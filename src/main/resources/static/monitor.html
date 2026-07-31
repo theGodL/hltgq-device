@@ -427,11 +427,11 @@ async function loadDeviceTree() {
       return;
     }
 
-    // 创建虚拟根节点（id=001），子节点为API返回的组织列表
+    // 创建花凉亭灌区根节点（id=001），子节点为API返回的组织列表
     const rootNode = document.createElement('li');
     rootNode.className = 'tree-node expanded root-node';
     rootNode.dataset.id = '001';
-    rootNode.dataset.name = '根节点';
+    rootNode.dataset.name = '花凉亭灌区';
     rootNode.dataset.nodeType = 'org';
     rootNode.dataset.isParent = 'true';
     rootNode.dataset.loaded = 'true';
@@ -440,7 +440,7 @@ async function loadDeviceTree() {
     row.className = 'node-row';
     row.innerHTML = '<span class="expand-icon">▶</span>' +
       '<span class="node-icon org">📁</span>' +
-      '<span class="node-label">根节点</span>';
+      '<span class="node-label">花凉亭灌区</span>';
     rootNode.appendChild(row);
 
     const rootKids = document.createElement('ul');
@@ -451,6 +451,38 @@ async function loadDeviceTree() {
     rootNode.appendChild(rootKids);
     const rootUl = document.createElement('ul');
     rootUl.appendChild(rootNode);
+
+    // ★ 麻塘湖灌区占位节点（暂未接入设备，预留空位）
+    const mtNode = document.createElement('li');
+    mtNode.className = 'tree-node root-node';
+    mtNode.dataset.id = 'matanghu';
+    mtNode.dataset.name = '麻塘湖灌区';
+    mtNode.dataset.nodeType = 'org';
+    mtNode.dataset.isParent = 'true';
+    mtNode.dataset.loaded = 'true';
+    const mtRow = document.createElement('div');
+    mtRow.className = 'node-row';
+    mtRow.innerHTML = '<span class="expand-icon">▶</span>' +
+      '<span class="node-icon org">📁</span>' +
+      '<span class="node-label">麻塘湖灌区</span>';
+    mtNode.appendChild(mtRow);
+    const mtKids = document.createElement('ul');
+    mtKids.className = 'children collapsed';
+    const mtPlaceholder = document.createElement('li');
+    mtPlaceholder.className = 'tree-node leaf';
+    const mtPhRow = document.createElement('div');
+    mtPhRow.className = 'node-row';
+    mtPhRow.innerHTML = '<span class="expand-icon">▶</span>' +
+      '<span class="node-icon org">📁</span>' +
+      '<span class="node-label" style="color:#999;font-style:italic">暂未接入设备</span>';
+    mtPlaceholder.appendChild(mtPhRow);
+    mtKids.appendChild(mtPlaceholder);
+    mtNode.appendChild(mtKids);
+    const mtExpand = mtNode.querySelector('.expand-icon');
+    mtExpand.onclick = (e) => { e.stopPropagation(); toggleNode(mtNode); };
+    mtRow.onclick = () => toggleNode(mtNode);
+    rootUl.appendChild(mtNode);
+
     container.appendChild(rootUl);
 
     // 绑定根节点展开/折叠事件
