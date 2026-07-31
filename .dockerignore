@@ -1,0 +1,39 @@
+# Maven/Gradle 构建产物
+target/
+*.class
+*.jar
+!hltgq-device-*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# 日志
+logs/
+*.log
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# Git
+.git/
+.gitignore
+
+# 文档
+HELP.md
+README.md
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore

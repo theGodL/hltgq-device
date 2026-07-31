@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>视频预览 - 云台控制</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;color:#e0e0e0;background:#0a0a14;overflow:hidden}
+
+/* ========== 顶部信息栏 ========== */
+.topbar{
+  height:42px;background:#141428;border-bottom:1px solid #1e1e3a;
+  display:flex;align-items:center;justify-content:space-between;padding:0 16px;flex-shrink:0;
+}
+.topbar .left{display:flex;align-items:center;gap:12px}
+.topbar .channel-info{font-size:14px;font-weight:600;color:#91d5ff}
+.topbar .channel-info .label{color:#888;font-weight:400;margin-right:4px}
+.topbar .status-dot{width:8px;height:8px;border-radius:50%;background:#52c41a;box-shadow:0 0 6px #52c41a;flex-shrink:0}
+.topbar .status-dot.offline{background:#ff4d4f;box-shadow:0 0 6px #ff4d4f}
+.topbar .status-dot.loading{background:#faad14;box-shadow:0 0 6px #faad14;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.topbar .right{display:flex;align-items:center;gap:10px}
+.topbar .btn{
+  width:32px;height:32px;border-radius:6px;border:1px solid #2a2a4a;background:#1a1a30;
+  color:#aaa;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center;
+  transition:all .2s
+}
+.topbar .btn:hover{background:#252550;color:#91d5ff;border-color:#3a3a6a}
+.topbar .btn.fullscreen-btn{width:auto;padding:0 10px;font-size:12px;gap:4px}
+
+/* ========== 主体：视频 + 左右控制 ========== */
+.main{display:flex;flex-direction:column;height:calc(100% - 42px)}
+
+/* 左控制 + 视频 + 右控制 行 */
+.content-row{flex:1;display:flex;min-height:0}
+
+/* 视频播放区 */
+.video-area{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  background:#000;position:relative;min-height:0;min-width:0
+}
+.video-area video{width:100%;height:100%;object-fit:contain;display:block}
+.video-area .no-channel{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;color:#555
+}
+.video-area .no-channel .icon{font-size:72px;opacity:.3}
+.video-area .no-channel .text{font-size:16px;color:#666}
+.video-area .no-channel .hint{font-size:13px;color:#444}
+.video-area .stream-error{
+  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.7);color:#ff7875;font-size:13px;z-index:3
+}
+.video-area .stream-error .retry{
+  margin-top:10px;padding:6px 20px;background:#1a6fb5;color:#fff;border:none;border-radius:4px;
+  cursor:pointer;font-size:12px
+}
+.video-area .stream-error .retry:hover{background:#2185d0}
+.video-area .loading-overlay{
+  position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.5);z-index:2;color:#aaa;font-size:14px
+}
+
+/* ========== PTZ 镜头控制（左侧边栏） ========== */
+.ptz-left{
+  width:150px;background:#141428;border-right:1px solid #1e1e3a;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  flex-shrink:0;padding:8px
+}
+.ptz-left.disabled{opacity:.35;pointer-events:none}
+.ptz-left .ptz-section-label{
+  font-size:10px;color:#666;font-weight:500;letter-spacing:1px
+}
+
+/* 镜头按钮 - 纵向排列 */
+.ptz-left .ptz-actions{
+  display:flex;flex-direction:column;gap:4px;width:100%
+}
+.ptz-left .ptz-actions button{
+  width:100%;padding:9px 6px;background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;
+  border-radius:5px;cursor:pointer;font-size:12px;transition:all .12s;
+  user-select:none;-webkit-user-select:none;white-space:nowrap
+}
+.ptz-left .ptz-actions button:hover{background:#252550;color:#91d5ff;border-color:#4a4a8a}
+.ptz-left .ptz-actions button:active{background:#1a6fb5;color:#fff;border-color:#1a6fb5;transform:scale(.93)}
+.ptz-left .ptz-actions button.zoom-btn{background:#1e1e38;font-weight:600}
+.ptz-left .ptz-actions button.focus-btn{background:#1a1a30}
+.ptz-left .ptz-actions button.iris-btn{background:#1a1a30}
+
+/* ========== PTZ 方向控制（右侧边栏） ========== */
+.ptz-sidebar{
+  width:150px;background:#141428;border-left:1px solid #1e1e3a;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+  flex-shrink:0;padding:6px
+}
+.ptz-sidebar.disabled{opacity:.35;pointer-events:none}
+.ptz-sidebar .ptz-section-label{
+  font-size:10px;color:#666;font-weight:500;letter-spacing:1px
+}
+
+/* 方向盘 */
+.ptz-pad{
+  display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);
+  gap:3px;width:134px;height:134px
+}
+.ptz-pad button{
+  background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;border-radius:5px;
+  cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;
+  transition:all .12s;user-select:none;-webkit-user-select:none
+}
+.ptz-pad button:hover{background:#252550;color:#91d5ff;border-color:#4a4a8a}
+.ptz-pad button:active{background:#1a6fb5;color:#fff;border-color:#1a6fb5;transform:scale(.93)}
+.ptz-pad .empty{background:transparent;border:none;cursor:default;pointer-events:none}
+.ptz-pad .center-btn{background:#1e1e40;font-size:12px;font-weight:600;color:#91d5ff;border-color:#3a3a6a}
+.ptz-pad .center-btn:hover{background:#ff4d4f;color:#fff;border-color:#ff4d4f}
+
+/* ========== 全屏浮动退出按钮 ========== */
+.fs-exit-btn{
+  position:fixed;top:80px;right:24px;z-index:99999;
+  padding:8px 18px;background:rgba(0,0,0,.65);color:#fff;
+  border:1px solid rgba(255,255,255,.25);border-radius:8px;
+  cursor:pointer;font-size:14px;font-weight:600;letter-spacing:1px;
+  display:none;align-items:center;gap:6px;
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  transition:background .2s,border-color .2s
+}
+.fs-exit-btn:hover{background:rgba(26,111,181,.8);border-color:rgba(255,255,255,.5)}
+.fs-exit-btn.visible{display:flex}
+
+/* ========== 响应式 ========== */
+@media(max-width:600px){
+  .ptz-left{width:120px;padding:4px}
+  .ptz-left .ptz-actions button{padding:7px 4px;font-size:11px}
+  .ptz-sidebar{width:120px;padding:4px}
+  .ptz-pad{width:108px;height:108px}
+  .ptz-pad button{font-size:15px}
+}
+</style>
+</head>
+<body>
+
+<!-- ========== 顶部信息栏 ========== -->
+<div class="topbar">
+  <div class="left">
+    <span class="status-dot loading" id="statusDot"></span>
+    <span class="channel-info">
+      <span class="label">通道:</span><span id="channelName">--</span>
+      <span style="color:#555;margin:0 6px">|</span>
+      <span class="label">ID:</span><span id="channelIdDisplay">--</span>
+    </span>
+  </div>
+  <div class="right">
+    <button class="btn" title="刷新视频" onclick="reloadStream()">↻</button>
+    <button class="btn fullscreen-btn" title="全屏" onclick="toggleFullscreen()">⛶ 全屏</button>
+  </div>
+</div>
+
+<!-- ========== 三栏布局：左镜头 | 视频 | 右方向 ========== -->
+<div class="main">
+  <div class="content-row">
+    <!-- 镜头控制（视频左侧） -->
+    <div class="ptz-left disabled" id="ptzBottomPanel">
+      <span class="ptz-section-label">镜头控制</span>
+      <div class="ptz-actions">
+        <button class="zoom-btn" title="变倍+" onmousedown="ptzLensStart('zoomIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁺ 放大</button>
+        <button class="zoom-btn" title="变倍-" onmousedown="ptzLensStart('zoomOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁻ 缩小</button>
+        <button class="focus-btn" title="聚焦+" onmousedown="ptzLensStart('focusIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁺ 聚焦+</button>
+        <button class="focus-btn" title="聚焦-" onmousedown="ptzLensStart('focusOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁻ 聚焦-</button>
+        <button class="iris-btn" title="光圈+" onmousedown="ptzLensStart('irisIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁺ 光圈+</button>
+        <button class="iris-btn" title="光圈-" onmousedown="ptzLensStart('irisOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁻ 光圈-</button>
+      </div>
+    </div>
+
+    <div class="video-area" id="videoArea">
+      <div class="no-channel" id="noChannel">
+        <div class="icon">📹</div>
+        <div class="text">请在URL中指定通道ID</div>
+        <div class="hint">例: viewer.html?channelId=1000230$0</div>
+      </div>
+      <div class="stream-error" id="streamError" style="display:none">
+        <span id="errorMsg"></span>
+        <button class="retry" onclick="reloadStream()">点击重试</button>
+      </div>
+      <div class="loading-overlay" id="loadingOverlay" style="display:none">
+        ⏳ 正在加载视频流...
+      </div>
+    </div>
+
+    <!-- 方向控制（视频右侧） -->
+    <div class="ptz-sidebar disabled" id="ptzPanel">
+      <span class="ptz-section-label">方向控制</span>
+      <div class="ptz-pad">
+        <button title="左上" onmousedown="ptzStart('upleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↖</button>
+        <button title="上" onmousedown="ptzStart('up')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▲</button>
+        <button title="右上" onmousedown="ptzStart('upright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↗</button>
+        <button title="左" onmousedown="ptzStart('left')" onmouseup="ptzStop()" onmouseleave="ptzStop()">◀</button>
+        <button class="center-btn" onclick="ptzStop()">■</button>
+        <button title="右" onmousedown="ptzStart('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▶</button>
+        <button title="左下" onmousedown="ptzStart('downleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↙</button>
+        <button title="下" onmousedown="ptzStart('down')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▼</button>
+        <button title="右下" onmousedown="ptzStart('downright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↘</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 全屏浮动退出按钮：避开Chrome工具栏覆盖 -->
+<button class="fs-exit-btn" id="fsExitBtn" onclick="console.log('[全屏]浮动按钮点击');toggleFullscreen()">⛶ 退出全屏</button>
+
+<script>
+// ==================== 全局状态 ====================
+const API_BASE = '/api/dahua';
+
+let channelId = null;           // URL参数原始值（可能只是设备编码，如1000230）
+let resolvedChannelId = null;   // 从设备树解析出的完整通道ID（如1000230$1$0$0），用于PTZ命令
+let channelName = '';
+let hlsInstance = null;
+let videoElement = null;
+
+// PTZ 状态
+let ptzTimer = null;
+let ptzLensTimer = null;
+let ptzHardTimeout = null;
+let ptzUserInteracting = false;
+let lastPtzDirection = null;
+let ptzOpSeq = 0;
+let ptzLensOpSeq = 0;
+let lastPtzRequestPromise = Promise.resolve();
+let lastLensRequestPromise = Promise.resolve();
+let ptzAbortController = null;
+let ptzLensAbortController = null;
+let selectedChannelHasPtz = true; // 默认启用（页面加载后根据cameraType校正）
+
+// ==================== 初始化 ====================
+
+/**
+ * 从 URL 参数中提取 channelId
+ */
+function getChannelIdFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('channelId') || null;
+}
+
+/**
+ * 页面初始化
+ */
+function init() {
+  channelId = getChannelIdFromUrl();
+
+  if (!channelId) {
+    // 无 channelId，显示提示
+    document.getElementById('noChannel').style.display = 'flex';
+    updateStatusDot('offline');
+    return;
+  }
+
+  document.getElementById('noChannel').style.display = 'none';
+  document.getElementById('channelIdDisplay').textContent = channelId;
+  document.getElementById('channelName').textContent = '加载中...';
+  updateStatusDot('loading');
+
+  // 自动加载视频流
+  loadStream();
+
+  // 全局兜底：鼠标在按钮外松开/窗口失焦时强制清理 PTZ
+  document.addEventListener('mouseup', cleanupPtzTimers);
+  window.addEventListener('blur', cleanupPtzTimers);
+
+  // ★ 浏览器标签页可见性恢复：最小化/切换标签页后回来
+  // 注意：hls.js v1.x 内部会自动恢复分片加载（定时器恢复后自动续传），
+  // 手动调用 startLoad() 反而干扰 hls.js 状态机，触发虚假 bufferStalledError
+  let pageWasHidden = false;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      pageWasHidden = true;
+    } else if (document.visibilityState === 'visible' && pageWasHidden && hlsInstance) {
+      pageWasHidden = false;
+      // 仅恢复 video.play()，让 hls.js 自行恢复加载
+      setTimeout(() => {
+        if (videoElement && videoElement.paused) {
+          videoElement.play().catch(() => {});
+        }
+      }, 500);
+    }
+  });
+}
+
+// ==================== 视频流加载 ====================
+
+async function loadStream() {
+  if (!channelId) return;
+
+  showLoading(true);
+  hideError();
+  updateStatusDot('loading');
+
+  try {
+    // 并行加载视频流地址和通道信息
+    const streamPromise = fetch(API_BASE + '/stream-url?channelId=' + encodeURIComponent(channelId) +
+      '&streamType=2&protocol=hls').then(r => r.json());
+    const infoPromise = loadChannelInfo(channelId);
+
+    const [streamJson] = await Promise.all([streamPromise, infoPromise]);
+
+    if (streamJson.success !== true || !streamJson.data || !streamJson.data.url) {
+      throw new Error(streamJson.desc || '获取流地址失败');
+    }
+
+    playHls(streamJson.data.url);
+  } catch (err) {
+    console.error('加载视频流失败:', err);
+    showError(err.message);
+    updateStatusDot('offline');
+    showLoading(false);
+  }
+}
+
+function playHls(url) {
+  // 销毁旧播放器
+  destroyPlayer();
+
+  // 获取或创建 video 元素
+  const videoArea = document.getElementById('videoArea');
+  videoElement = document.getElementById('playerVideo');
+  if (!videoElement) {
+    videoElement = document.createElement('video');
+    videoElement.id = 'playerVideo';
+    videoElement.muted = true;
+    videoElement.autoplay = true;
+    videoElement.playsInline = true;
+    videoElement.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block';
+    videoArea.appendChild(videoElement);
+  }
+
+  if (Hls.isSupported()) {
+    const hls = new Hls({
+      enableWorker: false,
+      lowLatencyMode: false,
+      backBufferLength: 90,
+      debug: false,
+      // 缓冲与追帧优化（与 monitor.html 保持一致，防止高码率主码流bufferStalledError）
+      maxBufferLength: 60,
+      maxMaxBufferLength: 600,
+      liveSyncDurationCount: 8,        // ★ 初始缓冲8个分片(~16s)，应对NVR取流~1.7s/段的慢速链路
+      liveMaxLatencyDurationCount: 10,
+      fragLoadingTimeOut: 20000,       // ★ 分片加载超时20秒（独立于liveSyncDurationCount），代理转码+网络波动需宽限
+      fragLoadingMaxRetry: 6,          // ★ 分片加载失败最多重试6次（默认3），代理链路不稳定时容错
+      fragLoadingRetryDelay: 1000,     // ★ 分片重试间隔1秒（默认0），避免NVR限流
+      nudgeMaxRetry: 12,
+      nudgeOffset: 0.5,
+      highBufferWatchdogPeriod: 2,
+      maxFragLookUpTolerance: 1.0
+    });
+    hls.loadSource(url);
+    hls.attachMedia(videoElement);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      videoElement.play().catch(() => {});
+      showLoading(false);
+      updateStatusDot('online');
+      // ★ 根据PTZ能力更新面板状态（匹配 monitor.html 逻辑）
+      updatePtzState();
+    });
+    // ★ 全面HLS事件诊断：捕获所有类型的事件用于排查卡死问题
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      const detail = {
+        type: data.type,
+        details: data.details,
+        fatal: data.fatal,
+        reason: data.reason || '',
+        frag: data.frag ? { sn: data.frag.sn, url: data.frag.url ? data.frag.url.substring(data.frag.url.lastIndexOf('/')+1) : '?', type: data.frag.type } : null,
+        errMsg: data.err ? (data.err.message || data.err) : ''
+      };
+      if (data.fatal) {
+        console.error('HLS致命错误:', detail);
+        showError('HLS播放失败: ' + data.details);
+        hls.destroy();
+        hlsInstance = null;
+        updateStatusDot('offline');
+      } else {
+        console.warn('HLS非致命错误:', detail);
+      }
+    });
+    // 关键事件：缓冲区状态变化 → 可能卡死
+    hls.on(Hls.Events.BUFFER_STALLED, (event, data) => {
+      console.error('⚠ HLS缓冲区停滞（bufferStalled）！当前缓冲:', data.bufferLen, '秒, 分片:', data.frag ? data.frag.sn : '?');
+      updateStatusDot('loading');
+    });
+    hls.on(Hls.Events.BUFFER_APPENDING, (event, data) => {
+      console.log('HLS缓冲追加: 分片#' + data.frag.sn + ' 类型=' + data.type + ' 大小=' + (data.data ? data.data.byteLength : '?') + 'B');
+    });
+    hls.on(Hls.Events.FRAG_PARSING_METADATA, (event, data) => {
+      console.log('HLS分片解析: #' + data.frag.sn + ', pts=' + (data.samples && data.samples[0] ? data.samples[0].pts : '?'));
+    });
+    hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+      console.log('HLS分片加载完成: #' + data.frag.sn + ', 耗时=' + Math.round(data.stats.tload/1000) + 'ms');
+    });
+    hlsInstance = hls;
+  } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari 原生 HLS
+    videoElement.src = url;
+    videoElement.addEventListener('loadedmetadata', () => {
+      videoElement.play().catch(() => {});
+      showLoading(false);
+      updateStatusDot('online');
+      // ★ 根据PTZ能力更新面板状态（匹配 monitor.html 逻辑）
+      updatePtzState();
+    });
+  } else {
+    showError('浏览器不支持HLS播放，请使用Chrome/Firefox/Edge');
+    updateStatusDot('offline');
+    showLoading(false);
+  }
+}
+
+function destroyPlayer() {
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  if (videoElement) {
+    videoElement.pause();
+    videoElement.removeAttribute('src');
+    videoElement.load();
+  }
+}
+
+function reloadStream() {
+  destroyPlayer();
+  if (videoElement) {
+    videoElement.remove();
+    videoElement = null;
+  }
+  // PTZ 状态重置
+  document.getElementById('ptzPanel').classList.add('disabled');
+  document.getElementById('ptzBottomPanel').classList.add('disabled');
+  cleanupPtzTimers();
+  loadStream();
+}
+
+// ==================== UI 状态 ====================
+
+function showLoading(show) {
+  document.getElementById('loadingOverlay').style.display = show ? 'flex' : 'none';
+}
+
+function showError(msg) {
+  const el = document.getElementById('streamError');
+  document.getElementById('errorMsg').textContent = '⚠ ' + msg;
+  el.style.display = 'flex';
+}
+
+function hideError() {
+  document.getElementById('streamError').style.display = 'none';
+}
+
+function updateStatusDot(state) {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'status-dot ' + state;
+}
+
+function toggleFullscreen() {
+  console.log('[全屏] toggleFullscreen 被调用，fullscreenElement=', document.fullscreenElement);
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    document.documentElement.requestFullscreen();
+  }
+}
+
+function updateFullscreenBtn(isFullscreen) {
+  const btn = document.querySelector('.fullscreen-btn');
+  if (btn) {
+    btn.innerHTML = isFullscreen ? '⛶ 退出' : '⛶ 全屏';
+    btn.title = isFullscreen ? '退出全屏' : '全屏';
+  }
+}
+
+// 记录浮动按钮的原始父节点，用于全屏退出后还原
+let fsExitBtnOriginalParent = null;
+
+// 监听浏览器全屏变化（ESC/F11 等方式退出），同步按钮状态
+document.addEventListener('fullscreenchange', () => {
+  const isFs = !!document.fullscreenElement;
+  const fsEl = document.fullscreenElement;
+  console.log('[全屏] fullscreenchange 触发，isFs=', isFs, 'element=', fsEl);
+  updateFullscreenBtn(isFs);
+  document.documentElement.classList.toggle('is-fullscreen', isFs);
+
+  const floatBtn = document.getElementById('fsExitBtn');
+  if (!floatBtn) return;
+
+  if (isFs && fsEl && fsEl !== document.documentElement) {
+    // ★ 非整页全屏：浮动按钮不在全屏元素子树内 → 不可见 → 注入
+    if (!fsExitBtnOriginalParent) {
+      fsExitBtnOriginalParent = floatBtn.parentElement;
+    }
+    fsEl.appendChild(floatBtn);
+    floatBtn.style.top = '16px';
+    floatBtn.style.right = '16px';
+    floatBtn.classList.add('visible');
+  } else {
+    // 退出全屏 / 整页全屏：还原到body
+    if (fsExitBtnOriginalParent && floatBtn.parentElement !== fsExitBtnOriginalParent) {
+      fsExitBtnOriginalParent.appendChild(floatBtn);
+      fsExitBtnOriginalParent = null;
+      floatBtn.style.top = '80px';
+      floatBtn.style.right = '24px';
+    }
+    floatBtn.classList.toggle('visible', isFs);
+  }
+});
+
+// ==================== 通道信息加载 ====================
+
+/**
+ * 加载通道信息（名称、PTZ能力）
+ * 通过设备树API查找通道，获取cameraType判断PTZ能力
+ */
+async function loadChannelInfo(chId) {
+  try {
+    // 递归搜索设备树，找到目标通道（支持设备编码前缀匹配）
+    const found = await searchChannelInTree(chId, '001');
+    if (found) {
+      channelName = found.name || chId;
+      document.getElementById('channelName').textContent = channelName;
+      // ★ 使用设备树返回的完整通道ID（如1000230$1$0$0），替换URL参数中的短格式
+      resolvedChannelId = found.id;
+      document.getElementById('channelIdDisplay').textContent = resolvedChannelId;
+      // cameraType: 1=枪机(固定), 2=球机(PTZ), 3=半球, 4=云台
+      const ct = parseInt(found.cameraType) || 1;
+      selectedChannelHasPtz = ct >= 2;
+      console.log('[PTZ] 通道信息：原始ID=' + chId + ', 完整ID=' + resolvedChannelId +
+        ', name=' + channelName + ', cameraType=' + ct + ', hasPtz=' + selectedChannelHasPtz);
+    } else {
+      // ★ 设备树中未找到通道时：resolvedChannelId 回退为原始值，后端会归一化处理
+      resolvedChannelId = chId;
+      document.getElementById('channelName').textContent = chId;
+      console.warn('[PTZ] 未在设备树中找到通道：' + chId + '，使用原始ID，保持PTZ乐观启用（后端校验）');
+    }
+  } catch (err) {
+    console.warn('[PTZ] 加载通道信息失败：', err);
+    resolvedChannelId = chId;
+    document.getElementById('channelName').textContent = chId;
+    // 加载失败时保留PTZ能力（乐观启用，后端会校验）
+  }
+}
+
+/**
+ * 递归搜索设备树，找到指定channelId的节点信息
+ */
+async function searchChannelInTree(targetId, orgId) {
+  try {
+    const resp = await fetch(API_BASE + '/device-tree?orgId=' + encodeURIComponent(orgId));
+    const json = await resp.json();
+    if (json.success !== true || !json.data) return null;
+
+    const children = json.data;
+    if (!Array.isArray(children)) return null;
+
+    for (const node of children) {
+      const nodeId = String(node.id || '');
+      if (node.nodeType !== 'ch') {
+        // 非通道节点：递归搜索子组织/设备
+        if (node.isParent === true) {
+          const found = await searchChannelInTree(targetId, nodeId);
+          if (found) return found;
+        }
+        continue;
+      }
+      // ★ 通道节点匹配：精确匹配 OR 设备编码前缀匹配（处理URL参数为短格式的场景）
+      if (nodeId === targetId) {
+        return { id: nodeId, name: node.name, cameraType: node.cameraType };
+      }
+      // 前缀匹配：targetId是纯数字设备编码（无$），而树中为完整格式如 1000230$1$0$0
+      if (targetId.indexOf('$') < 0 && nodeId.indexOf(targetId + '$') === 0) {
+        console.log('[PTZ] 设备编码前缀匹配：' + targetId + ' → ' + nodeId);
+        return { id: nodeId, name: node.name, cameraType: node.cameraType };
+      }
+    }
+    return null;
+  } catch (err) {
+    console.warn('[PTZ] 搜索设备树节点失败 orgId=' + orgId, err);
+    return null;
+  }
+}
+
+/**
+ * 更新PTZ面板启用/禁用状态（匹配 monitor.html 逻辑）
+ */
+function updatePtzState() {
+  const sidebar = document.getElementById('ptzPanel');
+  const bottom = document.getElementById('ptzBottomPanel');
+  if (resolvedChannelId && selectedChannelHasPtz) {
+    sidebar.classList.remove('disabled');
+    bottom.classList.remove('disabled');
+  } else {
+    sidebar.classList.add('disabled');
+    bottom.classList.add('disabled');
+    if (resolvedChannelId && !selectedChannelHasPtz) {
+      console.warn('[PTZ] 当前为固定摄像头，不支持云台控制');
+    }
+  }
+}
+
+// ==================== PTZ 云台控制 ====================
+
+/**
+ * 发送方向命令（START），匹配 monitor.html 的 async/await + AbortController 模式
+ */
+async function sendPtzCommand(direction) {
+  if (!resolvedChannelId) {
+    console.warn('[PTZ] sendPtzCommand 跳过：未选中通道');
+    return;
+  }
+  if (!selectedChannelHasPtz) {
+    console.warn('[PTZ] sendPtzCommand 跳过：当前通道不支持云台');
+    return;
+  }
+  // 每次成功发送方向命令时重置硬超时（用户持续按住时不误触发）
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  console.log('[PTZ] 发送方向命令：channelId=' + resolvedChannelId + ', direction=' + direction);
+  // 取消上一次飞行中的请求，避免方向切换后旧命令阻塞新命令
+  if (ptzAbortController) {
+    ptzAbortController.abort();
+  }
+  ptzAbortController = new AbortController();
+  const speed = 5;
+  try {
+    const resp = await fetch(API_BASE + '/ptz/direct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId: resolvedChannelId, direction: direction, speed: speed }),
+      signal: ptzAbortController.signal
+    });
+    const json = await resp.json();
+    if (json.success !== true) {
+      console.warn('[PTZ] 方向命令返回失败:', json.desc);
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('[PTZ] 方向命令失败:', err);
+    }
+  } finally {
+    // 请求完成后重置硬超时（3秒内必须有新请求，否则forceStop）
+    if (ptzTimer && ptzUserInteracting) {
+      if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+      ptzHardTimeout = setTimeout(() => {
+        console.error('[PTZ] ⚠ 3秒无新方向指令，硬超时强制停止');
+        forcePtzStop('3秒无新指令硬超时');
+      }, 3000);
+    }
+  }
+}
+
+function ptzStart(direction) {
+  console.log('[PTZ] ptzStart 用户按下：' + direction + ', channelId=' + channelId);
+  ptzOpSeq++;  // ★ 新操作代数：旧 STOP 重试时发现代数变化即放弃
+  ptzUserInteracting = true;  // 安全锁：标记用户正在操作
+  lastPtzDirection = direction;  // 记录方向，供停止时使用
+  // ★ 记录本次 START 请求 promise，供 sendPtzStopCommand 按序等待
+  lastPtzRequestPromise = sendPtzCommand(direction);
+  if (ptzTimer) clearInterval(ptzTimer);
+  // ★ 官方模式：START 一次即持续转动，改为 1 秒心跳维持，消除 150ms 高频连发的延迟感
+  ptzTimer = setInterval(() => { lastPtzRequestPromise = sendPtzCommand(direction); }, 1000);
+  // ★ 3秒硬超时兜底：即使stop事件丢失，3秒后强制停止，防止摄像头永久失控
+  if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+  ptzHardTimeout = setTimeout(() => {
+    console.error('[PTZ] ⚠ 3秒硬超时触发！强制停止方向移动');
+    forcePtzStop('3秒硬超时');
+  }, 3000);
+}
+
+function ptzStop() {
+  console.log('[PTZ] ptzStop 用户松开，channelId=' + channelId + ', lastDir=' + lastPtzDirection);
+  ptzUserInteracting = false;  // 安全锁：用户停止操作
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  // ★ 不再 abort START 请求 —— abort 可能导致快速点击时 START 还没到后端就被杀死
+  // ★ 新策略：sendPtzStopCommand 内部 await 最后一条 START + STOP ×1 重试 + 代数检查
+  ptzAbortController = null;
+  // 发送停止命令（即使lastPtzDirection为null也尝试发送，用后端默认方向兜底）
+  sendPtzStopCommand(lastPtzDirection);
+}
+
+/**
+ * 发送方向停止命令（与 monitor.html 完全一致）
+ */
+async function sendPtzStopCommand(direction) {
+  const dir = direction || lastPtzDirection;
+  if (!resolvedChannelId || !dir) {
+    console.warn('[PTZ] sendPtzStopCommand 跳过：channelId=' + resolvedChannelId + ', dir=' + dir);
+    return;
+  }
+  const mySeq = ptzOpSeq;  // 记录当前操作代数
+  lastPtzDirection = null;  // 消费后清空，防止重复发送
+  console.log('[PTZ] 发送方向停止命令：channelId=' + resolvedChannelId + ', direction=' + dir);
+
+  // ★ 顺序保证：等最后一条 START 完成（最多等500ms），STOP 不会先于 START 到达后端
+  try {
+    await Promise.race([lastPtzRequestPromise, new Promise(r => setTimeout(r, 500))]);
+  } catch (e) { /* 忽略 */ }
+
+  // ★ STOP ×1 + 失败重试（最多3次，间隔300ms），成功即止
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // 代数检查：用户已开始新操作，由新操作的 STOP 负责，旧 STOP 放弃
+    if (ptzOpSeq !== mySeq) {
+      console.log('[PTZ] 停止命令放弃：用户已开始新操作');
+      return;
+    }
+    try {
+      const resp = await fetch(API_BASE + '/ptz/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelId: resolvedChannelId, direction: dir })
+      });
+      const json = await resp.json();
+      if (json.success === true) {
+        console.log('[PTZ] 停止命令第' + attempt + '次成功');
+        return;  // ★ 成功即止，无冗余发送
+      }
+      console.error('[PTZ] 停止命令第' + attempt + '次被拒绝：' + (json.desc || json.code));
+    } catch (err) {
+      console.error('[PTZ] 停止命令第' + attempt + '次发送失败（网络异常）：' + err.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] ⚠ 停止命令3次均失败！请检查网络或平台状态');
+}
+
+/**
+ * 强制停止所有PTZ操作（硬超时兜底 + 手动停止共用）
+ */
+function forcePtzStop(reason) {
+  console.warn('[PTZ] forcePtzStop 触发，原因：' + reason + ', channelId=' + resolvedChannelId);
+  // 清除所有定时器和请求
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  if (ptzAbortController) { ptzAbortController.abort(); ptzAbortController = null; }
+  if (ptzLensAbortController) { ptzLensAbortController.abort(); ptzLensAbortController = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  ptzUserInteracting = false;
+  // 发送方向停止指令
+  if (resolvedChannelId && selectedChannelHasPtz && lastPtzDirection) {
+    sendPtzStopCommand(lastPtzDirection);
+  }
+}
+
+/**
+ * 强制清理所有 PTZ 定时器和飞行中的请求（匹配 monitor.html）
+ */
+function cleanupPtzTimers() {
+  console.log('[PTZ] cleanupPtzTimers 被调用，重置所有定时器和安全锁');
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  // ★ 不再 abort 方向/镜头控制请求 —— 后端自适应延迟 + 前端 await→重试 机制可安全兜底
+  ptzAbortController = null;
+  ptzLensAbortController = null;
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  // ★ 修复漏洞：cleanup时也发送stop指令，防止window.blur等场景下摄像头不停
+  if (ptzUserInteracting && resolvedChannelId && selectedChannelHasPtz && lastPtzDirection) {
+    console.warn('[PTZ] cleanup检测到未停止的PTZ操作，发送紧急停止指令');
+    sendPtzStopCommand(lastPtzDirection);
+  }
+  ptzUserInteracting = false;  // 安全锁复位
+}
+
+// ==================== 镜头控制 ====================
+
+async function sendPtzLens(action) {
+  if (!resolvedChannelId) {
+    console.warn('[PTZ] sendPtzLens 跳过：未选中通道');
+    return;
+  }
+  if (!selectedChannelHasPtz) {
+    console.warn('[PTZ] sendPtzLens 跳过：当前通道不支持云台');
+    return;
+  }
+  // ★ 安全锁：只有用户正在按下按钮才允许发送镜头命令
+  if (!ptzUserInteracting) {
+    console.warn('[PTZ] 安全锁拦截镜头命令：非用户操作，action=' + action + ', channelId=' + resolvedChannelId);
+    return;
+  }
+  console.log('[PTZ] 发送镜头命令：channelId=' + resolvedChannelId + ', action=' + action);
+  if (ptzLensAbortController) {
+    ptzLensAbortController.abort();
+  }
+  ptzLensAbortController = new AbortController();
+  const speed = 5;
+  try {
+    await fetch(API_BASE + '/ptz/lens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId: resolvedChannelId, action: action, speed: speed }),
+      signal: ptzLensAbortController.signal
+    });
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('[PTZ] 镜头命令失败:', err);
+    }
+  }
+}
+
+function ptzLensStart(action) {
+  console.log('[PTZ] ptzLensStart 用户按下：' + action + ', channelId=' + channelId);
+  ptzLensOpSeq++;  // ★ 新操作代数
+  ptzUserInteracting = true;  // 安全锁：标记用户正在操作
+  // ★ 记录本次 START 请求 promise，供 ptzLensStop 按序等待
+  lastLensRequestPromise = sendPtzLens(action);
+  if (ptzLensTimer) clearInterval(ptzLensTimer);
+  // ★ 官方模式：1 秒心跳维持
+  ptzLensTimer = setInterval(() => { lastLensRequestPromise = sendPtzLens(action); }, 1000);
+}
+
+async function ptzLensStop() {
+  console.log('[PTZ] ptzLensStop 用户松开，channelId=' + resolvedChannelId);
+  ptzUserInteracting = false;  // 安全锁：用户停止操作
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  // ★ 不再 abort 镜头请求 —— abort 可能导致 START 还没到后端就被杀死
+  // ★ 新策略：await 最后一条 START + STOP ×1 重试 + 代数检查
+  ptzLensAbortController = null;
+
+  const mySeq = ptzLensOpSeq;  // 记录当前操作代数
+
+  // ★ 顺序保证：等最后一条镜头 START 完成（最多等500ms）
+  try {
+    await Promise.race([lastLensRequestPromise, new Promise(r => setTimeout(r, 500))]);
+  } catch (e) { /* 忽略 */ }
+
+  // ★ STOP ×1 + 失败重试（最多3次，间隔300ms），成功即止
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (ptzLensOpSeq !== mySeq) {
+      console.log('[PTZ] 镜头停止命令放弃：用户已开始新操作');
+      return;
+    }
+    if (!resolvedChannelId) return;
+    try {
+      const resp = await fetch(API_BASE + '/ptz/lens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelId: resolvedChannelId, action: 'stop' })
+      });
+      const json = await resp.json();
+      if (json.success === true) {
+        console.log('[PTZ] 镜头停止命令第' + attempt + '次成功');
+        return;
+      }
+      console.error('[PTZ] 镜头停止命令第' + attempt + '次被拒绝：' + (json.desc || json.code));
+    } catch (err) {
+      console.error('[PTZ] 镜头停止命令第' + attempt + '次发送失败（网络异常）：' + err.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] ⚠ 镜头停止命令3次均失败！请检查网络或平台状态');
+}
+
+// ==================== 启动 ====================
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

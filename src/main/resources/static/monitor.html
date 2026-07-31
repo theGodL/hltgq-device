@@ -1,0 +1,1668 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- 强制禁止浏览器缓存，防止旧版JS代码导致PTZ失控 -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>实时预览 - 视频监控</title>
+<!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265) -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+/* ============ 全局重置 ============ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;color:#333;background:#f0f2f5;overflow:hidden}
+ul,li{list-style:none}
+
+/* ============ 顶部栏 ============ */
+.topbar{
+  height:50px;background:#fff;border-bottom:1px solid #e0e4e8;
+  display:flex;align-items:center;justify-content:space-between;padding:0 20px;flex-shrink:0;
+  box-shadow:0 1px 4px rgba(0,0,0,.06);
+}
+.topbar .title{font-size:18px;font-weight:700;color:#1a6fb5;letter-spacing:2px;display:flex;align-items:center;gap:10px}
+.topbar .title::before{content:"";display:inline-block;width:4px;height:22px;background:#1a6fb5;border-radius:2px}
+.topbar .actions{display:flex;align-items:center;gap:12px}
+.topbar .search-box{display:flex;align-items:center;background:#f5f7fa;border:1px solid #d0d5dd;border-radius:20px;padding:4px 12px;width:240px;transition:border-color .3s}
+.topbar .search-box:focus-within{border-color:#1a6fb5;background:#fff}
+.topbar .search-box .icon{color:#999;font-size:16px;margin-right:6px}
+.topbar .search-box input{background:transparent;border:none;outline:none;color:#333;font-size:13px;width:100%}
+.topbar .search-box input::placeholder{color:#b0b8c4}
+.topbar .btn{width:34px;height:34px;border-radius:6px;border:1px solid #d0d5dd;background:#fff;color:#666;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .25s}
+.topbar .btn:hover{background:#e8f0fe;color:#1a6fb5;border-color:#1a6fb5}
+.topbar .btn.fullscreen-btn{width:auto;padding:0 12px;font-size:13px;gap:4px}
+.topbar .layout-btns{display:flex;gap:4px}
+.topbar .layout-btns .btn.active{background:#d6e4ff;color:#1a6fb5;border-color:#1a6fb5}
+
+/* ============ 主体布局 ============ */
+.main{display:flex;height:calc(100% - 50px)}
+
+/* ============ 左侧树 ============ */
+.sidebar{
+  width:280px;min-width:280px;background:#fff;border-right:1px solid #e0e4e8;
+  display:flex;flex-direction:column;overflow:hidden
+}
+.sidebar-header{
+  padding:12px 14px;border-bottom:1px solid #e0e4e8;display:flex;align-items:center;justify-content:space-between;
+  font-size:14px;font-weight:600;color:#444
+}
+.sidebar-header .count{font-size:12px;color:#999}
+.tree-wrap{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 0;scrollbar-width:thin;scrollbar-color:#d0d5dd transparent}
+.tree-wrap::-webkit-scrollbar{width:5px}
+.tree-wrap::-webkit-scrollbar-thumb{background:#d0d5dd;border-radius:3px}
+
+/* 树节点 */
+.tree-node{cursor:pointer;user-select:none}
+.tree-node .node-row{display:flex;align-items:center;padding:3px 8px;margin:1px 4px;border-radius:4px;transition:background .15s;white-space:nowrap;position:relative}
+.tree-node .node-row:hover{background:#f0f4f8}
+.tree-node .node-row.active{background:#d6e4ff;color:#1a6fb5}
+.tree-node .node-row.active .node-icon{color:#1a6fb5}
+.tree-node.root-node>.node-row{font-weight:700;background:#f5f7fa;border-bottom:1px solid #e8ecf0}
+.tree-node.root-node>.node-row .node-label{font-size:14px}
+.tree-node .expand-icon{width:18px;height:18px;display:flex;align-items:center;justify-content:center;font-size:10px;color:#999;flex-shrink:0;transition:transform .2s}
+.tree-node.expanded>.node-row>.expand-icon{transform:rotate(90deg)}
+.tree-node.leaf>.node-row>.expand-icon{visibility:hidden}
+.tree-node .node-icon{margin:0 6px;font-size:16px;flex-shrink:0;color:#789}
+.tree-node .node-icon.org{color:#e8962e}
+.tree-node .node-icon.ch{color:#607d8b}
+.tree-node .node-icon.ptz{color:#1a6fb5}
+.tree-node .node-label{font-size:13px;overflow:hidden;text-overflow:ellipsis}
+.tree-node .node-status{width:7px;height:7px;border-radius:50%;margin-left:auto;flex-shrink:0}
+.tree-node .node-status.online{background:#52c41a;box-shadow:0 0 4px #52c41a}
+.tree-node .node-status.offline{background:#ccc}
+.tree-node .children{padding-left:20px;overflow:hidden;transition:max-height .25s ease}
+.tree-node .children.collapsed{max-height:0!important}
+.tree-node.filtered-out{display:none!important}
+.tree-node.filter-match>.node-row{background:#e6ffed;border:1px solid #b7eb8f}
+.tree-node.filter-match>.node-row .node-label{color:#389e0d}
+
+/* 加载指示器 */
+.tree-loading{padding:20px;text-align:center;color:#999;font-size:13px}
+.tree-error{padding:20px;text-align:center;color:#e74c3c;font-size:13px}
+.retry-btn{margin-top:8px;padding:4px 16px;background:#1a6fb5;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px}
+
+/* ============ 右侧主区域 ============ */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden;background:#f0f2f5}
+
+/* 工具栏 */
+.toolbar{
+  height:40px;padding:0 16px;background:#fff;border-bottom:1px solid #e0e4e8;
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0
+}
+.toolbar .info{font-size:13px;color:#888}
+.toolbar .info span{color:#1a6fb5;font-weight:600}
+
+/* 视频网格 */
+.video-grid{
+  flex:1;display:grid;gap:8px;padding:8px;overflow-y:auto;align-content:start
+}
+.video-grid.layout-1{grid-template-columns:1fr}
+.video-grid.layout-4{grid-template-columns:1fr 1fr}
+.video-grid.layout-6{grid-template-columns:1fr 1fr}
+.video-grid.layout-9{grid-template-columns:1fr 1fr 1fr}
+.video-grid.layout-12{grid-template-columns:1fr 1fr 1fr}
+.video-grid.layout-16{grid-template-columns:1fr 1fr 1fr 1fr}
+
+/* 视频窗口 */
+.video-cell{
+  position:relative;background:#1a1a2e;border:1px solid #d0d5dd;border-radius:6px;
+  overflow:hidden;aspect-ratio:16/9;cursor:pointer;transition:border-color .3s
+}
+.video-cell:hover{border-color:#1a6fb5}
+.video-cell.selected{border-color:#1a6fb5;box-shadow:0 0 8px rgba(26,111,181,.2)}
+.video-cell video{width:100%;height:100%;object-fit:cover;display:block}
+.video-cell .placeholder{
+  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  color:#888;z-index:1
+}
+.video-cell .placeholder .cam-icon{font-size:48px;margin-bottom:8px;opacity:.4}
+.video-cell .placeholder .text{font-size:13px;color:#b0b8c4}
+.video-cell .overlay-bar{
+  position:absolute;bottom:0;left:0;right:0;height:32px;
+  background:linear-gradient(transparent,rgba(0,0,0,.55));display:flex;
+  align-items:flex-end;justify-content:space-between;padding:0 10px 6px;z-index:2
+}
+.video-cell .overlay-bar .ch-name{font-size:12px;color:#fff;font-weight:500}
+.video-cell .overlay-bar .badges{display:flex;gap:6px;font-size:11px}
+.video-cell .overlay-bar .badge{padding:1px 6px;border-radius:3px;background:rgba(0,0,0,.45);color:#fff}
+.video-cell .overlay-bar .badge.live{color:#52c41a}
+.video-cell .overlay-bar .badge.hd{color:#91d5ff}
+.video-cell .stream-error{
+  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.6);color:#ff7875;font-size:12px;z-index:3
+}
+/* 离线摄像头：置灰图标 + 红色文字提示 */
+.video-cell.offline .placeholder{color:#666}
+.video-cell.offline .placeholder .cam-icon{opacity:.2}
+.video-cell.offline .placeholder .text{color:#ff7875;font-weight:600}
+.video-cell .single-btn{
+  position:absolute;top:8px;right:8px;width:28px;height:28px;border-radius:4px;
+  background:rgba(0,0,0,.5);color:#fff;border:none;cursor:pointer;font-size:14px;
+  display:none;align-items:center;justify-content:center;
+  transition:background .2s;z-index:4
+}
+.video-cell:hover .single-btn{display:flex}
+.video-cell .single-btn:hover{background:rgba(26,111,181,.7)}
+
+/* ============ PTZ 云台控制（左下角抽屉式） ============ */
+.ptz-drawer{
+  position:fixed;left:280px;right:0;bottom:0;z-index:90;
+  display:flex;flex-direction:column;
+  transition:transform .35s cubic-bezier(.4,0,.2,1);
+  transform:translateY(calc(100% - 42px));
+}
+.ptz-drawer.expanded{transform:translateY(0)}
+
+/* PTZ 禁用态：阻止操作，红色提示醒目可见 */
+.ptz-drawer.ptz-disabled .ptz-drawer-body{pointer-events:none}
+.ptz-drawer.ptz-disabled .ptz-drawer-header{cursor:not-allowed}
+.ptz-drawer.ptz-disabled .ptz-drawer-header .ptz-header-left .ptz-dot{background:#ff4d4f;box-shadow:none}
+.ptz-drawer .ptz-hint{display:none;font-size:14px;color:#ff4d4f;font-weight:600;margin-left:8px}
+.ptz-drawer.ptz-disabled .ptz-hint{display:inline}
+.ptz-drawer-header{
+  height:42px;background:#fff;border-top:1px solid #d0d5dd;border-left:1px solid #e0e4e8;
+  display:flex;align-items:center;justify-content:space-between;padding:0 16px;
+  cursor:pointer;user-select:none;flex-shrink:0;
+  box-shadow:0 -2px 8px rgba(0,0,0,.06);
+  transition:background .2s
+}
+.ptz-drawer-header:hover{background:#f5f7fa}
+.ptz-drawer-header .ptz-header-left{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;color:#444}
+.ptz-drawer-header .ptz-header-left .ptz-dot{width:8px;height:8px;border-radius:50%;background:#52c41a}
+.ptz-drawer-header .ptz-toggle-arrow{font-size:12px;color:#999;transition:transform .3s;display:inline-block}
+.ptz-drawer.expanded .ptz-toggle-arrow{transform:rotate(180deg)}
+.ptz-drawer-body{
+  background:#fff;border-left:1px solid #e0e4e8;border-top:1px solid #e8ecf0;
+  padding:16px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;
+  box-shadow:0 -4px 16px rgba(0,0,0,.08)
+}
+.ptz-drawer-body .ptz-section{display:flex;flex-direction:column;align-items:center;gap:6px}
+.ptz-drawer-body .ptz-section-label{font-size:11px;color:#999;font-weight:500}
+.ptz-pad{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);gap:2px;width:120px;height:120px}
+.ptz-pad button{
+  background:#f5f7fa;border:1px solid #d0d5dd;color:#555;border-radius:4px;
+  cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;
+  transition:all .15s
+}
+.ptz-pad button:hover{background:#d6e4ff;color:#1a6fb5;border-color:#1a6fb5}
+.ptz-pad button:active{background:#1a6fb5;color:#fff;border-color:#1a6fb5}
+.ptz-pad .empty{background:transparent;border:none;cursor:default}
+.ptz-pad .center-btn{background:#e8f0fe;font-size:12px;font-weight:600;color:#1a6fb5}
+.ptz-actions{display:flex;flex-wrap:wrap;gap:3px;justify-content:center;max-width:200px}
+.ptz-actions button{
+  padding:5px 10px;background:#f5f7fa;border:1px solid #d0d5dd;color:#555;
+  border-radius:4px;cursor:pointer;font-size:11px;transition:all .15s
+}
+.ptz-actions button:hover{background:#d6e4ff;color:#1a6fb5;border-color:#1a6fb5}
+
+/* ========== 全屏浮动退出按钮 ========== */
+/* Chrome全屏时鼠标靠近顶部会弹出浏览器工具栏(~60px)，盖住顶栏按钮 */
+/* 因此用一个浮动按钮放在安全位置(80px)，全屏时才显示 */
+.fs-exit-btn{
+  position:fixed;top:80px;right:24px;z-index:99999;
+  padding:8px 18px;background:rgba(0,0,0,.65);color:#fff;
+  border:1px solid rgba(255,255,255,.25);border-radius:8px;
+  cursor:pointer;font-size:14px;font-weight:600;letter-spacing:1px;
+  display:none;align-items:center;gap:6px;
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  transition:background .2s,border-color .2s
+}
+.fs-exit-btn:hover{background:rgba(26,111,181,.8);border-color:rgba(255,255,255,.5)}
+.fs-exit-btn.visible{display:flex}
+
+/* 全屏时隐藏入口型按钮（格内⛶），仅保留浮动退出按钮 */
+.is-fullscreen .single-btn{display:none!important}
+
+
+/* ============ 底部分页 ============ */
+.footbar{
+  height:36px;background:#fff;border-top:1px solid #e0e4e8;display:flex;
+  align-items:center;justify-content:center;gap:4px;flex-shrink:0
+}
+.footbar .page-btn{
+  min-width:28px;height:24px;border-radius:4px;border:1px solid #d0d5dd;
+  background:#fff;color:#666;cursor:pointer;font-size:12px;
+  display:flex;align-items:center;justify-content:center;transition:all .2s;padding:0 6px
+}
+.footbar .page-btn:hover{background:#e8f0fe;color:#1a6fb5;border-color:#1a6fb5}
+.footbar .page-btn.active{background:#1a6fb5;color:#fff;border-color:#1a6fb5}
+.footbar .page-btn.arrow{font-size:14px}
+
+/* 空状态：网格容器切换为flex，整体居中放大显示 */
+.video-grid.empty{display:flex;align-items:center;justify-content:center}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;color:#b0b8c4;gap:16px}
+.empty-state .empty-icon{font-size:96px;opacity:.25}
+.empty-state .empty-main{font-size:20px;font-weight:600;color:#8a94a3}
+.empty-state .empty-sub{font-size:14px;color:#b0b8c4}
+
+/* 响应式 */
+@media(max-width:1024px){.sidebar{width:240px;min-width:240px}.ptz-drawer{left:240px}}
+@media(max-width:768px){.sidebar{display:none}.ptz-drawer{left:0}}
+</style>
+</head>
+<body>
+
+<!-- ============ 顶部栏 ============ -->
+<div class="topbar">
+  <div class="title">实时预览</div>
+  <div class="actions">
+    <div class="layout-btns">
+      <button class="btn active" data-layout="4" title="2×2">⊞</button>
+      <button class="btn" data-layout="6" title="2×3">⊟</button>
+      <button class="btn" data-layout="9" title="3×3">⊠</button>
+      <button class="btn" data-layout="16" title="4×4">⬒</button>
+      <button class="btn" data-layout="1" title="单屏">▣</button>
+    </div>
+    <div class="search-box">
+      <span class="icon">🔍</span>
+      <input type="text" id="treeSearch" placeholder="搜索点位..." oninput="filterTree()">
+    </div>
+    <button class="btn" title="刷新" onclick="refreshAll()">↻</button>
+    <button class="btn fullscreen-btn" title="全屏" onclick="toggleFullscreen()">⛶ 全屏</button>
+  </div>
+</div>
+
+<!-- ============ 主体 ============ -->
+<div class="main">
+  <!-- 左侧导航树 -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <span>📁 监控点位</span>
+      <span class="count" id="channelCount">在线0路，离线0路</span>
+    </div>
+    <div class="tree-wrap" id="treeContainer">
+      <div class="tree-loading">⏳ 正在加载设备树...</div>
+    </div>
+  </div>
+
+  <!-- 右侧预览区 -->
+  <div class="content">
+    <div class="toolbar">
+      <div class="info" id="toolbarInfo">当前预览：<span>--</span></div>
+    </div>
+    <div class="video-grid layout-4 empty" id="videoGrid">
+      <div class="empty-state">
+        <div class="empty-icon">📹</div>
+        <div class="empty-main">请从左侧树中选择监控点位</div>
+        <div class="empty-sub">点击渠道节点即可预览视频</div>
+      </div>
+    </div>
+    <div class="footbar" id="footbar"></div>
+  </div>
+</div>
+
+<!-- PTZ 云台控制（左下角抽屉式） -->
+<div class="ptz-drawer" id="ptzDrawer">
+  <div class="ptz-drawer-header" onclick="togglePTZ()">
+    <div class="ptz-header-left">
+      <span class="ptz-dot"></span>
+      <span>☁ 云台控制</span>
+      <span class="ptz-hint">⚠ 请先点击视频窗口选择通道</span>
+    </div>
+    <span class="ptz-toggle-arrow">▲</span>
+  </div>
+  <div class="ptz-drawer-body">
+    <div class="ptz-section">
+      <span class="ptz-section-label">方向控制</span>
+      <div class="ptz-pad">
+        <button class="empty"></button>
+        <button title="上" onmousedown="ptzStart('up')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▲</button>
+        <button class="empty"></button>
+        <button title="左" onmousedown="ptzStart('left')" onmouseup="ptzStop()" onmouseleave="ptzStop()">◀</button>
+        <button class="center-btn" onclick="ptzStop()">停</button>
+        <button title="右" onmousedown="ptzStart('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▶</button>
+        <button class="empty"></button>
+        <button title="下" onmousedown="ptzStart('down')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▼</button>
+        <button class="empty"></button>
+      </div>
+    </div>
+    <div class="ptz-section">
+      <span class="ptz-section-label">镜头控制</span>
+      <div class="ptz-actions">
+        <button title="左上" onmousedown="ptzStart('upleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↖</button>
+        <button title="右上" onmousedown="ptzStart('upright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↗</button>
+        <button title="变倍+" onmousedown="ptzLensStart('zoomIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁺</button>
+        <button title="变倍-" onmousedown="ptzLensStart('zoomOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁻</button>
+        <button title="左下" onmousedown="ptzStart('downleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↙</button>
+        <button title="右下" onmousedown="ptzStart('downright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↘</button>
+        <button title="聚焦+" onmousedown="ptzLensStart('focusIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁺</button>
+        <button title="聚焦-" onmousedown="ptzLensStart('focusOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁻</button>
+        <button title="光圈+" onmousedown="ptzLensStart('irisIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁺</button>
+        <button title="光圈-" onmousedown="ptzLensStart('irisOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁻</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- 全屏浮动退出按钮：避开Chrome工具栏覆盖 -->
+<button class="fs-exit-btn" id="fsExitBtn" onclick="console.log('[全屏]浮动按钮点击');toggleFullscreen()">⛶ 退出全屏</button>
+
+<script>
+// ==================== 全局状态 ====================
+let channelList = [];            // [{channelId, name, orgName, orgId, cameraType, hasPtz}] 所有通道列表（扁平）
+let activeChannels = [];         // 当前播放列表中的通道索引
+let selectedCellIndex = 0;
+let currentLayout = 4;
+let pageSize = 4;
+let currentPage = 1;
+let ptzTimer = null;
+let ptzLensTimer = null;
+let selectedChannelId = null;    // 当前PTZ控制的通道ID
+let ptzUserInteracting = false;  // 安全锁：只有用户亲自按下PTZ按钮才允许发送命令
+let selectedChannelHasPtz = false; // 当前选中通道是否支持云台
+let channelCountCache = null;     // { online, offline } 全量统计缓存，页面加载时一次性计算
+
+// hls.js 播放器实例映射: cellIndex -> hlsInstance
+let hlsPlayers = {};
+
+// ==================== 常量 ====================
+const API_BASE = '/api/dahua';
+const FILTERED_ORG_NAMES = ['高低点视频', '分析服务器'];
+function isFilteredOrg(name) {
+  if (!name) return false;
+  return FILTERED_ORG_NAMES.some(keyword => name.includes(keyword));
+}
+
+/**
+ * 递归遍历整个组织树，统计全部通道的在线/离线数量
+ * 与树UI构建并行执行，页面加载时一次性完成统计
+ */
+async function loadAllChannelCounts() {
+  let online = 0, offline = 0;
+  async function recurse(parentId) {
+    try {
+      const resp = await fetch(API_BASE + '/device-tree?orgId=' + encodeURIComponent(parentId));
+      const json = await resp.json();
+      if (json.success !== true) return;
+      const children = json.data;
+      if (!children || !Array.isArray(children)) return;
+      const tasks = [];
+      for (const child of children) {
+        // 过滤指定名称的组织节点及其子树
+        if (isFilteredOrg(child.name)) continue;
+        if (child.nodeType === 'ch') {
+          if (child.checkStat === 1 || child.isOnline === 1) online++; else offline++;
+        }
+        if (child.isParent === true && child.nodeType !== 'ch') {
+          tasks.push(recurse(String(child.id || '')));
+        }
+      }
+      await Promise.all(tasks);
+    } catch (err) {
+      console.warn('[Tree] 递归统计失败 parentId=' + parentId, err);
+    }
+  }
+  await recurse('001');
+  channelCountCache = { online, offline };
+}
+
+// ==================== 加载设备树（ICC懒加载模式） ====================
+async function loadDeviceTree() {
+  const container = document.getElementById('treeContainer');
+  container.innerHTML = '<div class="tree-loading">⏳ 正在加载设备树...</div>';
+
+  try {
+    // ★ 并行：递归统计全量通道在线/离线数量（不阻塞树UI构建）
+    const countPromise = loadAllChannelCounts();
+
+    // 首次查询根组织001的子节点（id为空时后端默认取"001"）
+    const resp = await fetch(API_BASE + '/device-tree?orgId=');
+    const json = await resp.json();
+
+    // evo-brm子系统：success=true 表示成功
+    if (json.success !== true) {
+      throw new Error(json.desc || 'API返回错误码: ' + json.code);
+    }
+
+    channelList = [];
+    container.innerHTML = '';
+
+    // ICC返回指定父节点的直接子节点列表（pId均为同一父节点）
+    const children = json.data;
+    if (!children || !Array.isArray(children) || children.length === 0) {
+      container.innerHTML = '<div class="tree-error">⚠ 未获取到设备树数据<br><button class="retry-btn" onclick="loadDeviceTree()">重试</button></div>';
+      return;
+    }
+
+    // 创建虚拟根节点（id=001），子节点为API返回的组织列表
+    const rootNode = document.createElement('li');
+    rootNode.className = 'tree-node expanded root-node';
+    rootNode.dataset.id = '001';
+    rootNode.dataset.name = '根节点';
+    rootNode.dataset.nodeType = 'org';
+    rootNode.dataset.isParent = 'true';
+    rootNode.dataset.loaded = 'true';
+
+    const row = document.createElement('div');
+    row.className = 'node-row';
+    row.innerHTML = '<span class="expand-icon">▶</span>' +
+      '<span class="node-icon org">📁</span>' +
+      '<span class="node-label">根节点</span>';
+    rootNode.appendChild(row);
+
+    const rootKids = document.createElement('ul');
+    rootKids.className = 'children';
+
+    await appendChildrenFlattened(children, rootKids);
+
+    rootNode.appendChild(rootKids);
+    const rootUl = document.createElement('ul');
+    rootUl.appendChild(rootNode);
+    container.appendChild(rootUl);
+
+    // 绑定根节点展开/折叠事件
+    const expandIcon = rootNode.querySelector('.expand-icon');
+    expandIcon.onclick = (e) => { e.stopPropagation(); toggleNode(rootNode); };
+    row.onclick = () => toggleNode(rootNode);
+
+    // ★ 等待全量统计完成后更新，显示准确的在线/离线数
+    await countPromise;
+    updateChannelCount();
+  } catch (err) {
+    console.error('加载设备树失败:', err);
+    container.innerHTML = '<div class="tree-error">❌ 加载设备树失败<br><small>' +
+      err.message + '</small><br><button class="retry-btn" onclick="loadDeviceTree()">重试</button></div>';
+  }
+}
+
+/**
+ * 从ICC节点数据创建li元素（用于初始渲染和懒加载子节点）
+ * ICC节点：{id, name, pId, nodeType, isParent, checkStat, isOnline, sort, deviceCode, ...}
+ *   nodeType="org"  → 组织节点（可展开）
+ *   nodeType="dev"  → 设备节点（可展开，子节点为通道）
+ *   nodeType="ch"   → 通道节点（叶节点，可播放视频）
+ */
+function createTreeNodeFromIcc(node) {
+  const isChannel = node.nodeType === 'ch';
+  const isDev = node.nodeType === 'dev';
+  const canExpand = node.isParent === true;
+
+  const nodeId = String(node.id || '');
+  const nodeName = node.name || nodeId || '未知';
+
+  // 通道节点记录到channelList
+  if (isChannel) {
+    // cameraType: 1=枪机(固定), 2=球机(PTZ), 3=半球, 4=云台
+    const ct = parseInt(node.cameraType) || 1;
+    channelList.push({
+      channelId: nodeId,
+      name: nodeName,
+      orgId: String(node.pId || ''),
+      orgName: '',
+      cameraType: ct,
+      hasPtz: ct >= 2,  // 球机及以上支持云台
+      isOnline: node.checkStat === 1 || node.isOnline === 1
+    });
+  }
+
+  const li = document.createElement('li');
+  li.className = 'tree-node';
+  li.dataset.id = nodeId;
+  li.dataset.name = nodeName;
+  li.dataset.nodeType = node.nodeType || (isChannel ? 'ch' : 'org');
+  li.dataset.isParent = canExpand ? 'true' : 'false';
+  li.dataset.loaded = 'false';
+  if (isChannel || !canExpand) {
+    li.dataset.channelId = nodeId;
+    li.classList.add('leaf');
+  }
+
+  const row = document.createElement('div');
+  row.className = 'node-row';
+
+  // 展开图标（isParent=true时可见）
+  const expand = document.createElement('span');
+  expand.className = 'expand-icon';
+  expand.textContent = '▶';
+  if (canExpand) {
+    expand.onclick = (e) => { e.stopPropagation(); toggleNode(li); };
+  }
+  row.appendChild(expand);
+
+  // 类型图标
+  const icon = document.createElement('span');
+  icon.className = 'node-icon';
+  if (isChannel) {
+    // cameraType: 1=枪机📹  2=球机📡  3=半球  4=云台
+    const ct = parseInt(node.cameraType) || 1;
+    const hasPtz = ct >= 2;
+    li.dataset.cameraType = ct;
+    li.dataset.hasPtz = hasPtz ? 'true' : 'false';
+    if (hasPtz) {
+      icon.classList.add('ptz');
+      icon.textContent = '📡';  // 球机/云台用不同图标
+      icon.title = '支持云台控制';
+    } else {
+      icon.classList.add('ch');
+      icon.textContent = '📹';  // 固定枪机
+      icon.title = '固定摄像头（不支持云台）';
+    }
+  } else if (isDev) {
+    icon.classList.add('org');
+    icon.textContent = '📷';
+  } else {
+    icon.classList.add('org');
+    icon.textContent = '📁';
+  }
+  row.appendChild(icon);
+
+  // 名称
+  const label = document.createElement('span');
+  label.className = 'node-label';
+  label.textContent = nodeName;
+  row.appendChild(label);
+
+  // 在线状态（设备节点和通道节点显示状态灯）
+  if (isChannel || isDev) {
+    const status = document.createElement('span');
+    const online = node.checkStat === 1 || node.isOnline === 1;
+    status.className = 'node-status ' + (online ? 'online' : 'offline');
+    row.appendChild(status);
+  }
+
+  // 点击事件
+  if (isChannel) {
+    const hasPtz = (parseInt(node.cameraType) || 1) >= 2;
+    row.onclick = (e) => {
+      e.stopPropagation();
+      selectChannelByApi(nodeId, nodeName, hasPtz);
+      highlightNode(li);
+    };
+  } else if (canExpand) {
+    row.onclick = () => toggleNode(li);
+  }
+
+  li.appendChild(row);
+  return li;
+}
+
+// ==================== 树操作（含懒加载） ====================
+
+/**
+ * 将ICC子节点追加到父UL，设备(dev)节点自动扁平化：
+ * dev节点自身不显示，其下的通道(ch)直接作为父组织的子节点展示，
+ * 与源头官网的树结构保持一致。
+ */
+async function appendChildrenFlattened(children, parentUl) {
+  children.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+
+  const fetchTasks = [];
+  const directItems = [];
+
+  for (const child of children) {
+    // 过滤指定名称的组织节点（如"高低点视频"、"分析服务器"）
+    if (isFilteredOrg(child.name)) continue;
+    if (child.nodeType === 'dev' && child.isParent === true) {
+      // 设备节点：异步拉取其通道，扁平化到父级
+      fetchTasks.push((async () => {
+        try {
+          const devResp = await fetch(API_BASE + '/device-tree?orgId=' + encodeURIComponent(String(child.id)));
+          const devJson = await devResp.json();
+          if (devJson.success === true && devJson.data && Array.isArray(devJson.data)) {
+            devJson.data.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+            devJson.data.forEach(ch => {
+              if (ch.nodeType === 'ch') {
+                parentUl.appendChild(createTreeNodeFromIcc(ch));
+              }
+            });
+          }
+        } catch (e) {
+          console.warn('扁平化设备节点失败:', child.id, child.name, e);
+        }
+      })());
+    } else {
+      directItems.push(child);
+    }
+  }
+
+  // 非设备节点（org、ch等）直接追加
+  directItems.forEach(child => parentUl.appendChild(createTreeNodeFromIcc(child)));
+
+  // 等待所有设备扁平化任务完成
+  await Promise.all(fetchTasks);
+}
+
+/**
+ * 展开/折叠树节点
+ * 若节点未加载过子节点（isParent=true, loaded=false），则从API懒加载
+ */
+function toggleNode(li) {
+  const canExpand = li.dataset.isParent === 'true';
+  const loaded = li.dataset.loaded === 'true';
+  const isExpanded = li.classList.contains('expanded');
+
+  if (!canExpand) return; // 叶子节点不处理
+
+  // 还没加载过子节点 → 从API懒加载
+  if (!loaded && !isExpanded) {
+    loadNodeChildren(li);
+    return;
+  }
+
+  // 已加载 → 切换展开/折叠
+  li.classList.toggle('expanded');
+  const kids = li.querySelector(':scope > .children');
+  if (kids) {
+    kids.classList.toggle('collapsed');
+  }
+}
+
+/**
+ * 懒加载节点的子节点（调用设备树API）
+ */
+async function loadNodeChildren(li) {
+  const nodeId = li.dataset.id;
+  if (!nodeId) return;
+
+  // 显示加载中
+  const row = li.querySelector('.node-row');
+  const label = row ? row.querySelector('.node-label') : null;
+  const origText = label ? label.textContent : '';
+  if (label) label.textContent = origText + ' ⏳';
+
+  try {
+    const resp = await fetch(API_BASE + '/device-tree?orgId=' + encodeURIComponent(nodeId));
+    const json = await resp.json();
+
+    if (json.success !== true) {
+      throw new Error(json.desc || '加载失败: ' + json.code);
+    }
+
+    const children = json.data;
+    if (!children || !Array.isArray(children) || children.length === 0) {
+      // 没有子节点 → 更新为叶子节点
+      li.dataset.isParent = 'false';
+      li.classList.add('leaf');
+      const expIcon = li.querySelector('.expand-icon');
+      if (expIcon) expIcon.style.visibility = 'hidden';
+    } else {
+      // 创建子节点列表（设备节点自动扁平化，通道直接挂在组织下）
+      const kidsUl = document.createElement('ul');
+      kidsUl.className = 'children';
+
+      await appendChildrenFlattened(children, kidsUl);
+
+      li.appendChild(kidsUl);
+    }
+
+    li.dataset.loaded = 'true';
+    li.classList.add('expanded');
+    const kidsUl = li.querySelector(':scope > .children');
+    if (kidsUl) kidsUl.classList.remove('collapsed');
+    updateChannelCount();
+  } catch (err) {
+    console.error('加载子节点失败 nodeId=' + nodeId, err);
+    if (label) label.textContent = origText + ' ❌';
+    setTimeout(() => { if (label) label.textContent = origText; }, 2500);
+  } finally {
+    if (label) label.textContent = origText;
+  }
+}
+
+function collapseAllOrgs() {
+  // 收缩所有可展开节点（org 和 dev 都可能 isParent=true）
+  document.querySelectorAll('.tree-node').forEach(n => {
+    if (n.dataset.isParent !== 'true') return;
+    // 跳过根节点
+    if (n.dataset.id === '001') return;
+    n.classList.remove('expanded');
+    const kids = n.querySelector(':scope > .children');
+    if (kids) kids.classList.add('collapsed');
+  });
+  const root = document.querySelector('.tree-node[data-id="001"]');
+  if (root) {
+    root.classList.add('expanded');
+    const rootKids = root.querySelector(':scope > .children');
+    if (rootKids) rootKids.classList.remove('collapsed');
+  }
+}
+
+function highlightNode(li) {
+  document.querySelectorAll('.tree-node .node-row.active').forEach(r => r.classList.remove('active'));
+  li.querySelector('.node-row').classList.add('active');
+}
+
+// ==================== 搜索过滤 ====================
+function filterTree() {
+  const keyword = document.getElementById('treeSearch').value.trim().toLowerCase();
+  const allNodes = document.querySelectorAll('.tree-node');
+
+  // 重置所有过滤状态
+  allNodes.forEach(n => {
+    n.classList.remove('filtered-out', 'filter-match');
+  });
+
+  if (!keyword) {
+    collapseAllOrgs();
+    return;
+  }
+
+  // 匹配已加载到 DOM 的节点
+  const matched = new Set();
+  allNodes.forEach(n => {
+    const name = (n.dataset.name || '').toLowerCase();
+    if (name.includes(keyword)) {
+      matched.add(n);
+      n.classList.add('filter-match');
+    }
+  });
+
+  // 同时搜索 channelList（懒加载未展开的通道）
+  let hasChannelMatch = false;
+  channelList.forEach(ch => {
+    if (ch.name.toLowerCase().includes(keyword)) {
+      hasChannelMatch = true;
+    }
+  });
+
+  // DOM 无匹配 + channelList 也无匹配 → 折叠回默认，不隐藏树
+  // DOM 无匹配 + channelList 有匹配 → 折叠回默认（匹配节点可能未展开，避免全部隐藏）
+  if (matched.size === 0) {
+    collapseAllOrgs();
+    // 若 channelList 有匹配，闪烁搜索框提示结果在未展开节点中
+    if (hasChannelMatch) {
+      const searchBox = document.querySelector('.search-box');
+      searchBox.style.transition = 'none';
+      searchBox.style.borderColor = '#faad14';
+      searchBox.style.background = '#fffbe6';
+      setTimeout(() => {
+        searchBox.style.transition = 'border-color .5s, background .5s';
+        searchBox.style.borderColor = '';
+        searchBox.style.background = '';
+      }, 1200);
+    }
+    return;
+  }
+
+  // 找出哪些节点是匹配节点的祖先（它们应该保持可见）
+  allNodes.forEach(n => {
+    if (matched.has(n)) return;
+    let isAncestor = false;
+    // 注意：tree-node 的子节点在 ul.children > li.tree-node 之下
+    const walk = (node) => {
+      const childrenUl = node.querySelector(':scope > .children');
+      if (!childrenUl) return;
+      for (const child of childrenUl.children) {
+        if (child.classList && child.classList.contains('tree-node')) {
+          if (matched.has(child)) { isAncestor = true; return; }
+          walk(child);
+        }
+      }
+    };
+    walk(n);
+
+    if (!isAncestor && !matched.has(n)) {
+      n.classList.add('filtered-out');
+    } else if (isAncestor) {
+      n.classList.add('expanded');
+      const kids = n.querySelector(':scope > .children');
+      if (kids) kids.classList.remove('collapsed');
+    }
+  });
+
+  // 展开匹配节点及其所有祖先
+  matched.forEach(n => {
+    n.classList.add('expanded');
+    const kids = n.querySelector(':scope > .children');
+    if (kids) kids.classList.remove('collapsed');
+    let parent = n.parentElement;
+    while (parent && parent.classList.contains('children')) {
+      const pNode = parent.parentElement;
+      if (pNode && pNode.classList.contains('tree-node')) {
+        pNode.classList.add('expanded');
+        parent.classList.remove('collapsed');
+      }
+      parent = pNode ? pNode.parentElement : null;
+    }
+  });
+}
+
+// ==================== 通道选择 ====================
+function selectChannelByApi(channelId, chName, hasPtzFromNode) {
+  // 切割通道时强制清理旧通道遗留的 PTZ 定时器，防止向新通道发送云台命令
+  cleanupPtzTimers();
+  selectedChannelId = channelId;
+
+  // 查找通道详情（在线状态 + PTZ能力）
+  const chInfo = channelList.find(c => c.channelId === channelId);
+  const isOnline = chInfo ? chInfo.isOnline : null;
+
+  // 查找该通道是否支持云台（三路：传参 > channelList > DOM兜底）
+  if (typeof hasPtzFromNode === 'boolean') {
+    selectedChannelHasPtz = hasPtzFromNode;
+  } else {
+    const chInfo = channelList.find(c => c.channelId === channelId);
+    if (chInfo) {
+      selectedChannelHasPtz = chInfo.hasPtz;
+    } else {
+      // channelList未命中时遍历DOM树节点读取预存的PTZ能力（不用CSS选择器，避免$等特殊字符问题）
+      let found = false;
+      document.querySelectorAll('.tree-node').forEach(li => {
+        if (li.dataset.channelId === channelId) {
+          selectedChannelHasPtz = li.dataset.hasPtz === 'true';
+          found = true;
+        }
+      });
+      if (!found) selectedChannelHasPtz = false;
+      console.warn('[PTZ] channelList未找到通道，从DOM遍历兜底：' + chName + ', PTZ=' + selectedChannelHasPtz);
+    }
+  }
+  console.log('[PTZ] 选中通道：' + chName + ', PTZ=' + selectedChannelHasPtz);
+
+  // 更新PTZ面板状态
+  updatePtzState();
+
+  // 避免重复：已选中同一通道时只更新焦点，不重建网格
+  if (activeChannels.some(c => c.channelId === channelId)) {
+    selectedCellIndex = activeChannels.findIndex(c => c.channelId === channelId);
+    focusCell(selectedCellIndex);
+    return;
+  }
+
+  if (activeChannels.length < pageSize) {
+    activeChannels.push({ channelId, name: chName, isOnline });
+    selectedCellIndex = activeChannels.length - 1;
+  } else {
+    // 格子已满，替换当前选中位置：先销毁旧通道的播放器再重建
+    destroyPlayer(selectedCellIndex);
+    activeChannels[selectedCellIndex] = { channelId, name: chName, isOnline };
+  }
+  renderVideoGrid();
+}
+
+// ==================== 视频流加载 ====================
+async function loadStreamForCell(cellIdx) {
+  const ch = activeChannels[cellIdx];
+  if (!ch || !ch.channelId) return;
+
+  // 离线通道：不尝试拉流，直接显示离线状态
+  if (ch.isOnline === false) {
+    showStreamError(cellIdx, '设备离线，无法观看');
+    return;
+  }
+
+  const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
+  if (!cell) return;
+
+  // 清除旧播放器
+  destroyPlayer(cellIdx);
+
+  // 显示加载中
+  const placeholder = cell.querySelector('.placeholder');
+  if (placeholder) {
+    placeholder.querySelector('.text').textContent = '正在获取视频流...';
+  }
+
+  try {
+    const resp = await fetch(API_BASE + '/stream-url?channelId=' + encodeURIComponent(ch.channelId) +
+      '&streamType=2&protocol=hls');
+    const json = await resp.json();
+
+    if (json.success !== true || !json.data || !json.data.url) {
+      throw new Error(json.desc || '获取流地址失败');
+    }
+
+    // 使用hls.js播放
+    playHls(cellIdx, json.data.url);
+  } catch (err) {
+    console.error('加载视频流失败:', err);
+    showStreamError(cellIdx, err.message);
+  }
+}
+
+function playHls(cellIdx, url) {
+  const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
+  if (!cell) return;
+
+  // 移除占位
+  const placeholder = cell.querySelector('.placeholder');
+  if (placeholder) placeholder.style.display = 'none';
+
+  // 移除旧错误提示
+  const oldErr = cell.querySelector('.stream-error');
+  if (oldErr) oldErr.remove();
+
+  // 创建或复用video元素
+  let video = cell.querySelector('video');
+  if (!video) {
+    video = document.createElement('video');
+    video.muted = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block';
+    cell.appendChild(video);
+  }
+
+  if (Hls.isSupported()) {
+    const hls = new Hls({
+      enableWorker: false,  // 关闭worker，便于查看完整错误堆栈（诊断HEVC问题）
+      lowLatencyMode: false,
+      backBufferLength: 90,
+      debug: true,
+      // 缓冲与追帧优化（防止bufferNudgeOnStall）
+      maxBufferLength: 60,             // 最大缓冲60秒（默认30），给转码延迟留足余量
+      maxMaxBufferLength: 600,         // 自动缓冲上限（默认600）
+      liveSyncDurationCount: 8,        // ★ 初始缓冲8个分片(~16s)，应对NVR取流~1.7s/段的慢速链路
+      liveMaxLatencyDurationCount: 10, // 最大延迟10个分片后才跳帧
+      fragLoadingTimeOut: 20000,       // ★ 分片加载超时20秒（独立于liveSyncDurationCount），代理转码+网络波动需宽限
+      fragLoadingMaxRetry: 6,          // ★ 分片加载失败最多重试6次（默认3），代理链路不稳定时容错
+      fragLoadingRetryDelay: 1000,     // ★ 分片重试间隔1秒（默认0），避免NVR限流
+      nudgeMaxRetry: 12,               // 追帧最大重试次数（默认3），增强卡顿恢复能力
+      nudgeOffset: 0.5,                // ★ 追帧步长0.5秒（从0.2加大），一次跳过PTS间隙
+      highBufferWatchdogPeriod: 2,     // 高频缓冲看门狗2秒检查一次（默认3）
+      maxFragLookUpTolerance: 1.0      // ★ 允许1秒的分片查找容差（处理PTS微漂移累积）
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+    });
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      // 所有错误都记录详细信息用于诊断
+      console.error('HLS错误:', {
+        type: data.type,
+        details: data.details,
+        fatal: data.fatal,
+        frag: data.frag ? { url: data.frag.url, type: data.frag.type, sn: data.frag.sn } : null,
+        reason: data.reason || '',
+        err: data.err ? (data.err.message || data.err) : '',
+        url: data.url || ''
+      });
+      if (data.fatal) {
+        showStreamError(cellIdx, 'HLS播放失败: ' + data.details);
+        hls.destroy();
+        delete hlsPlayers[cellIdx]; // 清理引用，允许下次重新加载
+      }
+    });
+    hlsPlayers[cellIdx] = hls;
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari原生HLS支持
+    video.src = url;
+    video.addEventListener('loadedmetadata', () => { video.play().catch(() => {}); });
+  } else {
+    showStreamError(cellIdx, '浏览器不支持HLS播放，请使用Chrome/Firefox/Edge');
+  }
+}
+
+function destroyPlayer(cellIdx) {
+  const hls = hlsPlayers[cellIdx];
+  if (hls) {
+    hls.destroy();
+    delete hlsPlayers[cellIdx];
+  }
+  const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
+  if (cell) {
+    const video = cell.querySelector('video');
+    if (video) {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+      video.remove();
+    }
+    const err = cell.querySelector('.stream-error');
+    if (err) err.remove();
+    const placeholder = cell.querySelector('.placeholder');
+    if (placeholder) placeholder.style.display = '';
+  }
+}
+
+function showStreamError(cellIdx, msg) {
+  const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
+  if (!cell) return;
+  const oldErr = cell.querySelector('.stream-error');
+  if (oldErr) oldErr.remove();
+  const errDiv = document.createElement('div');
+  errDiv.className = 'stream-error';
+  errDiv.innerHTML = '⚠ ' + msg + '<br><small style="margin-top:4px;cursor:pointer;color:#91d5ff" onclick="retryStream(' + cellIdx + ')">点击重试</small>';
+  cell.appendChild(errDiv);
+}
+
+function retryStream(cellIdx) {
+  const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
+  if (cell) {
+    const err = cell.querySelector('.stream-error');
+    if (err) err.remove();
+  }
+  loadStreamForCell(cellIdx);
+}
+
+// ==================== 视频网格渲染 ====================
+// 关键策略：innerHTML 前先移除并用 JS 变量保存 video 元素，innerHTML 后再插回
+// — 直接移走/插回 video 元素，不 detachMedia/attachMedia，MediaSource 不重建、不重缓冲
+function renderVideoGrid() {
+  const grid = document.getElementById('videoGrid');
+  grid.className = 'video-grid layout-' + currentLayout;
+
+  if (activeChannels.length === 0) {
+    // 清理所有播放器，释放资源
+    Object.keys(hlsPlayers).forEach(idx => destroyPlayer(parseInt(idx)));
+    grid.classList.add('empty');
+    grid.innerHTML = `<div class="empty-state">
+      <div class="empty-icon">📹</div><div class="empty-main">请从左侧树中选择监控点位</div>
+      <div class="empty-sub">点击渠道节点即可预览视频</div></div>`;
+    document.getElementById('toolbarInfo').innerHTML = '当前预览：<span>--</span>';
+    document.getElementById('footbar').innerHTML = '';
+    updatePtzState();
+    return;
+  }
+
+  const totalPages = Math.ceil(activeChannels.length / pageSize);
+  if (currentPage > totalPages) currentPage = totalPages;
+  const start = (currentPage - 1) * pageSize;
+  const pageItems = activeChannels.slice(start, start + pageSize);
+
+  // 清理不在当前页的播放器（切页/布局变化时）
+  Object.keys(hlsPlayers).forEach(idx => {
+    if (!pageItems.some((_, i) => (start + i) === parseInt(idx))) {
+      destroyPlayer(parseInt(idx));
+    }
+  });
+
+  // ===== innerHTML 前：把当前存在的 video 元素从 DOM 移走，JS 变量持有 ====
+  // innerHTML 只销毁 DOM，不销毁 JS 对象；移走后 video 继续在内存中播放
+  const savedVideos = {};
+  Object.keys(hlsPlayers).forEach(idx => {
+    const cell = document.querySelector('.video-cell[data-index="' + idx + '"]');
+    if (cell) {
+      const video = cell.querySelector('video');
+      if (video) {
+        video.remove();       // 从 DOM 剥离但引用还在
+        savedVideos[idx] = video;
+      }
+    }
+  });
+
+  // 一次性构建所有 HTML 再设置 innerHTML，避免 += 导致多次 DOM 销毁
+  let gridHtml = pageItems.map((ch, i) => {
+    const realIdx = start + i;
+    const selected = realIdx === selectedCellIndex ? ' selected' : '';
+    const offline = ch.isOnline === false ? ' offline' : '';
+    const placeholderIcon = offline ? '🚫' : '📷';
+    const placeholderText = offline ? '设备离线' : '点击加载视频流';
+    const liveBadge = offline
+      ? '<span class="badge" style="color:#ff7875;font-weight:600">⚠ 离线</span>'
+      : '<span class="badge live">● LIVE</span>';
+    return `<div class="video-cell${selected}${offline}" data-index="${realIdx}" onclick="focusCell(${realIdx})" ondblclick="fullscreenCell(${realIdx})">
+      <div class="placeholder">
+        <div class="cam-icon">${placeholderIcon}</div>
+        <div class="text">${placeholderText}</div>
+      </div>
+      <div class="overlay-bar">
+        <span class="ch-name">${ch.name}</span>
+        <div class="badges">
+          ${liveBadge}
+          <span class="badge hd">HD</span>
+        </div>
+      </div>
+      <button class="single-btn" title="全屏此通道" onclick="event.stopPropagation();fullscreenCell(${realIdx})">⛶</button>
+    </div>`;
+  }).join('');
+
+  // 空占位
+  const emptySlots = pageSize - pageItems.length;
+  for (let i = 0; i < emptySlots; i++) {
+    gridHtml += `<div class="video-cell" style="border-style:dashed" onclick="selectEmptySlot()">
+      <div class="placeholder"><div class="cam-icon" style="font-size:36px">➕</div>
+      <div class="text">点击选择点位</div></div></div>`;
+  }
+
+  grid.innerHTML = gridHtml;
+
+  // ===== innerHTML 后：把保存的 video 插回新单元格 ====
+  // MediaSource 连接未中断 → 画面真正无缝，0 秒黑屏
+  pageItems.forEach((ch, i) => {
+    const realIdx = start + i;
+    const savedVideo = savedVideos[realIdx];
+
+    if (savedVideo) {
+      // 旧通道 → video 插回，不重建播放器
+      const cell = document.querySelector('.video-cell[data-index="' + realIdx + '"]');
+      if (cell) {
+        const placeholder = cell.querySelector('.placeholder');
+        if (placeholder) placeholder.style.display = 'none';
+        const oldErr = cell.querySelector('.stream-error');
+        if (oldErr) oldErr.remove();
+        cell.appendChild(savedVideo);
+        const recheckErr = cell.querySelector('.stream-error');
+        if (recheckErr) recheckErr.remove();
+      }
+    } else if (!hlsPlayers[realIdx]) {
+      // 没有 video 也没有播放器 → 新格子，首次加载视频流
+      loadStreamForCell(realIdx);
+    } else {
+      // 有播放器但无保存的 video（罕见：hls 刚创建未绑定 DOM）→ 重新加载
+      loadStreamForCell(realIdx);
+    }
+  });
+
+  const sel = activeChannels[selectedCellIndex];
+  document.getElementById('toolbarInfo').innerHTML =
+    '当前预览：<span>' + (sel ? sel.name + '（' + sel.channelId + '）' : '--') + '</span>';
+
+  renderPagination(totalPages);
+}
+
+function focusCell(idx) {
+  // 切割通道时强制清理旧通道遗留的 PTZ 定时器
+  if (idx !== selectedCellIndex) cleanupPtzTimers();
+  selectedCellIndex = idx;
+  selectedChannelId = activeChannels[idx] ? activeChannels[idx].channelId : null;
+  // 查找PTZ能力（三路：channelList → DOM遍历 → 默认false）
+  if (selectedChannelId) {
+    const chInfo = channelList.find(c => c.channelId === selectedChannelId);
+    if (chInfo) {
+      selectedChannelHasPtz = chInfo.hasPtz;
+    } else {
+      // 遍历DOM树节点避免CSS选择器$字符问题
+      let found = false;
+      document.querySelectorAll('.tree-node').forEach(li => {
+        if (li.dataset.channelId === selectedChannelId) {
+          selectedChannelHasPtz = li.dataset.hasPtz === 'true';
+          found = true;
+        }
+      });
+      if (!found) selectedChannelHasPtz = false;
+    }
+  } else {
+    selectedChannelHasPtz = false;
+  }
+  // 只更新CSS选中态，不重建DOM（否则会销毁video元素导致播放中断）
+  document.querySelectorAll('.video-cell.selected').forEach(el => el.classList.remove('selected'));
+  const cell = document.querySelector('.video-cell[data-index="' + idx + '"]');
+  if (cell) cell.classList.add('selected');
+  // 更新工具栏
+  const sel = activeChannels[idx];
+  document.getElementById('toolbarInfo').innerHTML =
+    '当前预览：<span>' + (sel ? sel.name + '（' + sel.channelId + '）' : '--') + '</span>';
+  // 更新PTZ面板状态
+  updatePtzState();
+}
+
+function selectEmptySlot() {
+  // 闪烁左侧设备树，引导用户从树中选择点位
+  const sidebar = document.querySelector('.sidebar');
+  if (sidebar) {
+    sidebar.style.transition = 'none';
+    sidebar.style.boxShadow = '0 0 0 3px #1a6fb5';
+    setTimeout(() => {
+      sidebar.style.transition = 'box-shadow .6s';
+      sidebar.style.boxShadow = '';
+    }, 100);
+    setTimeout(() => {
+      sidebar.style.boxShadow = '0 0 0 3px #1a6fb5';
+      setTimeout(() => {
+        sidebar.style.transition = 'box-shadow .8s';
+        sidebar.style.boxShadow = '';
+      }, 150);
+    }, 350);
+  }
+}
+
+function fullscreenCell(idx) {
+  const cell = document.querySelector('.video-cell[data-index="' + idx + '"]');
+  if (!cell) return;
+  if (cell.requestFullscreen) {
+    cell.requestFullscreen().catch(() => {});
+  }
+}
+
+// ==================== 分页 ====================
+function renderPagination(totalPages) {
+  const footbar = document.getElementById('footbar');
+  if (totalPages <= 1) { footbar.innerHTML = ''; return; }
+  let html = '';
+  html += `<button class="page-btn arrow" onclick="goPage(${currentPage - 1})" ${currentPage===1?'disabled':''}>◀</button>`;
+  for (let p = 1; p <= totalPages && p <= 12; p++) {
+    html += `<button class="page-btn${p === currentPage ? ' active' : ''}" onclick="goPage(${p})">${p}</button>`;
+  }
+  html += `<button class="page-btn arrow" onclick="goPage(${currentPage + 1})" ${currentPage===totalPages?'disabled':''}>▶</button>`;
+  footbar.innerHTML = html;
+}
+
+function goPage(p) {
+  const totalPages = Math.ceil(activeChannels.length / pageSize);
+  if (p < 1 || p > totalPages) return;
+  currentPage = p;
+  renderVideoGrid();
+}
+
+// ==================== 布局切换 ====================
+document.querySelectorAll('.layout-btns .btn').forEach(btn => {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('.layout-btns .btn').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+    currentLayout = parseInt(this.dataset.layout);
+    pageSize = currentLayout;
+    currentPage = 1;
+    // renderVideoGrid 内部会：①销毁不在当前页的播放器 ②reattach 仍在页内的播放器
+    // 无需提前全部销毁，避免所有视频重新拉流、重新缓冲
+    renderVideoGrid();
+  });
+});
+
+// ==================== PTZ 云台控制（对接后端API） ====================
+let ptzAbortController = null;
+let ptzLensAbortController = null;
+let lastPtzDirection = null;  // 记录最后一次方向移动的方向，用于停止时传给后端
+let ptzHardTimeout = null;    // 3秒硬超时timerId，防止stop指令丢失后永久失控
+let lastPtzRequestPromise = Promise.resolve();   // 最后一条方向START请求，STOP前await它保证顺序
+let lastLensRequestPromise = Promise.resolve();  // 最后一条镜头START请求
+let ptzOpSeq = 0;      // 方向操作代数：新按下时++，旧STOP重试发现代数变化即放弃（防止旧STOP杀死新START）
+let ptzLensOpSeq = 0;  // 镜头操作代数
+
+/**
+ * 发送方向停止命令到后端（可被 cleanup/forceStop/ptzStop 共用）
+ * ★ 低延迟策略：先 await 最后一条 START 完成（保证顺序），再发 STOP ×1；
+ * 失败自动重试（最多3次，间隔300ms），重试前检查操作代数，
+ * 用户已开始新操作则放弃（防止旧 STOP 打断新 START 造成延迟感）。
+ * 失控兜底：重试机制 + 3秒硬超时 + mouseup/blur 全局清理。
+ * @param {string} direction - 停止方向，null时尝试用lastPtzDirection兜底
+ */
+async function sendPtzStopCommand(direction) {
+  const dir = direction || lastPtzDirection;
+  const ch = selectedChannelId;
+  if (!ch || !dir) {
+    console.warn('[PTZ] sendPtzStopCommand 跳过：channelId=' + ch + ', dir=' + dir);
+    return;
+  }
+  const mySeq = ptzOpSeq;  // 记录当前操作代数
+  lastPtzDirection = null;  // 消费后清空，防止重复发送
+  console.log('[PTZ] 发送方向停止命令：channelId=' + ch + ', direction=' + dir);
+
+  // ★ 顺序保证：等最后一条 START 完成（最多等500ms），STOP 不会先于 START 到达后端
+  try {
+    await Promise.race([lastPtzRequestPromise, new Promise(r => setTimeout(r, 500))]);
+  } catch (e) { /* 忽略 */ }
+
+  // ★ STOP ×1 + 失败重试（最多3次，间隔300ms），成功即止
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // 代数检查：用户已开始新操作，由新操作的 STOP 负责，旧 STOP 放弃
+    if (ptzOpSeq !== mySeq) {
+      console.log('[PTZ] 停止命令放弃：用户已开始新操作');
+      return;
+    }
+    try {
+      const resp = await fetch(API_BASE + '/ptz/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelId: ch, direction: dir })
+      });
+      const json = await resp.json();
+      if (json.success === true) {
+        console.log('[PTZ] 停止命令第' + attempt + '次成功');
+        return;  // ★ 成功即止，无冗余发送
+      }
+      console.error('[PTZ] 停止命令第' + attempt + '次被拒绝：' + (json.desc || json.code));
+    } catch (err) {
+      console.error('[PTZ] 停止命令第' + attempt + '次发送失败（网络异常）：' + err.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] ⚠ 停止命令3次均失败！请检查网络或平台状态');
+}
+
+/**
+ * 强制停止所有PTZ操作（硬超时兜底 + 手动停止共用）
+ * 无论当前状态如何，都发送stop指令确保摄像头停止
+ */
+function forcePtzStop(reason) {
+  console.warn('[PTZ] forcePtzStop 触发，原因：' + reason + ', channelId=' + selectedChannelId);
+  // 清除所有定时器和请求
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  if (ptzAbortController) { ptzAbortController.abort(); ptzAbortController = null; }
+  if (ptzLensAbortController) { ptzLensAbortController.abort(); ptzLensAbortController = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  ptzUserInteracting = false;
+  // 发送方向停止指令（方向控制stop不会触发镜头误解bug，安全）
+  if (selectedChannelId && selectedChannelHasPtz && lastPtzDirection) {
+    sendPtzStopCommand(lastPtzDirection);
+  }
+}
+
+/**
+ * 强制清理所有 PTZ 定时器和飞行中的请求
+ * 用于切割通道时防止旧通道的定时器向新通道发送云台命令
+ * 注意：此函数也会发送stop指令，防止window.blur等场景下摄像头失控
+ */
+function cleanupPtzTimers() {
+  console.log('[PTZ] cleanupPtzTimers 被调用，重置所有定时器和安全锁');
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  // ★ 不再 abort 方向/镜头控制请求 —— 后端自适应延迟 + 前端 await→重试 机制可安全兜底
+  ptzAbortController = null;
+  ptzLensAbortController = null;
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  // ★ 修复漏洞：cleanup时也发送stop指令，防止window.blur等场景下摄像头不停
+  // 仅当用户之前在操作方向控制时发送（有lastPtzDirection说明之前按过方向按钮）
+  if (ptzUserInteracting && selectedChannelId && selectedChannelHasPtz && lastPtzDirection) {
+    console.warn('[PTZ] cleanup检测到未停止的PTZ操作，发送紧急停止指令');
+    sendPtzStopCommand(lastPtzDirection);
+  }
+  ptzUserInteracting = false;  // 安全锁复位
+}
+
+function togglePTZ() {
+  // 未选通道时不允许展开云台面板
+  if (!selectedChannelId) {
+    const drawer = document.getElementById('ptzDrawer');
+    // 闪烁提示用户先选通道
+    drawer.style.transition = 'none';
+    drawer.style.boxShadow = '0 0 0 2px #faad14';
+    setTimeout(() => {
+      drawer.style.transition = 'box-shadow .8s';
+      drawer.style.boxShadow = '';
+    }, 100);
+    return;
+  }
+  document.getElementById('ptzDrawer').classList.toggle('expanded');
+}
+
+/**
+ * 更新PTZ面板启用/禁用状态
+ * 未选通道时灰显并阻止操作，选中后恢复正常
+ */
+function updatePtzState() {
+  const drawer = document.getElementById('ptzDrawer');
+  const hint = drawer.querySelector('.ptz-hint');
+  if (selectedChannelId && selectedChannelHasPtz) {
+    drawer.classList.remove('ptz-disabled');
+    if (hint) hint.textContent = '';
+  } else if (selectedChannelId && !selectedChannelHasPtz) {
+    // 通道不支持云台（固定枪机）
+    drawer.classList.add('ptz-disabled');
+    drawer.classList.remove('expanded');
+    if (hint) hint.textContent = '⚠ 当前为固定摄像头，不支持云台控制';
+  } else {
+    drawer.classList.add('ptz-disabled');
+    drawer.classList.remove('expanded');
+    if (hint) hint.textContent = '⚠ 请先点击视频窗口选择通道';
+  }
+}
+
+
+
+async function sendPtzCommand(direction) {
+  if (!selectedChannelId) {
+    console.warn('[PTZ] sendPtzCommand 跳过：未选中通道');
+    return;
+  }
+  if (!selectedChannelHasPtz) {
+    console.warn('[PTZ] sendPtzCommand 跳过：当前通道不支持云台');
+    return;
+  }
+  // 每次成功发送方向命令时重置硬超时（用户持续按住时不误触发）
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  console.log('[PTZ] 发送方向命令：channelId=' + selectedChannelId + ', direction=' + direction);
+  // 取消上一次飞行中的请求，避免方向切换后旧命令阻塞新命令
+  if (ptzAbortController) {
+    ptzAbortController.abort();
+  }
+  ptzAbortController = new AbortController();
+  const speed = 5;
+  try {
+    const resp = await fetch(API_BASE + '/ptz/direct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId: selectedChannelId, direction: direction, speed: speed }),
+      signal: ptzAbortController.signal
+    });
+    const json = await resp.json();
+    if (json.success !== true) {
+      console.warn('[PTZ] 方向命令返回失败:', json.desc);
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('[PTZ] 方向命令失败:', err);
+    }
+  } finally {
+    // 请求完成后重置硬超时（3秒内必须有新请求，否则forceStop）
+    if (ptzTimer && ptzUserInteracting) {
+      if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+      ptzHardTimeout = setTimeout(() => {
+        console.error('[PTZ] ⚠ 3秒无新方向指令，硬超时强制停止');
+        forcePtzStop('3秒无新指令硬超时');
+      }, 3000);
+    }
+  }
+}
+
+function ptzStart(direction) {
+  console.log('[PTZ] ptzStart 用户按下：' + direction + ', channelId=' + selectedChannelId);
+  ptzOpSeq++;  // ★ 新操作代数：旧 STOP 重试时发现代数变化即放弃
+  ptzUserInteracting = true;  // 安全锁：标记用户正在操作
+  lastPtzDirection = direction;  // 记录方向，供停止时使用
+  // ★ 记录本次 START 请求 promise，供 sendPtzStopCommand 按序等待
+  lastPtzRequestPromise = sendPtzCommand(direction);
+  if (ptzTimer) clearInterval(ptzTimer);
+  // ★ 官方模式：START 一次即持续转动，改为 1 秒心跳维持，消除 150ms 高频连发的延迟感
+  ptzTimer = setInterval(() => { lastPtzRequestPromise = sendPtzCommand(direction); }, 1000);
+  // ★ 3秒硬超时兜底：即使stop事件丢失，3秒后强制停止，防止摄像头永久失控
+  if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+  ptzHardTimeout = setTimeout(() => {
+    console.error('[PTZ] ⚠ 3秒硬超时触发！强制停止方向移动');
+    forcePtzStop('3秒硬超时');
+  }, 3000);
+}
+
+function ptzStop() {
+  console.log('[PTZ] ptzStop 用户松开，channelId=' + selectedChannelId + ', lastDir=' + lastPtzDirection);
+  ptzUserInteracting = false;  // 安全锁：用户停止操作
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  // ★ 不再 abort START 请求 —— abort 可能导致快速点击时 START 还没到后端就被杀死
+  // ★ 新策略：sendPtzStopCommand 内部 await 最后一条 START + STOP ×1 重试 + 代数检查
+  ptzAbortController = null;
+  // 发送停止命令（即使lastPtzDirection为null也尝试发送，用后端默认方向兜底）
+  sendPtzStopCommand(lastPtzDirection);
+}
+
+async function sendPtzLens(action) {
+  if (!selectedChannelId) {
+    console.warn('[PTZ] sendPtzLens 跳过：未选中通道');
+    return;
+  }
+  if (!selectedChannelHasPtz) {
+    console.warn('[PTZ] sendPtzLens 跳过：当前通道不支持云台');
+    return;
+  }
+  // ★ 安全锁：只有用户正在按下按钮才允许发送镜头命令
+  // 防止旧版缓存的 auto-stop 定时器、cleanup 等非用户操作触发意外的镜头控制
+  if (!ptzUserInteracting) {
+    console.warn('[PTZ] 安全锁拦截镜头命令：非用户操作，action=' + action + ', channelId=' + selectedChannelId);
+    return;
+  }
+  console.log('[PTZ] 发送镜头命令：channelId=' + selectedChannelId + ', action=' + action);
+  if (ptzLensAbortController) {
+    ptzLensAbortController.abort();
+  }
+  ptzLensAbortController = new AbortController();
+  const speed = 5;
+  try {
+    await fetch(API_BASE + '/ptz/lens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId: selectedChannelId, action: action, speed: speed }),
+      signal: ptzLensAbortController.signal
+    });
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('[PTZ] 镜头命令失败:', err);
+    }
+  }
+}
+
+function ptzLensStart(action) {
+  console.log('[PTZ] ptzLensStart 用户按下：' + action + ', channelId=' + selectedChannelId);
+  ptzLensOpSeq++;  // ★ 新操作代数
+  ptzUserInteracting = true;  // 安全锁：标记用户正在操作
+  // ★ 记录本次 START 请求 promise，供 ptzLensStop 按序等待
+  lastLensRequestPromise = sendPtzLens(action);
+  if (ptzLensTimer) clearInterval(ptzLensTimer);
+  // ★ 官方模式：1 秒心跳维持
+  ptzLensTimer = setInterval(() => { lastLensRequestPromise = sendPtzLens(action); }, 1000);
+}
+
+async function ptzLensStop() {
+  console.log('[PTZ] ptzLensStop 用户松开，channelId=' + selectedChannelId);
+  ptzUserInteracting = false;  // 安全锁：用户停止操作
+  if (ptzLensTimer) { clearInterval(ptzLensTimer); ptzLensTimer = null; }
+  // ★ 不再 abort 镜头请求 —— abort 可能导致 START 还没到后端就被杀死
+  // ★ 新策略：await 最后一条 START + STOP ×1 重试 + 代数检查
+  ptzLensAbortController = null;
+
+  const ch = selectedChannelId;
+  const mySeq = ptzLensOpSeq;  // 记录当前操作代数
+
+  // ★ 顺序保证：等最后一条镜头 START 完成（最多等500ms）
+  try {
+    await Promise.race([lastLensRequestPromise, new Promise(r => setTimeout(r, 500))]);
+  } catch (e) { /* 忽略 */ }
+
+  // ★ STOP ×1 + 失败重试（最多3次，间隔300ms），成功即止
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (ptzLensOpSeq !== mySeq) {
+      console.log('[PTZ] 镜头停止命令放弃：用户已开始新操作');
+      return;
+    }
+    if (!ch) return;
+    try {
+      const resp = await fetch(API_BASE + '/ptz/lens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channelId: ch, action: 'stop' })
+      });
+      const json = await resp.json();
+      if (json.success === true) {
+        console.log('[PTZ] 镜头停止命令第' + attempt + '次成功');
+        return;
+      }
+      console.error('[PTZ] 镜头停止命令第' + attempt + '次被拒绝：' + (json.desc || json.code));
+    } catch (err) {
+      console.error('[PTZ] 镜头停止命令第' + attempt + '次发送失败（网络异常）：' + err.message);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] ⚠ 镜头停止命令3次均失败！请检查网络或平台状态');
+}
+
+// ==================== 工具栏按钮 ====================
+function refreshAll() {
+  Object.keys(hlsPlayers).forEach(idx => destroyPlayer(parseInt(idx)));
+  renderVideoGrid();
+}
+
+function toggleFullscreen() {
+  console.log('[全屏] toggleFullscreen 被调用，fullscreenElement=', document.fullscreenElement);
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    document.documentElement.requestFullscreen();
+  }
+}
+
+function updateFullscreenBtn(isFullscreen) {
+  const btn = document.querySelector('.fullscreen-btn');
+  if (btn) {
+    btn.innerHTML = isFullscreen ? '⛶ 退出' : '⛶ 全屏';
+    btn.title = isFullscreen ? '退出全屏' : '全屏';
+  }
+}
+
+// 记录浮动按钮的原始父节点，用于全屏退出后还原
+let fsExitBtnOriginalParent = null;
+
+// 监听浏览器全屏变化（ESC/F11 等方式退出），同步按钮状态
+document.addEventListener('fullscreenchange', () => {
+  const isFs = !!document.fullscreenElement;
+  const fsEl = document.fullscreenElement;
+  console.log('[全屏] fullscreenchange 触发，isFs=', isFs, 'element=', fsEl);
+  updateFullscreenBtn(isFs);
+  // 全屏时隐藏入口型按钮（格内⛶），避免和浮动退出按钮叠在一起
+  document.documentElement.classList.toggle('is-fullscreen', isFs);
+
+  const floatBtn = document.getElementById('fsExitBtn');
+  if (!floatBtn) return;
+
+  if (isFs && fsEl && fsEl.classList.contains('video-cell')) {
+    // ★ 视频格全屏：浮动按钮不在cell子树内 → 不可见 → 注入到cell内
+    if (!fsExitBtnOriginalParent) {
+      fsExitBtnOriginalParent = floatBtn.parentElement;
+    }
+    fsEl.appendChild(floatBtn);
+    floatBtn.style.top = '16px';
+    floatBtn.style.right = '16px';
+    floatBtn.classList.add('visible');
+  } else {
+    // 退出全屏 / 整页全屏：还原浮动按钮到body
+    if (fsExitBtnOriginalParent && floatBtn.parentElement !== fsExitBtnOriginalParent) {
+      fsExitBtnOriginalParent.appendChild(floatBtn);
+      fsExitBtnOriginalParent = null;
+      floatBtn.style.top = '80px';
+      floatBtn.style.right = '24px';
+    }
+    floatBtn.classList.toggle('visible', isFs);
+  }
+});
+
+function updateChannelCount() {
+  if (channelCountCache) {
+    document.getElementById('channelCount').textContent =
+      '在线' + channelCountCache.online + '路，离线' + channelCountCache.offline + '路';
+  } else {
+    const online = channelList.filter(c => c.isOnline).length;
+    const offline = channelList.length - online;
+    document.getElementById('channelCount').textContent = '在线' + online + '路，离线' + offline + '路';
+  }
+}
+
+// ==================== 初始化 ====================
+function init() {
+  updatePtzState(); // 初始无选中通道，PTZ灰显
+  loadDeviceTree();
+
+  // 全局兜底：鼠标松开时强制清理 PTZ 定时器
+  // 当鼠标在按钮外松开（如拖出浏览器窗口），onmouseleave 可能不触发
+  document.addEventListener('mouseup', cleanupPtzTimers);
+  // 窗口失焦时也清理：切换标签页/最小化等场景
+  window.addEventListener('blur', cleanupPtzTimers);
+
+  // ★ 浏览器标签页可见性恢复：最小化/切换标签页后回来
+  // 注意：hls.js v1.x 内部会自动恢复分片加载（定时器恢复后自动续传），
+  // 手动调用 startLoad() 反而干扰 hls.js 状态机，触发虚假 bufferStalledError
+  let pageWasHidden = false;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      pageWasHidden = true;
+    } else if (document.visibilityState === 'visible' && pageWasHidden) {
+      pageWasHidden = false;
+      // 仅恢复 video.play()（浏览器可能暂停视频），让 hls.js 自行恢复加载
+      setTimeout(() => {
+        Object.keys(hlsPlayers).forEach(idx => {
+          const hls = hlsPlayers[idx];
+          if (hls && hls.media) {
+            const video = hls.media;
+            if (video && video.paused) {
+              video.play().catch(() => {});
+            }
+          }
+        });
+      }, 500);
+    }
+  });
+}
+
+document.addEventListener('DOMContentLoaded', init);
+
+// 窗口大小变化（CSS grid 自动响应，无需重建视频网格）
+// let resizeDebounce;
+// window.addEventListener('resize', () => {
+//   clearTimeout(resizeDebounce);
+//   resizeDebounce = setTimeout(() => renderVideoGrid(), 300);
+// });
+</script>
+</body>
+</html>

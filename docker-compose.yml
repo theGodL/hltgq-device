@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  hltgq-device:
+    image: hltgq-device:latest
+    container_name: hltgq-device
+    restart: unless-stopped
+    ports:
+      - "18686:18686"
+    # 环境变量（覆盖 application.properties 中的配置，按需修改）
+    environment:
+      - TZ=Asia/Shanghai
+      # 如需覆盖 ICC 平台地址：
+      # - ICC_SDK_HOST=60.175.44.252:9443
+      # - ICC_SDK_HLS_PORT=7086
+    # 日志持久化（可选）
+    volumes:
+      - ./logs:/app/logs
+    # 资源限制（按服务器配置调整）
+    deploy:
+      resources:
+        limits:
+          memory: 1024M    # 含 ffmpeg 转码建议 ≥1G
+        reservations:
+          memory: 512M
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18686/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
