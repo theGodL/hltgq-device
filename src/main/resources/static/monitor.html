@@ -49,7 +49,7 @@ ul,li{list-style:none}
   font-size:14px;font-weight:600;color:#444
 }
 .sidebar-header .count{font-size:12px;color:#999}
-.tree-wrap{flex:1;overflow-y:auto;overflow-x:hidden;padding:4px 0;scrollbar-width:thin;scrollbar-color:#d0d5dd transparent}
+.tree-wrap{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:4px 0;scrollbar-width:thin;scrollbar-color:#d0d5dd transparent}
 .tree-wrap::-webkit-scrollbar{width:5px}
 .tree-wrap::-webkit-scrollbar-thumb{background:#d0d5dd;border-radius:3px}
 
@@ -146,14 +146,17 @@ ul,li{list-style:none}
 .video-cell:hover .single-btn{display:flex}
 .video-cell .single-btn:hover{background:rgba(26,111,181,.7)}
 
-/* ============ PTZ 云台控制（左下角抽屉式） ============ */
+/* ============ PTZ 云台控制（侧边栏下方抽屉式） ============ */
 .ptz-drawer{
-  position:fixed;left:280px;right:0;bottom:0;z-index:90;
+  flex-shrink:0;border-top:1px solid #e0e4e8;
   display:flex;flex-direction:column;
-  transition:transform .35s cubic-bezier(.4,0,.2,1);
-  transform:translateY(calc(100% - 42px));
 }
-.ptz-drawer.expanded{transform:translateY(0)}
+.ptz-drawer-body-wrap{
+  overflow:hidden;
+  transition:max-height .35s cubic-bezier(.4,0,.2,1);
+  max-height:0;
+}
+.ptz-drawer.expanded .ptz-drawer-body-wrap{max-height:320px}
 
 /* PTZ 禁用态：阻止操作，红色提示醒目可见 */
 .ptz-drawer.ptz-disabled .ptz-drawer-body{pointer-events:none}
@@ -162,7 +165,7 @@ ul,li{list-style:none}
 .ptz-drawer .ptz-hint{display:none;font-size:14px;color:#ff4d4f;font-weight:600;margin-left:8px}
 .ptz-drawer.ptz-disabled .ptz-hint{display:inline}
 .ptz-drawer-header{
-  height:42px;background:#fff;border-top:1px solid #d0d5dd;border-left:1px solid #e0e4e8;
+  height:42px;background:#fff;
   display:flex;align-items:center;justify-content:space-between;padding:0 16px;
   cursor:pointer;user-select:none;flex-shrink:0;
   box-shadow:0 -2px 8px rgba(0,0,0,.06);
@@ -174,9 +177,8 @@ ul,li{list-style:none}
 .ptz-drawer-header .ptz-toggle-arrow{font-size:12px;color:#999;transition:transform .3s;display:inline-block}
 .ptz-drawer.expanded .ptz-toggle-arrow{transform:rotate(180deg)}
 .ptz-drawer-body{
-  background:#fff;border-left:1px solid #e0e4e8;border-top:1px solid #e8ecf0;
-  padding:16px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;
-  box-shadow:0 -4px 16px rgba(0,0,0,.08)
+  background:#fff;border-top:1px solid #e8ecf0;
+  padding:16px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;justify-content:center
 }
 .ptz-drawer-body .ptz-section{display:flex;flex-direction:column;align-items:center;gap:6px}
 .ptz-drawer-body .ptz-section-label{font-size:11px;color:#999;font-weight:500}
@@ -238,8 +240,7 @@ ul,li{list-style:none}
 .empty-state .empty-sub{font-size:14px;color:#b0b8c4}
 
 /* 响应式 */
-@media(max-width:1024px){.sidebar{width:240px;min-width:240px}.ptz-drawer{left:240px}}
-@media(max-width:768px){.sidebar{display:none}.ptz-drawer{left:0}}
+@media(max-width:768px){.sidebar{display:none}}
 </style>
 </head>
 <body>
@@ -275,6 +276,51 @@ ul,li{list-style:none}
     <div class="tree-wrap" id="treeContainer">
       <div class="tree-loading">⏳ 正在加载设备树...</div>
     </div>
+
+    <!-- PTZ 云台控制（侧边栏下方抽屉式） -->
+    <div class="ptz-drawer" id="ptzDrawer">
+      <div class="ptz-drawer-header" onclick="togglePTZ()">
+        <div class="ptz-header-left">
+          <span class="ptz-dot"></span>
+          <span>☁ 云台控制</span>
+          <span class="ptz-hint">⚠ 请选择视频通道</span>
+        </div>
+        <span class="ptz-toggle-arrow">▲</span>
+      </div>
+      <div class="ptz-drawer-body-wrap">
+        <div class="ptz-drawer-body">
+          <div class="ptz-section">
+            <span class="ptz-section-label">方向控制</span>
+            <div class="ptz-pad">
+              <button class="empty"></button>
+              <button title="上" onmousedown="ptzStart('up')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▲</button>
+              <button class="empty"></button>
+              <button title="左" onmousedown="ptzStart('left')" onmouseup="ptzStop()" onmouseleave="ptzStop()">◀</button>
+              <button class="center-btn" onclick="ptzStop()">停</button>
+              <button title="右" onmousedown="ptzStart('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▶</button>
+              <button class="empty"></button>
+              <button title="下" onmousedown="ptzStart('down')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▼</button>
+              <button class="empty"></button>
+            </div>
+          </div>
+          <div class="ptz-section">
+            <span class="ptz-section-label">镜头控制</span>
+            <div class="ptz-actions">
+              <button title="左上" onmousedown="ptzStart('upleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↖</button>
+              <button title="右上" onmousedown="ptzStart('upright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↗</button>
+              <button title="变倍+" onmousedown="ptzLensStart('zoomIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁺</button>
+              <button title="变倍-" onmousedown="ptzLensStart('zoomOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁻</button>
+              <button title="左下" onmousedown="ptzStart('downleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↙</button>
+              <button title="右下" onmousedown="ptzStart('downright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↘</button>
+              <button title="聚焦+" onmousedown="ptzLensStart('focusIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁺</button>
+              <button title="聚焦-" onmousedown="ptzLensStart('focusOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁻</button>
+              <button title="光圈+" onmousedown="ptzLensStart('irisIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁺</button>
+              <button title="光圈-" onmousedown="ptzLensStart('irisOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁻</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- 右侧预览区 -->
@@ -290,50 +336,6 @@ ul,li{list-style:none}
       </div>
     </div>
     <div class="footbar" id="footbar"></div>
-  </div>
-</div>
-
-<!-- PTZ 云台控制（左下角抽屉式） -->
-<div class="ptz-drawer" id="ptzDrawer">
-  <div class="ptz-drawer-header" onclick="togglePTZ()">
-    <div class="ptz-header-left">
-      <span class="ptz-dot"></span>
-      <span>☁ 云台控制</span>
-      <span class="ptz-hint">⚠ 请先点击视频窗口选择通道</span>
-    </div>
-    <span class="ptz-toggle-arrow">▲</span>
-  </div>
-  <div class="ptz-drawer-body">
-    <div class="ptz-section">
-      <span class="ptz-section-label">方向控制</span>
-      <div class="ptz-pad">
-        <button class="empty"></button>
-        <button title="上" onmousedown="ptzStart('up')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▲</button>
-        <button class="empty"></button>
-        <button title="左" onmousedown="ptzStart('left')" onmouseup="ptzStop()" onmouseleave="ptzStop()">◀</button>
-        <button class="center-btn" onclick="ptzStop()">停</button>
-        <button title="右" onmousedown="ptzStart('right')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▶</button>
-        <button class="empty"></button>
-        <button title="下" onmousedown="ptzStart('down')" onmouseup="ptzStop()" onmouseleave="ptzStop()">▼</button>
-        <button class="empty"></button>
-      </div>
-    </div>
-    <div class="ptz-section">
-      <span class="ptz-section-label">镜头控制</span>
-      <div class="ptz-actions">
-        <button title="左上" onmousedown="ptzStart('upleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↖</button>
-        <button title="右上" onmousedown="ptzStart('upright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↗</button>
-        <button title="变倍+" onmousedown="ptzLensStart('zoomIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁺</button>
-        <button title="变倍-" onmousedown="ptzLensStart('zoomOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁻</button>
-        <button title="左下" onmousedown="ptzStart('downleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↙</button>
-        <button title="右下" onmousedown="ptzStart('downright')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↘</button>
-        <button title="聚焦+" onmousedown="ptzLensStart('focusIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁺</button>
-        <button title="聚焦-" onmousedown="ptzLensStart('focusOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◉⁻</button>
-        <button title="光圈+" onmousedown="ptzLensStart('irisIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁺</button>
-        <button title="光圈-" onmousedown="ptzLensStart('irisOut')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">◎⁻</button>
-      </div>
-    </div>
-
   </div>
 </div>
 
@@ -1411,7 +1413,7 @@ function updatePtzState() {
   } else {
     drawer.classList.add('ptz-disabled');
     drawer.classList.remove('expanded');
-    if (hint) hint.textContent = '⚠ 请先点击视频窗口选择通道';
+    if (hint) hint.textContent = '⚠ 请选择视频通道';
   }
 }
 
