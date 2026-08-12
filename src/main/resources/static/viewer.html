@@ -11,6 +11,10 @@
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;color:#e0e0e0;background:#0a0a14;overflow:hidden}
+:root{
+  --side-w: clamp(120px, 18vw, 280px);
+  --pad-size: min(calc(var(--side-w) - 16px), 200px);
+}
 
 /* ========== 顶部信息栏 ========== */
 .topbar{
@@ -44,7 +48,7 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
   flex:1;display:flex;align-items:center;justify-content:center;
   background:#000;position:relative;min-height:0;min-width:0
 }
-.video-area video{width:100%;height:100%;object-fit:contain;display:block}
+.video-area video{width:100%;height:100%;object-fit:cover;display:block}
 .video-area .no-channel{
   display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;color:#555
 }
@@ -67,22 +71,22 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
 
 /* ========== PTZ 镜头控制（左侧边栏） ========== */
 .ptz-left{
-  width:150px;background:#141428;border-right:1px solid #1e1e3a;
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
-  flex-shrink:0;padding:8px
+  width:var(--side-w);background:#141428;border-right:1px solid #1e1e3a;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+  flex-shrink:0;padding:10px 12px;transition:width .2s ease
 }
 .ptz-left.disabled{opacity:.35;pointer-events:none}
 .ptz-left .ptz-section-label{
-  font-size:10px;color:#666;font-weight:500;letter-spacing:1px
+  font-size:clamp(10px, 1.1vw, 13px);color:#666;font-weight:500;letter-spacing:1px
 }
 
 /* 镜头按钮 - 纵向排列 */
 .ptz-left .ptz-actions{
-  display:flex;flex-direction:column;gap:4px;width:100%
+  display:flex;flex-direction:column;gap:6px;width:100%;max-width:220px
 }
 .ptz-left .ptz-actions button{
-  width:100%;padding:9px 6px;background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;
-  border-radius:5px;cursor:pointer;font-size:12px;transition:all .12s;
+  width:100%;padding:clamp(8px, 1.2vh, 14px) 8px;background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;
+  border-radius:6px;cursor:pointer;font-size:clamp(12px, 1.2vw, 15px);transition:all .12s;
   user-select:none;-webkit-user-select:none;white-space:nowrap
 }
 .ptz-left .ptz-actions button:hover{background:#252550;color:#91d5ff;border-color:#4a4a8a}
@@ -93,29 +97,29 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
 
 /* ========== PTZ 方向控制（右侧边栏） ========== */
 .ptz-sidebar{
-  width:150px;background:#141428;border-left:1px solid #1e1e3a;
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;
-  flex-shrink:0;padding:6px
+  width:var(--side-w);background:#141428;border-left:1px solid #1e1e3a;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  flex-shrink:0;padding:10px 12px;transition:width .2s ease
 }
 .ptz-sidebar.disabled{opacity:.35;pointer-events:none}
 .ptz-sidebar .ptz-section-label{
-  font-size:10px;color:#666;font-weight:500;letter-spacing:1px
+  font-size:clamp(10px, 1.1vw, 13px);color:#666;font-weight:500;letter-spacing:1px
 }
 
 /* 方向盘 */
 .ptz-pad{
   display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);
-  gap:3px;width:134px;height:134px
+  gap:4px;width:var(--pad-size);height:var(--pad-size)
 }
 .ptz-pad button{
-  background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;border-radius:5px;
-  cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;
+  background:#1a1a30;border:1px solid #2a2a4a;color:#aaa;border-radius:6px;
+  cursor:pointer;font-size:clamp(16px, 2.2vw, 22px);display:flex;align-items:center;justify-content:center;
   transition:all .12s;user-select:none;-webkit-user-select:none
 }
 .ptz-pad button:hover{background:#252550;color:#91d5ff;border-color:#4a4a8a}
 .ptz-pad button:active{background:#1a6fb5;color:#fff;border-color:#1a6fb5;transform:scale(.93)}
 .ptz-pad .empty{background:transparent;border:none;cursor:default;pointer-events:none}
-.ptz-pad .center-btn{background:#1e1e40;font-size:12px;font-weight:600;color:#91d5ff;border-color:#3a3a6a}
+.ptz-pad .center-btn{background:#1e1e40;font-size:clamp(12px, 1.4vw, 15px);font-weight:600;color:#91d5ff;border-color:#3a3a6a}
 .ptz-pad .center-btn:hover{background:#ff4d4f;color:#fff;border-color:#ff4d4f}
 
 /* ========== 全屏浮动退出按钮 ========== */
@@ -131,13 +135,17 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
 .fs-exit-btn:hover{background:rgba(26,111,181,.8);border-color:rgba(255,255,255,.5)}
 .fs-exit-btn.visible{display:flex}
 
-/* ========== 响应式 ========== */
+/* ========== 响应式兜底（无视频尺寸时） ========== */
+@media(max-width:900px){
+  :root{--side-w: clamp(100px, 16vw, 180px)}
+}
 @media(max-width:600px){
-  .ptz-left{width:120px;padding:4px}
-  .ptz-left .ptz-actions button{padding:7px 4px;font-size:11px}
-  .ptz-sidebar{width:120px;padding:4px}
-  .ptz-pad{width:108px;height:108px}
-  .ptz-pad button{font-size:15px}
+  :root{--side-w: clamp(88px, 22vw, 120px)}
+  .ptz-left,.ptz-sidebar{padding:6px}
+  .ptz-left .ptz-actions button{padding:7px 4px;font-size:11px;white-space:normal}
+}
+@media(min-width:1600px){
+  :root{--side-w: clamp(180px, 16vw, 360px)}
 }
 </style>
 </head>
@@ -250,6 +258,7 @@ function getChannelIdFromUrl() {
  */
 function init() {
   channelId = getChannelIdFromUrl();
+  fitSidePanelsToVideo();
 
   if (!channelId) {
     // 无 channelId，显示提示
@@ -332,8 +341,10 @@ function playHls(url) {
     videoElement.muted = true;
     videoElement.autoplay = true;
     videoElement.playsInline = true;
-    videoElement.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block';
+    videoElement.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block';
     videoArea.appendChild(videoElement);
+    videoElement.addEventListener('loadedmetadata', fitSidePanelsToVideo);
+    videoElement.addEventListener('resize', fitSidePanelsToVideo);
   }
 
   if (Hls.isSupported()) {
@@ -363,6 +374,7 @@ function playHls(url) {
       updateStatusDot('online');
       // ★ 根据PTZ能力更新面板状态（匹配 monitor.html 逻辑）
       updatePtzState();
+      fitSidePanelsToVideo();
     });
     // ★ 全面HLS事件诊断：捕获所有类型的事件用于排查卡死问题
     hls.on(Hls.Events.ERROR, (event, data) => {
@@ -408,6 +420,7 @@ function playHls(url) {
       updateStatusDot('online');
       // ★ 根据PTZ能力更新面板状态（匹配 monitor.html 逻辑）
       updatePtzState();
+      fitSidePanelsToVideo();
     });
   } else {
     showError('浏览器不支持HLS播放，请使用Chrome/Firefox/Edge');
@@ -462,6 +475,55 @@ function updateStatusDot(state) {
   dot.className = 'status-dot ' + state;
 }
 
+/**
+ * 按视频宽高比计算侧栏宽度（取计算结果的 80%），中间区域用 cover 铺满。
+ * 窗口缩放 / 全屏时同步重算。
+ */
+function fitSidePanelsToVideo() {
+  const row = document.querySelector('.content-row');
+  if (!row) return;
+
+  const rowW = row.clientWidth;
+  const rowH = row.clientHeight;
+  if (rowW <= 0 || rowH <= 0) return;
+
+  // 小屏保底更窄，大屏允许更宽
+  const minSide = rowW < 600 ? 72 : (rowW < 900 ? 88 : 96);
+  const maxSide = Math.min(Math.floor(rowW * 0.28), rowW < 1200 ? 200 : 300);
+
+  let sideW = minSide;
+  const vw = videoElement && videoElement.videoWidth;
+  const vh = videoElement && videoElement.videoHeight;
+
+  if (vw > 0 && vh > 0) {
+    const aspect = vw / vh;
+    // 按高度铺满时，画面实际占用宽度
+    const idealVideoW = Math.min(rowW, rowH * aspect);
+    const leftover = Math.max(0, rowW - idealVideoW);
+    // 侧栏取「刚好盖满黑边」宽度的 80%
+    sideW = Math.round(leftover / 2 * 0.8);
+  } else {
+    // 尚无视频尺寸时，按视口给一个较宽默认值
+    sideW = Math.round(Math.min(maxSide, Math.max(minSide, rowW * 0.18 * 0.8)));
+  }
+
+  sideW = Math.max(minSide, Math.min(maxSide, sideW));
+  const root = document.documentElement;
+  root.style.setProperty('--side-w', sideW + 'px');
+  root.style.setProperty('--pad-size', Math.min(sideW - 16, 220) + 'px');
+}
+
+let _fitSideRaf = 0;
+function scheduleFitSidePanels() {
+  if (_fitSideRaf) cancelAnimationFrame(_fitSideRaf);
+  _fitSideRaf = requestAnimationFrame(() => {
+    _fitSideRaf = 0;
+    fitSidePanelsToVideo();
+  });
+}
+
+window.addEventListener('resize', scheduleFitSidePanels);
+
 function toggleFullscreen() {
   console.log('[全屏] toggleFullscreen 被调用，fullscreenElement=', document.fullscreenElement);
   if (document.fullscreenElement) {
@@ -489,6 +551,7 @@ document.addEventListener('fullscreenchange', () => {
   console.log('[全屏] fullscreenchange 触发，isFs=', isFs, 'element=', fsEl);
   updateFullscreenBtn(isFs);
   document.documentElement.classList.toggle('is-fullscreen', isFs);
+  scheduleFitSidePanels();
 
   const floatBtn = document.getElementById('fsExitBtn');
   if (!floatBtn) return;
