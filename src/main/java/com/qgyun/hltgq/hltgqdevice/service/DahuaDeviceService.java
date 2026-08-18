@@ -35,6 +35,20 @@ public class DahuaDeviceService {
      * @return 子节点列表
      */
     public List<DeviceTreeNode> getDeviceTree(String orgId) {
+        return getDeviceTreeWithStatus(orgId).getNodes();
+    }
+
+    /**
+     * 查询设备树节点（带成功标识）
+     * <p>
+     * 供站点同步定时任务区分"API调用失败"与"无子节点"：二者返回的节点列表
+     * 都为空，但前者意味着本轮遍历不完整，不能据此把缺失通道标注为离线
+     * （会误伤整个子树），必须通过success标识区分。
+     *
+     * @param orgId 父节点组织ID，为空或"001"时查询根节点
+     * @return 查询结果（success=false表示API调用失败）
+     */
+    public DeviceTreeResult getDeviceTreeWithStatus(String orgId) {
         try {
             // 处理空orgId，默认查询根组织001
             String parentId = (orgId == null || orgId.trim().isEmpty()) ? "001" : orgId.trim();
@@ -60,34 +74,64 @@ public class DahuaDeviceService {
             // gr.getResult() 可能已是String，不需要再用 toJSONString 包装
             Object result = gr.getResult();
             String responseJson = result instanceof String ? (String) result : JSON.toJSONString(result);
-            log.info("设备树查询响应：{}", responseJson);
+            // 调试级日志：站点同步定时任务会递归调用本方法数百次，INFO级整段响应会洪泛日志
+            log.debug("设备树查询响应：{}", responseJson);
 
             JSONObject response = JSON.parseObject(responseJson);
             // ICC API使用code="0"表示成功，success=true也表示成功
             if (response == null || !"0".equals(response.getString("code"))) {
                 log.warn("设备树查询失败：{}", response);
-                return Collections.emptyList();
+                return DeviceTreeResult.fail();
             }
 
             // data.value 才是节点数组（data是{"value":[...]}结构）
             JSONObject dataObj = response.getJSONObject("data");
             if (dataObj == null) {
                 log.warn("设备树响应data为空");
-                return Collections.emptyList();
+                return DeviceTreeResult.fail();
             }
             List<DeviceTreeNode> nodes = JSON.parseArray(
                     dataObj.getString("value"),
                     DeviceTreeNode.class
             );
 
-            return nodes != null ? nodes : Collections.emptyList();
+            return DeviceTreeResult.success(nodes != null ? nodes : Collections.emptyList());
 
         } catch (ClientException e) {
             log.error("设备树查询异常：{}", e.getErrMsg(), e);
-            return Collections.emptyList();
+            return DeviceTreeResult.fail();
         } catch (Exception e) {
             log.error("设备树查询失败：", e);
-            return Collections.emptyList();
+            return DeviceTreeResult.fail();
+        }
+    }
+
+    /**
+     * 设备树查询结果：success=false表示API调用失败（与"无子节点"区分）
+     */
+    public static class DeviceTreeResult {
+        private final boolean success;
+        private final List<DeviceTreeNode> nodes;
+
+        private DeviceTreeResult(boolean success, List<DeviceTreeNode> nodes) {
+            this.success = success;
+            this.nodes = nodes;
+        }
+
+        public static DeviceTreeResult success(List<DeviceTreeNode> nodes) {
+            return new DeviceTreeResult(true, nodes);
+        }
+
+        public static DeviceTreeResult fail() {
+            return new DeviceTreeResult(false, Collections.emptyList());
+        }
+
+        public boolean isSuccess() {
+            return success;
+        }
+
+        public List<DeviceTreeNode> getNodes() {
+            return nodes;
         }
     }
 

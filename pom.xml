@@ -54,6 +54,18 @@
             <version>1.2.76</version>
         </dependency>
 
+        <!-- JDBC（站点信息表同步，人大金仓KingbaseES v8） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <!-- PostgreSQL JDBC 驱动（人大金仓KingbaseES v8兼容，与hltgq-mq一致） -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+
         <!-- BouncyCastle（ICC SDK 加密依赖，必须显式声明确保打包） -->
         <dependency>
             <groupId>org.bouncycastle</groupId>
