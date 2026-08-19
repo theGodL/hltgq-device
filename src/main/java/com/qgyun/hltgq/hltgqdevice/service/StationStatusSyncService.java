@@ -163,8 +163,10 @@ public class StationStatusSyncService {
                 code = code.trim();
                 // 站点名称兜底取设备编码，避免zzkaec入库为NULL违反非空约束
                 String name = firstNonEmpty(node.getName(), code);
-                boolean online = Integer.valueOf(1).equals(node.getCheckStat())
-                        || Integer.valueOf(1).equals(node.getIsOnline());
+                // ★ 在线判定只认isOnline（0-离线 1-在线）：
+                // checkStat是状态检测使能标志（请求参数checkStat=1的回显），离线设备同样为1，
+                // 若用 checkStat==1 || isOnline==1 会把所有设备误判为在线（实测离线设备checkStat=1,isOnline=0）
+                boolean online = Integer.valueOf(1).equals(node.getIsOnline());
                 out.add(new VideoChannel(code, name, currentOrg, online));
             } else if (Boolean.TRUE.equals(node.getIsParent())
                     && node.getId() != null && !node.getId().trim().isEmpty()) {

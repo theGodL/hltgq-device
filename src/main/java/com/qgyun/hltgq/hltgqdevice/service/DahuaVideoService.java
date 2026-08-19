@@ -51,6 +51,18 @@ public class DahuaVideoService {
     private final ConcurrentHashMap<String, String> channelStreamStrategy = new ConcurrentHashMap<>();
 
     /**
+     * 码流探测结果
+     */
+    private enum ProbeResult {
+        /** 流可访问且为HEVC(H.265)编码 */
+        HEVC,
+        /** 流可访问且为H.264编码（或无法确定编码，保守视为H.264） */
+        H264,
+        /** 流不可访问（M3U8拉取失败，如404/连接超时） */
+        UNAVAILABLE
+    }
+
+    /**
      * 获取视频流播放地址
      *
      * @param channelId  通道ID（格式：设备编号$通道号$...）
@@ -422,9 +434,29 @@ public class DahuaVideoService {
         }
 
         log.info("智能码流探测：首次探测子码流编码格式，channel={}", channelId);
-        boolean subIsHevc = probeHevc(subRawUrl);
+        ProbeResult subProbe = probeStream(subRawUrl);
 
-        if (!subIsHevc) {
+        // ★ 子码流不可用（M3U8拉取失败，如404）→ 降级探测主码流
+        // 避免把无效URL返回前端导致hls.js manifestLoadError
+        if (subProbe == ProbeResult.UNAVAILABLE) {
+            log.warn("智能码流探测：子码流不可用，降级探测主码流，channel={}", channelId);
+            String mainRawUrl = resolveRawStreamUrl(channelId, "1");
+            if (mainRawUrl != null) {
+                ProbeResult mainProbe = probeStream(mainRawUrl);
+                if (mainProbe != ProbeResult.UNAVAILABLE) {
+                    // 主码流可用：H.264直出，HEVC交由代理层ffmpeg转码
+                    channelStreamStrategy.put(channelId, "main");
+                    log.info("智能码流探测：子码流不可用，主码流{} → 返回主码流，channel={}",
+                            mainProbe == ProbeResult.HEVC ? "HEVC(代理转码)" : "H.264", channelId);
+                    return buildProxyUrl(mainRawUrl);
+                }
+                log.warn("智能码流探测：子码流和主码流均不可用，channel={}", channelId);
+            }
+            // 两条码流都取不到 → 返回null，前端提示获取流地址失败（而非404播放错误）
+            return null;
+        }
+
+        if (subProbe == ProbeResult.H264) {
             // 子码流原生H.264 → 最佳方案，无需转码
             channelStreamStrategy.put(channelId, "sub");
             log.info("智能码流探测：子码流为H.264 → 直出，channel={}", channelId);
@@ -435,13 +467,14 @@ public class DahuaVideoService {
         log.info("智能码流探测：子码流为HEVC → 探测主码流，channel={}", channelId);
         String mainRawUrl = resolveRawStreamUrl(channelId, "1");
         if (mainRawUrl != null) {
-            boolean mainIsHevc = probeHevc(mainRawUrl);
-            if (!mainIsHevc) {
+            ProbeResult mainProbe = probeStream(mainRawUrl);
+            if (mainProbe == ProbeResult.H264) {
                 channelStreamStrategy.put(channelId, "main");
                 log.info("智能码流探测：主码流为H.264 → 返回主码流，无需转码，channel={}", channelId);
                 return buildProxyUrl(mainRawUrl);
             }
-            log.info("智能码流探测：主码流也为HEVC → 返回子码流+代理转码，channel={}", channelId);
+            log.info("智能码流探测：主码流{} → 返回子码流+代理转码，channel={}",
+                    mainProbe == ProbeResult.HEVC ? "也为HEVC" : "不可用", channelId);
         } else {
             log.info("智能码流探测：主码流不可用 → 返回子码流+代理转码，channel={}", channelId);
         }
@@ -515,15 +548,17 @@ public class DahuaVideoService {
     }
 
     /**
-     * 探测HLS流是否为HEVC(H.265)编码。
+     * 探测HLS流的编码格式及可用性。
      * <p>
      * 流程：获取M3U8 → 提取首条TS分片URL → 拉取TS分片 → 扫描PMT中的streamType。
+     * 与旧版 probeHevc 的关键区别：M3U8拉取失败（如404）时返回 {@link ProbeResult#UNAVAILABLE}，
+     * 避免调用方把"流不可用"误判为"H.264直出"后把无效URL返回前端（hls.js manifestLoadError）。
      * 超时保护：单次HTTP请求连接3s、读取5s。
      *
      * @param m3u8Url 流的M3U8地址（含token）
-     * @return true-HEVC编码，false-H.264或探测失败
+     * @return 探测结果
      */
-    private boolean probeHevc(String m3u8Url) {
+    private ProbeResult probeStream(String m3u8Url) {
         long start = System.currentTimeMillis();
         try {
             // 从M3U8 URL中提取token（TS分片URL可能不含鉴权参数，需手动附加）
@@ -532,44 +567,44 @@ public class DahuaVideoService {
             // Step 1：拉取M3U8
             String m3u8Content = httpGetString(m3u8Url);
             if (m3u8Content == null || m3u8Content.isEmpty()) {
-                log.info("probeHevc：M3U8拉取失败/空，url={}", m3u8Url);
-                return false;
+                log.warn("probeStream：M3U8拉取失败/空（流不可用），url={}", m3u8Url);
+                return ProbeResult.UNAVAILABLE;
             }
-            log.info("probeHevc：M3U8拉取成功，len={}，前200字符={}",
+            log.info("probeStream：M3U8拉取成功，len={}，前200字符={}",
                     m3u8Content.length(),
                     m3u8Content.length() > 200 ? m3u8Content.substring(0, 200) : m3u8Content);
 
             // Step 2：提取首条TS分片URL
             String tsUrl = extractFirstTsUrl(m3u8Content, m3u8Url);
             if (tsUrl == null) {
-                log.info("probeHevc：M3U8中无TS分片");
-                return false;
+                log.info("probeStream：M3U8中无TS分片");
+                return ProbeResult.H264; // 保守处理：无法判断编码，视为H.264直出
             }
-            log.info("probeHevc：首条TS分片URL={}", tsUrl);
+            log.info("probeStream：首条TS分片URL={}", tsUrl);
 
             // ★ 附加token到TS URL（NVR要求每条TS请求都鉴权）
             if (token != null && !tsUrl.contains("token=")) {
                 tsUrl += (tsUrl.contains("?") ? "&" : "?") + "token=" + token;
-                log.info("probeHevc：已附加token到TS URL");
+                log.info("probeStream：已附加token到TS URL");
             }
 
             // Step 3：拉取TS分片
             byte[] tsData = httpGetBytes(tsUrl);
             if (tsData == null || tsData.length < 188 * 2) {
-                log.info("probeHevc：TS分片拉取失败/过短，len={}", tsData != null ? tsData.length : 0);
-                return false;
+                log.info("probeStream：TS分片拉取失败/过短，len={}", tsData != null ? tsData.length : 0);
+                return ProbeResult.H264; // 保守处理：M3U8可用但TS暂不可取，视为H.264直出
             }
-            log.info("probeHevc：TS分片拉取成功，len={}", tsData.length);
+            log.info("probeStream：TS分片拉取成功，len={}", tsData.length);
 
             // Step 4：扫描HEVC
             boolean isHevc = containsHevcSimple(tsData);
             long elapsed = System.currentTimeMillis() - start;
-            log.info("probeHevc：结果={}，耗时{}ms", isHevc, elapsed);
-            return isHevc;
+            log.info("probeStream：结果={}，耗时{}ms", isHevc ? "HEVC" : "H.264", elapsed);
+            return isHevc ? ProbeResult.HEVC : ProbeResult.H264;
 
         } catch (Exception e) {
-            log.info("probeHevc：异常，url={}，err={}", m3u8Url, e.getMessage());
-            return false;
+            log.info("probeStream：异常，url={}，err={}", m3u8Url, e.getMessage());
+            return ProbeResult.H264; // 保守处理
         }
     }
 

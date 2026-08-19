@@ -149,9 +149,9 @@ public class DahuaDeviceService {
         private String nodeType;
         /** 是否为父节点（有子节点） */
         private Boolean isParent;
-        /** 在线状态 0-离线 1-在线 */
+        /** 状态检测使能标志（请求参数checkStat的回显，非在线状态；在线状态以isOnline为准） */
         private Integer checkStat;
-        /** 在线标识 0-离线 1-在线 */
+        /** 在线状态 0-离线 1-在线 */
         private Integer isOnline;
         /** 排序号 */
         private Integer sort;

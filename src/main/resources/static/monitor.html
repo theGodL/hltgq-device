@@ -386,7 +386,8 @@ async function loadAllChannelCounts() {
         // 过滤指定名称的组织节点及其子树
         if (isFilteredOrg(child.name)) continue;
         if (child.nodeType === 'ch') {
-          if (child.checkStat === 1 || child.isOnline === 1) online++; else offline++;
+          // ★ 在线判定只认isOnline：checkStat是状态检测使能标志（请求参数回显），离线设备同样为1
+          if (child.isOnline === 1) online++; else offline++;
         }
         if (child.isParent === true && child.nodeType !== 'ch') {
           tasks.push(recurse(String(child.id || '')));
@@ -528,7 +529,8 @@ function createTreeNodeFromIcc(node) {
       orgName: '',
       cameraType: ct,
       hasPtz: ct >= 2,  // 球机及以上支持云台
-      isOnline: node.checkStat === 1 || node.isOnline === 1
+      // ★ 在线判定只认isOnline：checkStat是状态检测使能标志（请求参数回显），离线设备同样为1
+      isOnline: node.isOnline === 1
     });
   }
 
@@ -592,7 +594,8 @@ function createTreeNodeFromIcc(node) {
   // 在线状态（设备节点和通道节点显示状态灯）
   if (isChannel || isDev) {
     const status = document.createElement('span');
-    const online = node.checkStat === 1 || node.isOnline === 1;
+    // ★ 在线判定只认isOnline：checkStat是状态检测使能标志（请求参数回显），离线设备同样为1
+    const online = node.isOnline === 1;
     status.className = 'node-status ' + (online ? 'online' : 'offline');
     row.appendChild(status);
   }
