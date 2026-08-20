@@ -25,7 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <ul>
  *   <li>已存在站点：状态（zebpsu，{@code #1#}在线/{@code #2#}离线）变化时更新；</li>
  *   <li>新视频站点：自动新增，必填 id/devicecode/zebpsu/zzkaec/mivbcz/epjutj，
- *       类型默认 {@code #5#} 视频站点，位置取所属组织名称，坐标暂无来源留空；</li>
+ *       类型默认 {@code #5#} 视频站点，位置取所属组织名称，坐标暂无来源留空；
+ *       新增名称与站点表已有 zzkaec 重名时追加"-视频"后缀（如"夏家湖渡槽-视频"）；</li>
  *   <li>ICC设备树中已消失的视频站点：标注离线（{@code #2#}）。
  *       仅在整轮遍历无任何失败节点时执行，防止某子树查询失败被误判为通道消失。</li>
  * </ul>
@@ -80,12 +81,13 @@ public class StationStatusSyncService {
             log.info("[站点同步] ICC设备树遍历完成，共{}个视频通道，遍历失败={}",
                     channels.size(), traversalFailed.get());
 
-            // 2. 加载站点表现有记录：devicecode → zebpsu（失败返回null，代表数据库不可达）
-            Map<String, String> existingStatus = loadExistingStations();
-            if (existingStatus == null) {
+            // 2. 加载站点表现有数据：devicecode → zebpsu + 全部站点名称（失败返回null，代表数据库不可达）
+            ExistingStations existing = loadExistingStations();
+            if (existing == null) {
                 log.warn("[站点同步] 站点表加载失败（数据库不可达？），本轮跳过状态比对与离线标注");
                 return;
             }
+            Map<String, String> existingStatus = existing.status;
 
             // 3. 逐通道比对：状态变化则更新，新通道则新增
             // processedCodes：同一轮遍历中重复出现的通道（多组织共享设备）只处理一次，防止重复插入
@@ -98,7 +100,10 @@ public class StationStatusSyncService {
                 // 否则NULL状态站点会被误判为新增导致重复插入
                 boolean exists = existingStatus.containsKey(ch.devicecode);
                 if (!exists) {
-                    if (insertStation(ch, target)) inserted++;
+                    // 新站点名称与站点表已有站点重名时追加"-视频"后缀（如"夏家湖渡槽-视频"），
+                    // existing.names 由 uniqueStationName 登记本轮已用名称，防同轮多个同名新站点撞名
+                    String stationName = uniqueStationName(ch.name, existing.names);
+                    if (insertStation(ch, stationName, target)) inserted++;
                 } else if (!target.equals(existingStatus.get(ch.devicecode))) {
                     if (updateStationStatus(ch.devicecode, target)) updated++;
                 } else {
@@ -177,36 +182,79 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 加载站点表现有记录：devicecode → zebpsu
+     * 加载站点表现有数据：devicecode → zebpsu 状态映射 + 全部站点名称集合
      *
-     * @return devicecode→zebpsu映射（zebpsu可能为NULL）；数据库不可达时返回null
+     * @return 站点数据快照；数据库不可达时返回null
      */
-    private Map<String, String> loadExistingStations() {
-        Map<String, String> map = new HashMap<>();
+    private ExistingStations loadExistingStations() {
+        ExistingStations snapshot = new ExistingStations();
         try {
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(
-                    "SELECT devicecode, zebpsu FROM " + STATION_TABLE + " WHERE devicecode IS NOT NULL");
+                    "SELECT devicecode, zebpsu, zzkaec FROM " + STATION_TABLE);
             for (Map<String, Object> row : rows) {
                 Object code = row.get("devicecode");
                 Object status = row.get("zebpsu");
+                Object name = row.get("zzkaec");
                 if (code != null && !String.valueOf(code).trim().isEmpty()) {
-                    map.put(String.valueOf(code).trim(), status == null ? null : String.valueOf(status));
+                    snapshot.status.put(String.valueOf(code).trim(), status == null ? null : String.valueOf(status));
+                }
+                if (name != null && !String.valueOf(name).trim().isEmpty()) {
+                    snapshot.names.add(String.valueOf(name).trim());
                 }
             }
         } catch (Exception e) {
             log.error("[站点同步] 加载现有站点记录失败：", e);
             return null;
         }
-        return map;
+        return snapshot;
+    }
+
+    /**
+     * 站点表现有数据快照（单次查询加载，供状态比对与新增站点名称去重）
+     */
+    private static class ExistingStations {
+        /** devicecode → zebpsu（zebpsu可能为NULL） */
+        final Map<String, String> status = new HashMap<>();
+        /** 全部站点名称（zzkaec），新增视频站点重名时追加"-视频"后缀 */
+        final Set<String> names = new HashSet<>();
+    }
+
+    /**
+     * 新增视频站点名称去重：名称与站点表已有站点重复时追加"-视频"后缀
+     * （如"夏家湖渡槽" → "夏家湖渡槽-视频"），避免与水位/雨量等非视频站点重名混淆。
+     * 调用方负责传入并维护 usedNames（含本轮已插入的新站点名），
+     * 防止同一轮内多个同名新通道互相撞名。
+     *
+     * @param baseName  通道名称（zzkaec候选值）
+     * @param usedNames 已使用名称集合（会被修改：登记最终使用的名称）
+     * @return 去重后的站点名称
+     */
+    private String uniqueStationName(String baseName, Set<String> usedNames) {
+        if (baseName == null || baseName.trim().isEmpty()) {
+            return baseName;
+        }
+        String name = baseName.trim();
+        if (!usedNames.contains(name)) {
+            usedNames.add(name);
+            return name;
+        }
+        // 重名 → 追加"-视频"后缀；若加后缀后仍重名（极端情况）则继续追加，保证不撞名
+        String candidate = name + "-视频";
+        while (usedNames.contains(candidate)) {
+            candidate += "-视频";
+        }
+        log.info("[站点同步] 站点名称{}已被占用，新增视频站点改名为{}", name, candidate);
+        usedNames.add(candidate);
+        return candidate;
     }
 
     /**
      * 新增视频站点（此前设备树中不存在的devicecode）
      * <p>
-     * 必填：id、devicecode、zebpsu、zzkaec（站点名称）、mivbcz（站点位置，取所属组织名称）、
+     * 必填：id、devicecode、zebpsu、zzkaec（站点名称，可能带"-视频"后缀）、mivbcz（站点位置，取所属组织名称）、
      * epjutj（默认#5#视频站点）；坐标bviiio_x/bviiio_y暂无来源留空；系统字段与hltgq-mq一致。
      */
-    private boolean insertStation(VideoChannel ch, String status) {
+    private boolean insertStation(VideoChannel ch, String name, String status) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             String location = ch.orgName != null && !ch.orgName.trim().isEmpty()
@@ -216,9 +264,9 @@ public class StationStatusSyncService {
                     "  devicecode, zebpsu, zzkaec, mivbcz, epjutj) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             jdbcTemplate.update(sql, IdGenerator.generate(), corpCode, now, "SYSTEM", now, "SYSTEM",
-                    ch.devicecode, status, ch.name, location, VIDEO_TYPE);
+                    ch.devicecode, status, name, location, VIDEO_TYPE);
             log.info("[站点同步] 新增视频站点: devicecode={}, 名称={}, 位置={}, 状态={}",
-                    ch.devicecode, ch.name, location, status);
+                    ch.devicecode, name, location, status);
             return true;
         } catch (Exception e) {
             log.error("[站点同步] 新增视频站点失败: devicecode={}", ch.devicecode, e);
