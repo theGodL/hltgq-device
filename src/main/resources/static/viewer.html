@@ -171,7 +171,7 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
 <div class="main">
   <div class="content-row">
     <!-- 镜头控制（视频左侧） -->
-    <div class="ptz-left disabled" id="ptzBottomPanel">
+    <div class="ptz-left disabled" id="ptzBottomPanel" style="display:none">
       <span class="ptz-section-label">镜头控制</span>
       <div class="ptz-actions">
         <button class="zoom-btn" title="变倍+" onmousedown="ptzLensStart('zoomIn')" onmouseup="ptzLensStop()" onmouseleave="ptzLensStop()">🔍⁺ 放大</button>
@@ -199,7 +199,7 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
     </div>
 
     <!-- 方向控制（视频右侧） -->
-    <div class="ptz-sidebar disabled" id="ptzPanel">
+    <div class="ptz-sidebar disabled" id="ptzPanel" style="display:none">
       <span class="ptz-section-label">方向控制</span>
       <div class="ptz-pad">
         <button title="左上" onmousedown="ptzStart('upleft')" onmouseup="ptzStop()" onmouseleave="ptzStop()">↖</button>
@@ -242,6 +242,7 @@ let lastLensRequestPromise = Promise.resolve();
 let ptzAbortController = null;
 let ptzLensAbortController = null;
 let selectedChannelHasPtz = true; // 默认启用（页面加载后根据cameraType校正）
+let userIsAdmin = false;          // 当前登录人是否系统管理员（云台操作权限，页面加载时查询）
 
 // ==================== 初始化 ====================
 
@@ -259,6 +260,9 @@ function getChannelIdFromUrl() {
 function init() {
   channelId = getChannelIdFromUrl();
   fitSidePanelsToVideo();
+
+  // ★ 查询云台操作权限（仅系统管理员可操作云台），失败/未登录按无权限处理
+  loadCurrentUserPermission();
 
   if (!channelId) {
     // 无 channelId，显示提示
@@ -652,11 +656,39 @@ async function searchChannelInTree(targetId, orgId) {
 }
 
 /**
- * 更新PTZ面板启用/禁用状态（匹配 monitor.html 逻辑）
+ * 加载当前登录人云台权限（系统管理员才可操作云台）
+ * 失败/未登录时按无权限处理（安全侧：云台面板直接隐藏）
+ */
+async function loadCurrentUserPermission() {
+  try {
+    const resp = await fetch(API_BASE + '/auth/current-user');
+    const json = await resp.json();
+    userIsAdmin = !!(json.success === true && json.data && json.data.isAdmin === true);
+    console.log('[Auth] 当前登录人云台权限：isAdmin=' + userIsAdmin);
+  } catch (err) {
+    console.warn('[Auth] 获取云台权限失败，默认无权限：', err);
+    userIsAdmin = false;
+  }
+  updatePtzState();
+}
+
+/**
+ * 更新PTZ面板状态
+ * 无云台权限（非系统管理员）时两侧云台面板直接隐藏；
+ * 有权限时按通道PTZ能力灰显/启用
  */
 function updatePtzState() {
   const sidebar = document.getElementById('ptzPanel');
   const bottom = document.getElementById('ptzBottomPanel');
+  if (!userIsAdmin) {
+    // 无云台操作权限（仅系统管理员）：直接隐藏云台面板，不可见
+    sidebar.style.display = 'none';
+    bottom.style.display = 'none';
+    console.warn('[PTZ] 无云台操作权限，云台面板已隐藏');
+    return;
+  }
+  sidebar.style.display = '';
+  bottom.style.display = '';
   if (resolvedChannelId && selectedChannelHasPtz) {
     sidebar.classList.remove('disabled');
     bottom.classList.remove('disabled');
@@ -675,6 +707,10 @@ function updatePtzState() {
  * 发送方向命令（START），匹配 monitor.html 的 async/await + AbortController 模式
  */
 async function sendPtzCommand(direction) {
+  if (!userIsAdmin) {
+    console.warn('[PTZ] sendPtzCommand 拦截：无云台操作权限（仅系统管理员）');
+    return;
+  }
   if (!resolvedChannelId) {
     console.warn('[PTZ] sendPtzCommand 跳过：未选中通道');
     return;
@@ -699,6 +735,13 @@ async function sendPtzCommand(direction) {
       body: JSON.stringify({ channelId: resolvedChannelId, direction: direction, speed: speed }),
       signal: ptzAbortController.signal
     });
+    // ★ 后端权限拦截响应：401未登录/403非管理员 → 同步本地权限状态并禁用面板
+    if (resp.status === 401 || resp.status === 403) {
+      console.warn('[PTZ] 方向命令被后端拒绝：HTTP ' + resp.status);
+      userIsAdmin = false;
+      updatePtzState();
+      return;
+    }
     const json = await resp.json();
     if (json.success !== true) {
       console.warn('[PTZ] 方向命令返回失败:', json.desc);
@@ -834,6 +877,10 @@ function cleanupPtzTimers() {
 // ==================== 镜头控制 ====================
 
 async function sendPtzLens(action) {
+  if (!userIsAdmin) {
+    console.warn('[PTZ] sendPtzLens 拦截：无云台操作权限（仅系统管理员）');
+    return;
+  }
   if (!resolvedChannelId) {
     console.warn('[PTZ] sendPtzLens 跳过：未选中通道');
     return;

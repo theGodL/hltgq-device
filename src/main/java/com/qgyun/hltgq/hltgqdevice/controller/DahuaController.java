@@ -1,5 +1,11 @@
 package com.qgyun.hltgq.hltgqdevice.controller;
 
+import com.qgyun.hltgq.hltgqdevice.auth.RequireAdmin;
+import com.qgyun.hltgq.hltgqdevice.auth.RolePermissionService;
+import com.qgyun.hltgq.hltgqdevice.auth.SessionContextService;
+import com.qgyun.hltgq.hltgqdevice.auth.SessionUnavailableException;
+import com.qgyun.hltgq.hltgqdevice.auth.UnauthorizedException;
+import com.qgyun.hltgq.hltgqdevice.auth.UserContext;
 import com.qgyun.hltgq.hltgqdevice.model.ApiResponse;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaDeviceService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaPtzService;
@@ -9,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
+import javax.servlet.http.HttpServletRequest;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +43,12 @@ public class DahuaController {
 
     @Resource
     private PtzCommandDispatcher ptzDispatcher;
+
+    @Resource
+    private SessionContextService sessionContextService;
+
+    @Resource
+    private RolePermissionService rolePermissionService;
 
     // ==================== 设备树 ====================
 
@@ -98,7 +111,7 @@ public class DahuaController {
     // ==================== 云台方向控制 ====================
 
     /**
-     * 云台方向控制
+     * 云台方向控制（仅系统管理员）
      * <p>
      * 前端调用：POST /api/dahua/ptz/direct
      * Body: { "channelId": "xxx", "direction": "up", "speed": 5 }
@@ -106,6 +119,7 @@ public class DahuaController {
      * @param params 请求参数
      * @return 操作结果
      */
+    @RequireAdmin
     @PostMapping("/ptz/direct")
     public ApiResponse<Void> ptzDirect(@RequestBody Map<String, Object> params) {
         try {
@@ -129,7 +143,7 @@ public class DahuaController {
     }
 
     /**
-     * 停止云台移动
+     * 停止云台移动（仅系统管理员）
      * <p>
      * 前端调用：POST /api/dahua/ptz/stop
      * Body: { "channelId": "xxx" }
@@ -137,6 +151,7 @@ public class DahuaController {
      * @param params 请求参数
      * @return 操作结果
      */
+    @RequireAdmin
     @PostMapping("/ptz/stop")
     public ApiResponse<Void> ptzStop(@RequestBody Map<String, Object> params) {
         try {
@@ -157,7 +172,7 @@ public class DahuaController {
     // ==================== 镜头控制 ====================
 
     /**
-     * 镜头控制（变焦/聚焦/光圈）
+     * 镜头控制（变焦/聚焦/光圈，仅系统管理员）
      * <p>
      * 前端调用：POST /api/dahua/ptz/lens
      * Body: { "channelId": "xxx", "action": "zoomIn", "speed": 5 }
@@ -165,6 +180,7 @@ public class DahuaController {
      * @param params 请求参数
      * @return 操作结果
      */
+    @RequireAdmin
     @PostMapping("/ptz/lens")
     public ApiResponse<Void> ptzLens(@RequestBody Map<String, Object> params) {
         try {
@@ -185,6 +201,36 @@ public class DahuaController {
             log.error("镜头控制接口异常：", e);
             return ApiResponse.fail("镜头控制失败：" + e.getMessage());
         }
+    }
+
+    // ==================== 鉴权 ====================
+
+    /**
+     * 当前登录人云台权限接口（前端用于控制云台面板显隐/禁用）
+     * <p>
+     * 前端调用：GET /api/dahua/auth/current-user
+     * 返回 data = { userId, isAdmin }；未登录或会话服务异常时 isAdmin=false（安全侧：隐藏云台面板）
+     */
+    @GetMapping("/auth/current-user")
+    public ApiResponse<Map<String, Object>> currentUser(HttpServletRequest request) {
+        Map<String, Object> data = new HashMap<>();
+        try {
+            UserContext user = sessionContextService.resolveCurrentUser(request);
+            // 平台超管（superAdmin）或绑定 hltgq_default_admin 角色的用户均视为系统管理员
+            boolean isAdmin = rolePermissionService.isAdmin(user);
+            data.put("userId", user.getUserId());
+            data.put("isAdmin", isAdmin);
+        } catch (UnauthorizedException e) {
+            // 未登录/会话过期：非错误场景，前端按无权限处理
+            data.put("userId", null);
+            data.put("isAdmin", false);
+        } catch (SessionUnavailableException e) {
+            // Redis 不可达：安全侧处理（隐藏云台面板，禁止放行操作）
+            log.warn("current-user 会话服务不可用，按无权限返回：{}", e.getMessage());
+            data.put("userId", null);
+            data.put("isAdmin", false);
+        }
+        return ApiResponse.success(data);
     }
 
     // ==================== 工具方法 ====================

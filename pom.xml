@@ -60,6 +60,12 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
 
+        <!-- Redis（APaaS平台会话/角色权限查询，云台管理员权限校验） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <!-- PostgreSQL JDBC 驱动（人大金仓KingbaseES v8兼容，与hltgq-mq一致） -->
         <dependency>
             <groupId>org.postgresql</groupId>

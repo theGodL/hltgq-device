@@ -277,8 +277,8 @@ ul,li{list-style:none}
       <div class="tree-loading">⏳ 正在加载设备树...</div>
     </div>
 
-    <!-- PTZ 云台控制（侧边栏下方抽屉式） -->
-    <div class="ptz-drawer" id="ptzDrawer">
+    <!-- PTZ 云台控制（侧边栏下方抽屉式，无权限时隐藏） -->
+    <div class="ptz-drawer" id="ptzDrawer" style="display:none">
       <div class="ptz-drawer-header" onclick="togglePTZ()">
         <div class="ptz-header-left">
           <span class="ptz-dot"></span>
@@ -355,6 +355,7 @@ let ptzLensTimer = null;
 let selectedChannelId = null;    // 当前PTZ控制的通道ID
 let ptzUserInteracting = false;  // 安全锁：只有用户亲自按下PTZ按钮才允许发送命令
 let selectedChannelHasPtz = false; // 当前选中通道是否支持云台
+let userIsAdmin = false;          // 当前登录人是否系统管理员（云台操作权限，页面加载时查询）
 let channelCountCache = null;     // { online, offline } 全量统计缓存，页面加载时一次性计算
 
 // hls.js 播放器实例映射: cellIndex -> hlsInstance
@@ -1383,6 +1384,8 @@ function cleanupPtzTimers() {
 }
 
 function togglePTZ() {
+  // 无云台操作权限：云台抽屉已隐藏，此处防御性拦截（后端接口同样拦截）
+  if (!userIsAdmin) return;
   // 未选通道时不允许展开云台面板
   if (!selectedChannelId) {
     const drawer = document.getElementById('ptzDrawer');
@@ -1399,12 +1402,19 @@ function togglePTZ() {
 }
 
 /**
- * 更新PTZ面板启用/禁用状态
- * 未选通道时灰显并阻止操作，选中后恢复正常
+ * 更新PTZ面板状态
+ * 无云台权限（非系统管理员）时整个云台抽屉直接隐藏；
+ * 有权限时按通道选中状态灰显/启用
  */
 function updatePtzState() {
   const drawer = document.getElementById('ptzDrawer');
   const hint = drawer.querySelector('.ptz-hint');
+  if (!userIsAdmin) {
+    // 无云台操作权限（仅系统管理员）：直接隐藏云台抽屉，不可见
+    drawer.style.display = 'none';
+    return;
+  }
+  drawer.style.display = '';
   if (selectedChannelId && selectedChannelHasPtz) {
     drawer.classList.remove('ptz-disabled');
     if (hint) hint.textContent = '';
@@ -1423,6 +1433,10 @@ function updatePtzState() {
 
 
 async function sendPtzCommand(direction) {
+  if (!userIsAdmin) {
+    console.warn('[PTZ] sendPtzCommand 拦截：无云台操作权限（仅系统管理员）');
+    return;
+  }
   if (!selectedChannelId) {
     console.warn('[PTZ] sendPtzCommand 跳过：未选中通道');
     return;
@@ -1447,6 +1461,13 @@ async function sendPtzCommand(direction) {
       body: JSON.stringify({ channelId: selectedChannelId, direction: direction, speed: speed }),
       signal: ptzAbortController.signal
     });
+    // ★ 后端权限拦截响应：401未登录/403非管理员 → 同步本地权限状态并禁用面板
+    if (resp.status === 401 || resp.status === 403) {
+      console.warn('[PTZ] 方向命令被后端拒绝：HTTP ' + resp.status);
+      userIsAdmin = false;
+      updatePtzState();
+      return;
+    }
     const json = await resp.json();
     if (json.success !== true) {
       console.warn('[PTZ] 方向命令返回失败:', json.desc);
@@ -1498,6 +1519,10 @@ function ptzStop() {
 }
 
 async function sendPtzLens(action) {
+  if (!userIsAdmin) {
+    console.warn('[PTZ] sendPtzLens 拦截：无云台操作权限（仅系统管理员）');
+    return;
+  }
   if (!selectedChannelId) {
     console.warn('[PTZ] sendPtzLens 跳过：未选中通道');
     return;
@@ -1657,8 +1682,26 @@ function updateChannelCount() {
 }
 
 // ==================== 初始化 ====================
+/**
+ * 加载当前登录人云台权限（系统管理员才可操作云台）
+ * 与设备树加载并行执行；失败/未登录时按无权限处理（安全侧：隐藏云台面板）
+ */
+async function loadCurrentUserPermission() {
+  try {
+    const resp = await fetch(API_BASE + '/auth/current-user');
+    const json = await resp.json();
+    userIsAdmin = !!(json.success === true && json.data && json.data.isAdmin === true);
+    console.log('[Auth] 当前登录人云台权限：isAdmin=' + userIsAdmin);
+  } catch (err) {
+    console.warn('[Auth] 获取云台权限失败，默认无权限：', err);
+    userIsAdmin = false;
+  }
+  updatePtzState();
+}
+
 function init() {
   updatePtzState(); // 初始无选中通道，PTZ灰显
+  loadCurrentUserPermission(); // ★ 查询云台操作权限（系统管理员校验）
   loadDeviceTree();
 
   // 全局兜底：鼠标松开时强制清理 PTZ 定时器

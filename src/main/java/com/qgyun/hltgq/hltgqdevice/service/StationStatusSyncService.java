@@ -222,6 +222,9 @@ public class StationStatusSyncService {
     /**
      * 新增视频站点名称去重：名称与站点表已有站点重复时追加"-视频"后缀
      * （如"夏家湖渡槽" → "夏家湖渡槽-视频"），避免与水位/雨量等非视频站点重名混淆。
+     * 若"-视频"后缀名也已被占用（同轮多个同名新通道或历史遗留同名视频站点），
+     * 改用数字递增"-视频2"、"-视频3"…，禁止叠词追加（历史教训：
+     * 无脑追加"-视频"产生过"长喉槽-视频-视频-视频"脏数据）。
      * 调用方负责传入并维护 usedNames（含本轮已插入的新站点名），
      * 防止同一轮内多个同名新通道互相撞名。
      *
@@ -238,10 +241,12 @@ public class StationStatusSyncService {
             usedNames.add(name);
             return name;
         }
-        // 重名 → 追加"-视频"后缀；若加后缀后仍重名（极端情况）则继续追加，保证不撞名
+        // 重名 → 追加"-视频"后缀；若"-视频"也已被占用则数字递增"-视频2"、"-视频3"…
         String candidate = name + "-视频";
+        int seq = 2;
         while (usedNames.contains(candidate)) {
-            candidate += "-视频";
+            candidate = name + "-视频" + seq;
+            seq++;
         }
         log.info("[站点同步] 站点名称{}已被占用，新增视频站点改名为{}", name, candidate);
         usedNames.add(candidate);
