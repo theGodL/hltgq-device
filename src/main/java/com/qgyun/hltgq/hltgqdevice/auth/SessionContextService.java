@@ -12,8 +12,8 @@ import java.util.Map;
 
 /**
  * 会话上下文服务：从 APaaS 平台 Redis 会话解析当前登录人。
- * <p>会话来源：平台登录后 cookie 中的 sessionId（形如 dev_hltgq_session:xxxx），
- * 该值即 Redis Hash key，HGETALL 取用户上下文（userId/corpCode/superAdmin）。
+ * <p>会话来源：平台登录后 cookie 中的 sessionId 或 Header（X-Session-Id/Authorization），
+ * 值形如 dev_hltgq_session:xxxx，该值即 Redis Hash key，HGETALL 取用户上下文（userId/corpCode/superAdmin）。
  * <p>平台对 Hash 值做过 JSON 序列化（字符串值带双引号包裹），取值必须剥离首尾引号。
  * <p>注意：鉴权场景 Redis 异常禁止降级放行，抛 SessionUnavailableException 快速失败。
  * 实现与 hltgq-site 的 SessionContextService 保持一致（同平台、同会话体系）。
@@ -25,6 +25,9 @@ public class SessionContextService {
     /** Header 传递会话 ID（平台服务端代理场景） */
     public static final String HEADER_SESSION_ID = "X-Session-Id";
 
+    /** Authorization 头传递会话 ID（标准头，值形如 dev_hltgq_session:xxxx，可选带 Bearer 前缀） */
+    public static final String HEADER_AUTHORIZATION = "Authorization";
+
     /** Cookie 传递会话 ID（浏览器直连场景） */
     public static final String COOKIE_SESSION_ID = "sessionId";
 
@@ -33,7 +36,8 @@ public class SessionContextService {
     private StringRedisTemplate stringRedisTemplate;
 
     /**
-     * 从请求提取会话 ID：优先 Header（X-Session-Id），其次 Cookie（sessionId）
+     * 从请求提取会话 ID：优先 Header（X-Session-Id），其次 Header（Authorization），最后 Cookie（sessionId）。
+     * <p>任意来源携带形如 dev_hltgq_session:xxxx 的会话键即视为已携带登录凭证。
      *
      * @return 会话 ID，未携带返回 null
      */
@@ -41,6 +45,17 @@ public class SessionContextService {
         String headerValue = request.getHeader(HEADER_SESSION_ID);
         if (StringUtils.hasText(headerValue)) {
             return headerValue.trim();
+        }
+        String authValue = request.getHeader(HEADER_AUTHORIZATION);
+        if (StringUtils.hasText(authValue)) {
+            String trimmed = authValue.trim();
+            // 兼容标准 "Bearer xxx" 前缀，剥离后剩余部分即会话键
+            if (trimmed.regionMatches(true, 0, "Bearer ", 0, 7)) {
+                trimmed = trimmed.substring(7).trim();
+            }
+            if (StringUtils.hasText(trimmed)) {
+                return trimmed;
+            }
         }
         Cookie[] cookies = request.getCookies();
         if (cookies != null) {
@@ -59,7 +74,7 @@ public class SessionContextService {
     public UserContext resolveCurrentUser(HttpServletRequest request) {
         String sessionId = extractSessionId(request);
         if (sessionId == null) {
-            log.warn("未登录：请求未携带会话 ID（Header/Cookie 均缺失）");
+            log.warn("未登录：请求未携带会话 ID（X-Session-Id/Authorization/Cookie 均缺失）");
             throw new UnauthorizedException("未登录：缺少会话 ID");
         }
         return resolveUser(sessionId);

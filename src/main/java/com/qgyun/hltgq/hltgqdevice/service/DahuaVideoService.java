@@ -270,11 +270,14 @@ public class DahuaVideoService {
      * <p>
      * 浏览器无法直接携带OAuth Token访问ICC媒体服务器，
      * 需要通过后端代理转发HLS请求并自动附加鉴权信息。
+     * 同时强制将7086端口的公网IP替换为内网HLS主机（7086仅内网可达）。
+     * <p>
+     * 公共方法：实时流与录像回放流（/vod/...路径，同为7086端口）共用此包装逻辑。
      *
      * @param rawUrl ICC返回的原始流地址（如 http://192.168.14.20:7086/live/.../1.m3u8）
      * @return 代理地址（如 /api/dahua/hls-proxy?url=...）
      */
-    private String buildProxyUrl(String rawUrl) {
+    public String buildProxyUrl(String rawUrl) {
         if (rawUrl == null || rawUrl.trim().isEmpty()) {
             return null;
         }

@@ -7,8 +7,10 @@ import com.qgyun.hltgq.hltgqdevice.auth.SessionUnavailableException;
 import com.qgyun.hltgq.hltgqdevice.auth.UnauthorizedException;
 import com.qgyun.hltgq.hltgqdevice.auth.UserContext;
 import com.qgyun.hltgq.hltgqdevice.model.ApiResponse;
+import com.qgyun.hltgq.hltgqdevice.model.RecordSegment;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaDeviceService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaPtzService;
+import com.qgyun.hltgq.hltgqdevice.service.DahuaRecordService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaVideoService;
 import com.qgyun.hltgq.hltgqdevice.service.PtzCommandDispatcher;
 import lombok.extern.slf4j.Slf4j;
@@ -40,6 +42,9 @@ public class DahuaController {
 
     @Resource
     private DahuaPtzService ptzService;
+
+    @Resource
+    private DahuaRecordService recordService;
 
     @Resource
     private PtzCommandDispatcher ptzDispatcher;
@@ -200,6 +205,124 @@ public class DahuaController {
         } catch (Exception e) {
             log.error("镜头控制接口异常：", e);
             return ApiResponse.fail("镜头控制失败：" + e.getMessage());
+        }
+    }
+
+    // ==================== 历史录像 ====================
+
+    /**
+     * 查询通道指定月份的每日录像存在状态（前端月历标记用）
+     * <p>
+     * 前端调用：GET /api/dahua/record/month-status?channelId=xxx&month=202609&recordSource=1
+     *
+     * @param channelId    通道ID（必填）
+     * @param month        月份，格式 yyyyMM（必填）
+     * @param recordSource 录像来源：1=全部，2=设备，3=中心（默认1）
+     * @return days 字符串（逗号分隔的0/1序列，1=当日有录像）
+     */
+    @GetMapping("/record/month-status")
+    public ApiResponse<Map<String, Object>> getMonthRecordStatus(
+            @RequestParam String channelId,
+            @RequestParam String month,
+            @RequestParam(required = false, defaultValue = "1") String recordSource) {
+        Map<String, Object> result = new HashMap<>();
+        try {
+            if (channelId == null || channelId.trim().isEmpty()) {
+                return ApiResponse.fail("通道ID不能为空");
+            }
+            if (month == null || !month.matches("\\d{6}")) {
+                return ApiResponse.fail("月份格式错误，应为yyyyMM");
+            }
+            String days = recordService.getMonthRecordStatus(channelId.trim(), recordSource, month);
+            result.put("channelId", channelId.trim());
+            result.put("month", month);
+            result.put("days", days);
+            return ApiResponse.success(result);
+        } catch (Exception e) {
+            log.error("月录像状态查询接口异常：", e);
+            return ApiResponse.fail("月录像状态查询失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 查询时间段内录像信息列表（按文件分段，回放不能跨文件）
+     * <p>
+     * 前端调用：GET /api/dahua/record/query?channelId=xxx&startTime=1725000000&endTime=1725003600
+     *
+     * @param channelId    通道ID（必填）
+     * @param startTime    开始时间（时间戳：单位秒，必填）
+     * @param endTime      结束时间（时间戳：单位秒，必填）
+     * @param recordSource 录像来源：1=全部，2=设备，3=中心（默认1）
+     * @param streamType   码流类型：0=所有，1=主码流，2=辅码流（默认0）
+     * @param recordType   录像类型：0=全部录像（默认0）
+     * @return 录像段列表（无录像返回空数组）
+     */
+    @GetMapping("/record/query")
+    public ApiResponse<List<RecordSegment>> queryRecords(
+            @RequestParam String channelId,
+            @RequestParam long startTime,
+            @RequestParam long endTime,
+            @RequestParam(required = false, defaultValue = "1") String recordSource,
+            @RequestParam(required = false, defaultValue = "0") String streamType,
+            @RequestParam(required = false, defaultValue = "0") String recordType) {
+        try {
+            if (channelId == null || channelId.trim().isEmpty()) {
+                return ApiResponse.fail("通道ID不能为空");
+            }
+            if (startTime <= 0 || endTime <= startTime) {
+                return ApiResponse.fail("时间范围不合法");
+            }
+            List<RecordSegment> records = recordService.queryRecords(
+                    channelId.trim(), recordSource, startTime, endTime, streamType, recordType);
+            return ApiResponse.success(records);
+        } catch (Exception e) {
+            log.error("录像信息查询接口异常：", e);
+            return ApiResponse.fail("录像信息查询失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 获取HLS录像回放流代理地址
+     * <p>
+     * 前端调用：GET /api/dahua/record/stream?channelId=xxx&beginTime=1725000000&endTime=1725000300
+     * <p>
+     * 注意：beginTime/endTime 不能跨录像文件（先调 /record/query 拿到段再申请流），
+     * 返回的代理地址经 /hls-proxy 播放（后端自动附加token、内网IP修正、HEVC转码兜底）。
+     *
+     * @param channelId    通道ID（必填）
+     * @param beginTime    开始时间（时间戳：单位秒，必填）
+     * @param endTime      结束时间（时间戳：单位秒，必填）
+     * @param streamType   码流类型：1=主码流，2=辅码流（默认1）
+     * @param recordType   录像类型：1=普通录像，2=报警录像（默认1，与查询到的段类型保持一致）
+     * @param recordSource 录像来源：2=设备，3=中心（默认3）
+     * @return { url } 代理播放地址
+     */
+    @GetMapping("/record/stream")
+    public ApiResponse<Map<String, String>> getRecordStream(
+            @RequestParam String channelId,
+            @RequestParam long beginTime,
+            @RequestParam long endTime,
+            @RequestParam(required = false, defaultValue = "1") String streamType,
+            @RequestParam(required = false, defaultValue = "1") String recordType,
+            @RequestParam(required = false, defaultValue = "3") String recordSource) {
+        try {
+            if (channelId == null || channelId.trim().isEmpty()) {
+                return ApiResponse.fail("通道ID不能为空");
+            }
+            if (beginTime <= 0 || endTime <= beginTime) {
+                return ApiResponse.fail("时间范围不合法");
+            }
+            String url = recordService.getRecordStreamUrl(
+                    channelId.trim(), streamType, recordType, beginTime, endTime, recordSource);
+            if (url == null || url.trim().isEmpty()) {
+                return ApiResponse.fail("获取录像回放流失败，可能该时间段无录像或录像类型不支持");
+            }
+            Map<String, String> result = new HashMap<>();
+            result.put("url", url);
+            return ApiResponse.success(result);
+        } catch (Exception e) {
+            log.error("录像回放流接口异常：", e);
+            return ApiResponse.fail("获取录像回放流失败：" + e.getMessage());
         }
     }
 

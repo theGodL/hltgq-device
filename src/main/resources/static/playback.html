@@ -1,0 +1,1784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>录像回放 - 花凉亭灌区视频监控</title>
+  <!-- hls.js 用于播放HLS(m3u8)录像回放流，1.5.17支持HEVC(H.265) -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <style>
+    /* ==================== 基础 ==================== */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", sans-serif;
+      background: #f5f7fa;
+      color: #333;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+    }
+    button { font-family: inherit; cursor: pointer; }
+
+    /* ==================== 顶部导航栏 ==================== */
+    .topbar {
+      height: 52px;
+      background: #fff;
+      border-bottom: 1px solid #eceef1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .topbar-left { display: flex; align-items: center; gap: 10px; }
+    .title-bar {
+      width: 4px; height: 20px;
+      background: #1890ff;
+      border-radius: 2px;
+    }
+    .page-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: #1890ff;
+      letter-spacing: 1px;
+    }
+    .topbar-tools { display: flex; align-items: center; gap: 10px; }
+
+    /* 顶部宫格切换图标（CSS绘制小方块） */
+    .layout-icons { display: flex; align-items: center; border: 1px solid #d9d9d9; border-radius: 4px; overflow: hidden; }
+    .layout-ico {
+      width: 34px; height: 30px;
+      background: #fff;
+      border: none;
+      border-right: 1px solid #e8e8e8;
+      display: flex; align-items: center; justify-content: center;
+      padding: 0;
+    }
+    .layout-ico:last-child { border-right: none; }
+    .layout-ico:hover { background: #f5f7fa; }
+    .layout-ico.active { background: #e6f4ff; }
+    .layout-ico.active .mini { background: #1890ff; border-color: #1890ff; }
+    .mini-grid { display: inline-grid; gap: 2px; }
+    .mini-grid.l1 { grid-template-columns: repeat(1, 10px); grid-template-rows: repeat(1, 10px); }
+    .mini-grid.l4 { grid-template-columns: repeat(2, 5px); grid-template-rows: repeat(2, 5px); }
+    .mini-grid.l9 { grid-template-columns: repeat(3, 4px); grid-template-rows: repeat(3, 4px); }
+    .mini-grid.l16 { grid-template-columns: repeat(4, 3px); grid-template-rows: repeat(4, 3px); }
+    .mini { background: #8c8c8c; border: 1px solid #8c8c8c; border-radius: 1px; }
+
+    /* 搜索框 */
+    .search-box {
+      display: flex; align-items: center;
+      border: 1px solid #d9d9d9;
+      border-radius: 16px;
+      padding: 4px 10px;
+      width: 210px;
+      background: #fff;
+      transition: border-color .2s;
+    }
+    .search-box:focus-within { border-color: #1890ff; }
+    .search-ico { font-size: 13px; color: #999; margin-right: 6px; }
+    .search-box input {
+      border: none; outline: none;
+      width: 100%;
+      font-size: 13px;
+      color: #333;
+      background: transparent;
+    }
+    .search-box input::placeholder { color: #bfbfbf; }
+
+    .icon-btn {
+      width: 30px; height: 30px;
+      border: 1px solid #d9d9d9;
+      border-radius: 4px;
+      background: #fff;
+      font-size: 14px;
+      color: #595959;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .icon-btn:hover { color: #1890ff; border-color: #1890ff; }
+
+    .back-live {
+      border: none;
+      background: none;
+      color: #1890ff;
+      font-size: 14px;
+      padding: 4px 6px;
+      border-radius: 4px;
+    }
+    .back-live:hover { background: #e6f4ff; }
+
+    /* ==================== 主体布局 ==================== */
+    .main { flex: 1; display: flex; min-height: 0; }
+
+    /* ---------- 左侧边栏 ---------- */
+    .sidebar {
+      width: 25%;
+      min-width: 280px;
+      background: #f0f2f5;
+      border-right: 1px solid #e0e3e8;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .sidebar-title {
+      display: flex; align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid #e0e3e8;
+      flex-shrink: 0;
+    }
+    .folder-ico { font-size: 16px; margin-right: 6px; }
+    .sidebar-title-text { font-weight: 700; color: #262626; font-size: 14px; margin-right: auto; }
+    .online-stat { font-size: 12px; color: #8c8c8c; }
+
+    .tree { flex: 1; overflow: auto; padding: 4px 0 12px 0; }
+    .tree ul { list-style: none; }
+    .tree .children { margin-left: 16px; }
+    .tree .children.collapsed { display: none; }
+
+    .tree-node .node-row {
+      display: flex; align-items: center;
+      height: 30px;
+      padding: 0 8px;
+      cursor: pointer;
+      border-radius: 3px;
+      user-select: none;
+      white-space: nowrap;
+    }
+    .tree-node .node-row:hover { background: #e6e9ee; }
+    .tree-node.selected > .node-row { background: #d6e9ff; }
+    .tree-node.selected > .node-row .node-label { color: #1890ff; font-weight: 600; }
+
+    /* 三角箭头（灰色） */
+    .expand-icon {
+      width: 14px; height: 14px;
+      flex-shrink: 0;
+      margin-right: 2px;
+      display: inline-flex; align-items: center; justify-content: center;
+      color: #8c8c8c;
+      font-size: 10px;
+      transition: transform .15s;
+    }
+    .tree-node.expanded > .node-row > .expand-icon { transform: rotate(90deg); }
+    .tree-node.leaf .expand-icon { visibility: hidden; }
+
+    /* 复选框 */
+    .chk {
+      flex-shrink: 0;
+      width: 15px; height: 15px;
+      margin-right: 6px;
+      position: relative;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .chk input { position: absolute; opacity: 0; width: 100%; height: 100%; cursor: pointer; margin: 0; }
+    .chk-box {
+      width: 14px; height: 14px;
+      border: 1px solid #bfbfbf;
+      border-radius: 2px;
+      background: #fff;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .15s;
+    }
+    .chk-box::after {
+      content: '';
+      width: 7px; height: 4px;
+      border-left: 2px solid #fff;
+      border-bottom: 2px solid #fff;
+      transform: rotate(-45deg) scale(0);
+      transition: transform .15s;
+      margin-top: -2px;
+    }
+    .chk input:checked + .chk-box { background: #1890ff; border-color: #1890ff; }
+    .chk input:checked + .chk-box::after { transform: rotate(-45deg) scale(1); }
+
+    .node-icon { font-size: 13px; margin-right: 5px; flex-shrink: 0; }
+    .node-label { font-size: 13px; color: #434343; overflow: hidden; text-overflow: ellipsis; }
+
+    /* 在线状态小圆点 */
+    .node-status {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      margin-left: auto;
+      flex-shrink: 0;
+      margin-right: 2px;
+    }
+    .node-status.online { background: #52c41a; }
+    .node-status.offline { background: #bfbfbf; }
+
+    .tree-loading, .tree-error { padding: 20px 14px; color: #8c8c8c; font-size: 13px; text-align: center; }
+    .retry-btn {
+      margin-top: 8px; padding: 4px 14px;
+      border: 1px solid #1890ff; color: #1890ff;
+      background: #fff; border-radius: 4px;
+      font-size: 12px;
+    }
+
+    /* ---------- 右侧主内容区 ---------- */
+    .content { flex: 1; display: flex; flex-direction: column; padding: 12px; gap: 10px; min-width: 0; min-height: 0; }
+
+    /* 信息工具栏 */
+    .info-bar {
+      height: 40px;
+      background: #fff;
+      border: 1px solid #e8eaed;
+      border-radius: 6px;
+      display: flex; align-items: center;
+      padding: 0 14px;
+      gap: 10px;
+      flex-shrink: 0;
+      box-shadow: 0 1px 2px rgba(0,0,0,.03);
+    }
+    .time-label { color: #8c8c8c; font-size: 13px; }
+    .time-input {
+      width: 172px; height: 28px;
+      border: 1px solid #d9d9d9;
+      border-radius: 4px;
+      padding: 0 8px;
+      font-size: 12px;
+      color: #333;
+      outline: none;
+      background: #fff;
+      font-variant-numeric: tabular-nums;
+    }
+    .time-input:focus { border-color: #1890ff; }
+    /* 隐藏datetime-local的上下调节箭头，保持外观简洁（日历图标保留） */
+    .time-input::-webkit-inner-spin-button { display: none; }
+    .time-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .6; }
+    .time-sep { color: #8c8c8c; font-size: 12px; }
+    .query-btn {
+      height: 28px;
+      padding: 0 18px;
+      background: #1890ff;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: background .2s;
+    }
+    .query-btn:hover { background: #40a9ff; }
+    .tip-text { margin-left: auto; font-size: 12px; color: #bfbfbf; white-space: nowrap; }
+
+    /* 视频网格 */
+    .video-grid {
+      flex: 1;
+      display: grid;
+      gap: 8px;
+      min-height: 0;
+    }
+    .video-grid.layout-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+    .video-grid.layout-2 { grid-template-columns: repeat(2, 1fr); grid-template-rows: 1fr; }
+    .video-grid.layout-4 { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
+    .video-grid.layout-9 { grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 1fr); }
+    .video-grid.layout-16 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(4, 1fr); }
+
+    .video-cell {
+      position: relative;
+      background: #1a1f2e;
+      border-radius: 6px;
+      overflow: hidden;
+      display: none;
+      cursor: pointer;
+      min-height: 0;
+    }
+    .video-cell.visible { display: block; }
+    .video-cell.selected { outline: 2px solid #1890ff; outline-offset: -2px; }
+
+    .video-cell video { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+    /* 占位（空视频格子） */
+    .placeholder {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      color: #6b7290;
+      gap: 8px;
+    }
+    .placeholder .plus {
+      width: 44px; height: 44px;
+      border: 2px dashed #4a5678;
+      border-radius: 8px;
+      font-size: 26px;
+      line-height: 40px;
+      text-align: center;
+      color: #5a6790;
+      font-weight: 300;
+    }
+    .placeholder .ph-text { font-size: 13px; color: #7a83a3; }
+    .placeholder .ph-warn { font-size: 12px; color: #ff9c9c; max-width: 85%; text-align: center; }
+
+    /* 格子底部信息浮层 */
+    .cell-info {
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 30px;
+      background: linear-gradient(to top, rgba(0,0,0,.72), rgba(0,0,0,.28) 70%, transparent);
+      display: none;
+      align-items: center;
+      padding: 0 10px;
+      pointer-events: none;
+    }
+    .cell-name { color: #fff; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cell-tags { display: flex; gap: 6px; align-items: center; }
+    .tag {
+      display: inline-flex; align-items: center;
+      font-size: 11px;
+      border-radius: 3px;
+      padding: 1px 6px;
+      line-height: 16px;
+    }
+    .tag.live { background: rgba(0,0,0,.55); color: #52c41a; }
+    .tag.live .dot { width: 6px; height: 6px; border-radius: 50%; background: #52c41a; margin-right: 4px; }
+    .tag.hd { background: #fff; color: #333; font-weight: 600; }
+
+    /* 加载中遮罩 */
+    .cell-loading {
+      position: absolute; inset: 0;
+      background: rgba(26,31,46,.75);
+      display: none;
+      align-items: center; justify-content: center;
+      color: #91a2c9;
+      font-size: 12px;
+      flex-direction: column; gap: 8px;
+    }
+    .cell-loading.show { display: flex; }
+    .spinner {
+      width: 22px; height: 22px;
+      border: 3px solid #3a4668;
+      border-top-color: #1890ff;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* 时间轴 */
+    .timeline {
+      height: 74px;
+      background: #eef1f5;
+      border: 1px solid #e2e6ec;
+      border-radius: 6px;
+      position: relative;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .timeline-ruler { position: absolute; inset: 10px 8px 8px 8px; }
+    .ruler-seg {
+      position: absolute;
+      height: 8px;
+      border-radius: 3px;
+      background: #69c0ff;
+      opacity: .55;
+      top: 8px;
+    }
+    .tick {
+      position: absolute;
+      top: 22px;
+      bottom: 0;
+      width: 1px;
+      background: #d3d8e0;
+    }
+    .tick.major { background: #b6bcc7; }
+    .tick-label {
+      position: absolute;
+      bottom: 0;
+      transform: translateX(-50%);
+      font-size: 10px;
+      color: #7a7f8c;
+      font-variant-numeric: tabular-nums;
+    }
+    /* 蓝色播放指针 */
+    .playhead {
+      position: absolute;
+      top: 6px;
+      bottom: 0;
+      left: 8px;
+      right: 8px;
+      width: 0;
+      z-index: 3;
+      display: none;
+    }
+    .playhead.show { display: block; }
+    .playhead-line {
+      position: absolute;
+      top: 0; bottom: 0; left: 0;
+      width: 2px;
+      background: #1890ff;
+      transform: translateX(-1px);
+    }
+    .playhead-dot {
+      position: absolute;
+      top: -2px; left: -5px;
+      width: 0; height: 0;
+      border-left: 5px solid transparent;
+      border-right: 5px solid transparent;
+      border-top: 7px solid #1890ff;
+    }
+    .playhead-tip {
+      position: absolute;
+      top: -2px; left: 8px;
+      background: #1890ff;
+      color: #fff;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 底部播放控制栏 */
+    .control-bar {
+      height: 44px;
+      background: #fff;
+      border: 1px solid #e8eaed;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      gap: 18px;
+      flex-shrink: 0;
+      box-shadow: 0 1px 2px rgba(0,0,0,.03);
+    }
+    .ctrl-group { display: flex; align-items: center; gap: 8px; }
+    .ctrl-btn {
+      width: 32px; height: 32px;
+      border: 1px solid #e3e6ea;
+      border-radius: 4px;
+      background: #fafbfc;
+      font-size: 13px;
+      color: #434343;
+      display: flex; align-items: center; justify-content: center;
+      transition: all .15s;
+    }
+    .ctrl-btn:hover { border-color: #1890ff; color: #1890ff; }
+    .ctrl-btn.stop { color: #ff4d4f; }
+    .ctrl-btn.stop:hover { border-color: #ff4d4f; }
+    .ctrl-btn.play {
+      width: 38px; height: 38px;
+      border-radius: 50%;
+      background: #1890ff;
+      border-color: #1890ff;
+      color: #fff;
+      font-size: 15px;
+    }
+    .ctrl-btn.play:hover { background: #40a9ff; border-color: #40a9ff; color: #fff; }
+
+    /* 倍速 */
+    .speed-box {
+      position: relative;
+      min-width: 48px; height: 30px;
+      border: 1px solid #e3e6ea;
+      border-radius: 4px;
+      background: #fff;
+      display: flex; align-items: center; justify-content: center;
+      gap: 4px;
+      font-size: 12px;
+      color: #434343;
+      cursor: pointer;
+      user-select: none;
+    }
+    .speed-box .arrow { font-size: 9px; color: #999; }
+    .speed-menu {
+      position: absolute;
+      bottom: 34px; left: 0;
+      background: #fff;
+      border: 1px solid #e3e6ea;
+      border-radius: 4px;
+      box-shadow: 0 3px 10px rgba(0,0,0,.12);
+      display: none;
+      z-index: 20;
+      min-width: 62px;
+    }
+    .speed-menu.show { display: block; }
+    .speed-menu .item {
+      padding: 6px 14px;
+      font-size: 12px;
+      color: #434343;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .speed-menu .item:hover { background: #f0f6ff; color: #1890ff; }
+    .speed-menu .item.active { color: #1890ff; font-weight: 600; }
+
+    .layout-label { font-size: 12px; color: #8c8c8c; margin-right: 2px; }
+    .layout-num {
+      min-width: 26px; height: 26px;
+      border: 1px solid #d9d9d9;
+      border-radius: 4px;
+      background: #fff;
+      color: #595959;
+      font-size: 12px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .layout-num:hover { border-color: #1890ff; color: #1890ff; }
+    .layout-num.active { background: #1890ff; border-color: #1890ff; color: #fff; font-weight: 600; }
+
+    .ctrl-divider { width: 1px; height: 22px; background: #eceef1; }
+
+    /* 提示浮层 */
+    .toast {
+      position: fixed;
+      top: 70px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.72);
+      color: #fff;
+      font-size: 13px;
+      padding: 9px 18px;
+      border-radius: 4px;
+      z-index: 999;
+      display: none;
+      max-width: 70%;
+    }
+
+    /* 滚动条 */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: #c8ccd4; border-radius: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+  </style>
+</head>
+<body>
+  <!-- ==================== 顶部导航栏 ==================== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="title-bar"></span>
+      <h1 class="page-title">录像回放</h1>
+    </div>
+    <div class="topbar-tools">
+      <div class="layout-icons">
+        <button class="layout-ico" data-layout="1" title="单屏" onclick="setLayout(1)">
+          <span class="mini-grid l1"><span class="mini"></span></span>
+        </button>
+        <button class="layout-ico active" data-layout="4" title="四宫格" onclick="setLayout(4)">
+          <span class="mini-grid l4"><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span></span>
+        </button>
+        <button class="layout-ico" data-layout="9" title="九宫格" onclick="setLayout(9)">
+          <span class="mini-grid l9"><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span></span>
+        </button>
+        <button class="layout-ico" data-layout="16" title="十六宫格" onclick="setLayout(16)">
+          <span class="mini-grid l16"><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span><span class="mini"></span></span>
+        </button>
+      </div>
+      <div class="search-box">
+        <span class="search-ico">🔍</span>
+        <input id="searchInput" type="text" placeholder="搜索点位..." oninput="filterTree(this.value)">
+      </div>
+      <button class="icon-btn" title="刷新" onclick="reloadTree()">🔄</button>
+      <button class="icon-btn" title="全屏" onclick="togglePageFullscreen()">⛶</button>
+      <button class="back-live" onclick="location.href='monitor.html'">返回实时</button>
+    </div>
+  </header>
+
+  <!-- ==================== 主体 ==================== -->
+  <div class="main">
+    <!-- 左侧边栏：通道列表 -->
+    <aside class="sidebar">
+      <div class="sidebar-title">
+        <span class="folder-ico">📁</span>
+        <span class="sidebar-title-text">监控点位</span>
+        <span class="online-stat" id="onlineStat">在线--路，离线--路</span>
+      </div>
+      <div class="tree" id="treeContainer"></div>
+    </aside>
+
+    <!-- 右侧主内容区 -->
+    <section class="content">
+      <!-- 信息工具栏 -->
+      <div class="info-bar">
+        <span class="time-label">回放时间</span>
+        <input id="beginInput" class="time-input" type="datetime-local" step="1" spellcheck="false">
+        <span class="time-sep">至</span>
+        <input id="endInput" class="time-input" type="datetime-local" step="1" spellcheck="false">
+        <button class="query-btn" onclick="queryPlayback()">查询回放</button>
+        <span class="tip-text">勾选左侧视频（最多16路），默认四宫格，支持1/4/9/16</span>
+      </div>
+
+      <!-- 视频播放网格 -->
+      <div class="video-grid layout-4" id="videoGrid"></div>
+
+      <!-- 时间轴 -->
+      <div class="timeline" id="timeline">
+        <div class="timeline-ruler" id="timelineRuler"></div>
+        <div class="playhead" id="playhead">
+          <div class="playhead-dot"></div>
+          <div class="playhead-line"></div>
+          <span class="playhead-tip" id="playheadTip">--</span>
+        </div>
+      </div>
+
+      <!-- 播放控制栏 -->
+      <div class="control-bar">
+        <div class="ctrl-group">
+          <button class="ctrl-btn stop" title="停止" onclick="stopPlayback()">■</button>
+          <button class="ctrl-btn play" id="playBtn" title="播放/暂停" onclick="togglePlay()">▶</button>
+          <button class="ctrl-btn" title="快退10秒" onclick="seek(-10)">⏪</button>
+          <button class="ctrl-btn" title="快进10秒" onclick="seek(10)">⏩</button>
+          <div class="speed-box" onclick="toggleSpeedMenu(event)">
+            <span id="speedText">1x</span><span class="arrow">▾</span>
+            <div class="speed-menu" id="speedMenu">
+              <div class="item" onclick="event.stopPropagation(); setSpeed(0.5)">0.5x</div>
+              <div class="item active" onclick="event.stopPropagation(); setSpeed(1)">1x</div>
+              <div class="item" onclick="event.stopPropagation(); setSpeed(1.5)">1.5x</div>
+              <div class="item" onclick="event.stopPropagation(); setSpeed(2)">2x</div>
+              <div class="item" onclick="event.stopPropagation(); setSpeed(4)">4x</div>
+            </div>
+          </div>
+        </div>
+        <span class="ctrl-divider"></span>
+        <div class="ctrl-group">
+          <span class="layout-label">布局</span>
+          <button class="layout-num" data-layout="1" onclick="setLayout(1)">1</button>
+          <button class="layout-num" data-layout="2" onclick="setLayout(2)">2</button>
+          <button class="layout-num active" data-layout="4" onclick="setLayout(4)">4</button>
+          <button class="layout-num" data-layout="9" onclick="setLayout(9)">9</button>
+          <button class="layout-num" data-layout="16" onclick="setLayout(16)">16</button>
+        </div>
+        <span class="ctrl-divider"></span>
+        <div class="ctrl-group">
+          <button class="ctrl-btn" title="截图" onclick="captureSnapshot()">📷</button>
+          <button class="ctrl-btn" title="下载" onclick="downloadRecord()">⬇</button>
+          <button class="ctrl-btn" title="全屏" onclick="fullscreenSelectedCell()">⛶</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+  // ==================== 常量与全局状态 ====================
+  const API_BASE = '/api/dahua';
+  const MAX_CELLS = 16;                 // 最多16路
+  const FILTERED_ORG_NAMES = ['高低点视频', '分析服务器'];
+
+  let channelList = [];                 // 全量通道（统计用）
+  let playbackQueue = [];               // 勾选通道队列 {channelId, name, isOnline}
+  let selectedChannelId = null;         // 树中选中行
+  let currentLayout = 4;                // 当前布局：1/2/4/9/16
+  let selectedCell = 0;                 // 主区选中格子索引
+  let hlsPlayers = {};                  // cellIndex -> hls实例
+  let cellChannels = {};                // cellIndex -> {channelId, name, beginTime}
+  let queryRange = { begin: 0, end: 0 };// 查询时间范围（秒）
+  let timelineSegs = [];                // 时间轴录像段 {channelId, name, start, end}
+  let currentSpeed = 1;                 // 当前倍速
+
+  function isFilteredOrg(name) {
+    if (!name) return false;
+    return FILTERED_ORG_NAMES.some(keyword => name.includes(keyword));
+  }
+
+  // ==================== 工具函数 ====================
+  let toastTimer = null;
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.display = 'block';
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.display = 'none'; }, 2600);
+  }
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function fmtTime(ts) {
+    if (!ts) return '--';
+    const d = new Date(ts * 1000);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  /** 秒时间戳 → datetime-local 输入框的 value 格式（本地时间，无时区后缀） */
+  function fmtLocalInput(ts) {
+    const d = new Date(ts * 1000);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  function parseTime(s) {
+    if (!s) return 0;
+    // 兼容 datetime-local 的 "2026-09-01T22:33:12" 与纯文本 "2026-09-01 22:33:12"
+    const normalized = s.indexOf('T') >= 0 ? s : s.replace(' ', 'T');
+    const t = Math.floor(new Date(normalized).getTime() / 1000);
+    return isNaN(t) ? 0 : t;
+  }
+  async function fetchJson(url) {
+    const resp = await fetch(url);
+    return await resp.json();
+  }
+
+  // ==================== 初始化时间范围（默认最近10分钟） ====================
+  function initTimeRange() {
+    const now = Math.floor(Date.now() / 1000);
+    const begin = now - 600;
+    queryRange = { begin: begin, end: now };
+    document.getElementById('beginInput').value = fmtLocalInput(begin);
+    document.getElementById('endInput').value = fmtLocalInput(now);
+    renderTimeline();
+  }
+
+  // ==================== 设备树加载（ICC懒加载） ====================
+  async function loadAllChannelCounts() {
+    let online = 0, offline = 0;
+    async function recurse(parentId) {
+      try {
+        const json = await fetchJson(API_BASE + '/device-tree?orgId=' + encodeURIComponent(parentId));
+        if (json.success !== true) return;
+        const children = json.data;
+        if (!children || !Array.isArray(children)) return;
+        const tasks = [];
+        for (const child of children) {
+          if (isFilteredOrg(child.name)) continue;
+          if (child.nodeType === 'ch') {
+            // ★ 在线判定只认isOnline
+            if (child.isOnline === 1) online++; else offline++;
+          }
+          if (child.isParent === true && child.nodeType !== 'ch') {
+            tasks.push(recurse(String(child.id || '')));
+          }
+        }
+        await Promise.all(tasks);
+      } catch (err) {
+        console.warn('[Tree] 递归统计失败 parentId=' + parentId, err);
+      }
+    }
+    await recurse('001');
+    document.getElementById('onlineStat').textContent = '在线' + online + '路，离线' + offline + '路';
+  }
+
+  async function loadDeviceTree() {
+    const container = document.getElementById('treeContainer');
+    container.innerHTML = '<div class="tree-loading">⏳ 正在加载设备树...</div>';
+
+    try {
+      const countPromise = loadAllChannelCounts();
+
+      const resp = await fetch(API_BASE + '/device-tree?orgId=');
+      const json = await resp.json();
+      if (json.success !== true) {
+        throw new Error(json.desc || 'API返回错误码: ' + json.code);
+      }
+
+      channelList = [];
+      container.innerHTML = '';
+
+      const children = json.data;
+      if (!children || !Array.isArray(children) || children.length === 0) {
+        container.innerHTML = '<div class="tree-error">⚠ 未获取到设备树数据<br><button class="retry-btn" onclick="loadDeviceTree()">重试</button></div>';
+        return;
+      }
+
+      // 花凉亭灌区根节点（id=001）
+      const rootNode = document.createElement('li');
+      rootNode.className = 'tree-node expanded root-node';
+      rootNode.dataset.id = '001';
+      rootNode.dataset.name = '花凉亭灌区';
+      rootNode.dataset.nodeType = 'org';
+      rootNode.dataset.isParent = 'true';
+      rootNode.dataset.loaded = 'true';
+
+      const row = document.createElement('div');
+      row.className = 'node-row';
+      row.innerHTML = '<span class="expand-icon">▶</span>' +
+        '<span class="node-icon">📁</span>' +
+        '<span class="node-label">花凉亭灌区</span>';
+      rootNode.appendChild(row);
+
+      const rootKids = document.createElement('ul');
+      rootKids.className = 'children';
+      await appendChildrenFlattened(children, rootKids);
+      rootNode.appendChild(rootKids);
+
+      const rootUl = document.createElement('ul');
+      rootUl.appendChild(rootNode);
+
+      // 麻塘湖灌区占位节点（暂未接入设备）
+      const mtNode = document.createElement('li');
+      mtNode.className = 'tree-node root-node';
+      mtNode.dataset.id = 'matanghu';
+      mtNode.dataset.name = '麻塘湖灌区';
+      mtNode.dataset.nodeType = 'org';
+      mtNode.dataset.isParent = 'true';
+      mtNode.dataset.loaded = 'true';
+      const mtRow = document.createElement('div');
+      mtRow.className = 'node-row';
+      mtRow.innerHTML = '<span class="expand-icon">▶</span>' +
+        '<span class="node-icon">📁</span>' +
+        '<span class="node-label">麻塘湖灌区</span>';
+      mtNode.appendChild(mtRow);
+      const mtKids = document.createElement('ul');
+      mtKids.className = 'children collapsed';
+      const mtPlaceholder = document.createElement('li');
+      mtPlaceholder.className = 'tree-node leaf';
+      const mtPhRow = document.createElement('div');
+      mtPhRow.className = 'node-row';
+      mtPhRow.innerHTML = '<span class="expand-icon">▶</span>' +
+        '<span class="node-icon">📁</span>' +
+        '<span class="node-label" style="color:#999;font-style:italic">暂未接入设备</span>';
+      mtPlaceholder.appendChild(mtPhRow);
+      mtKids.appendChild(mtPlaceholder);
+      mtNode.appendChild(mtKids);
+      const mtExpand = mtNode.querySelector('.expand-icon');
+      mtExpand.onclick = (e) => { e.stopPropagation(); toggleNode(mtNode); };
+      mtRow.onclick = () => toggleNode(mtNode);
+      rootUl.appendChild(mtNode);
+
+      container.appendChild(rootUl);
+
+      const expandIcon = rootNode.querySelector('.expand-icon');
+      expandIcon.onclick = (e) => { e.stopPropagation(); toggleNode(rootNode); };
+      row.onclick = () => toggleNode(rootNode);
+
+      await countPromise;
+    } catch (err) {
+      console.error('加载设备树失败:', err);
+      container.innerHTML = '<div class="tree-error">❌ 加载设备树失败<br><small>' +
+        err.message + '</small><br><button class="retry-btn" onclick="loadDeviceTree()">重试</button></div>';
+    }
+  }
+
+  function reloadTree() {
+    // 刷新设备树（保留已勾选点位重新挂接，树重建后按channelId恢复勾选）
+    const checked = playbackQueue.map(ch => ch.channelId);
+    loadDeviceTree().then(() => {
+      setTimeout(() => {
+        document.querySelectorAll('.tree-node.leaf').forEach(li => {
+          const cid = li.dataset.channelId;
+          if (cid && checked.includes(cid)) {
+            const box = li.querySelector('.chk input');
+            if (box) box.checked = true;
+          }
+        });
+      }, 300);
+    });
+  }
+
+  function createTreeNodeFromIcc(node) {
+    const isChannel = node.nodeType === 'ch';
+    const isDev = node.nodeType === 'dev';
+    const canExpand = node.isParent === true;
+    const nodeId = String(node.id || '');
+    const nodeName = node.name || nodeId || '未知';
+
+    if (isChannel) {
+      channelList.push({
+        channelId: nodeId,
+        name: nodeName,
+        isOnline: node.isOnline === 1
+      });
+    }
+
+    const li = document.createElement('li');
+    li.className = 'tree-node';
+    li.dataset.id = nodeId;
+    li.dataset.name = nodeName;
+    li.dataset.nodeType = node.nodeType || (isChannel ? 'ch' : 'org');
+    li.dataset.isParent = canExpand ? 'true' : 'false';
+    li.dataset.loaded = 'false';
+    if (isChannel || !canExpand) {
+      li.dataset.channelId = nodeId;
+      li.classList.add('leaf');
+    }
+
+    const row = document.createElement('div');
+    row.className = 'node-row';
+
+    // 展开三角箭头
+    const expand = document.createElement('span');
+    expand.className = 'expand-icon';
+    expand.textContent = '▶';
+    if (canExpand) {
+      expand.onclick = (e) => { e.stopPropagation(); toggleNode(li); };
+    }
+    row.appendChild(expand);
+
+    if (isChannel) {
+      // 复选框（勾选=加入回放队列）
+      const chk = document.createElement('label');
+      chk.className = 'chk';
+      chk.innerHTML = '<input type="checkbox"><span class="chk-box"></span>';
+      const input = chk.querySelector('input');
+      input.onclick = (e) => {
+        e.stopPropagation();
+        // 超限时回滚复选框状态，保持勾选与队列一致
+        if (!toggleQueueChannel(nodeId, nodeName, node.isOnline === 1, input.checked)) {
+          input.checked = false;
+        }
+      };
+      row.appendChild(chk);
+    }
+
+    // 类型图标
+    const icon = document.createElement('span');
+    icon.className = 'node-icon';
+    if (isChannel) {
+      icon.textContent = '📹';
+    } else if (isDev) {
+      icon.textContent = '📷';
+    } else {
+      icon.textContent = '📁';
+    }
+    row.appendChild(icon);
+
+    // 名称
+    const label = document.createElement('span');
+    label.className = 'node-label';
+    label.textContent = nodeName;
+    label.title = nodeName;
+    row.appendChild(label);
+
+    // 在线状态圆点
+    if (isChannel || isDev) {
+      const status = document.createElement('span');
+      status.className = 'node-status ' + (node.isOnline === 1 ? 'online' : 'offline');
+      row.appendChild(status);
+    }
+
+    if (isChannel) {
+      row.onclick = (e) => {
+        e.stopPropagation();
+        selectChannelRow(li, nodeId, nodeName, node.isOnline === 1);
+      };
+    } else if (canExpand) {
+      row.onclick = () => toggleNode(li);
+    }
+
+    li.appendChild(row);
+    return li;
+  }
+
+  /**
+   * 追加ICC子节点（dev节点扁平化，通道直接挂组织下）
+   */
+  async function appendChildrenFlattened(children, parentUl) {
+    children.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+    const fetchTasks = [];
+    const directItems = [];
+
+    for (const child of children) {
+      if (isFilteredOrg(child.name)) continue;
+      if (child.nodeType === 'dev' && child.isParent === true) {
+        fetchTasks.push((async () => {
+          try {
+            const devJson = await fetchJson(API_BASE + '/device-tree?orgId=' + encodeURIComponent(String(child.id)));
+            if (devJson.success === true && devJson.data && Array.isArray(devJson.data)) {
+              devJson.data.sort((a, b) => (a.sort || 0) - (b.sort || 0));
+              devJson.data.forEach(ch => {
+                if (ch.nodeType === 'ch') {
+                  parentUl.appendChild(createTreeNodeFromIcc(ch));
+                }
+              });
+            }
+          } catch (e) {
+            console.warn('扁平化设备节点失败:', child.id, child.name, e);
+          }
+        })());
+      } else {
+        directItems.push(child);
+      }
+    }
+    directItems.forEach(child => parentUl.appendChild(createTreeNodeFromIcc(child)));
+    await Promise.all(fetchTasks);
+  }
+
+  function toggleNode(li) {
+    const canExpand = li.dataset.isParent === 'true';
+    const loaded = li.dataset.loaded === 'true';
+    const isExpanded = li.classList.contains('expanded');
+
+    if (!canExpand) return;
+    if (!loaded && !isExpanded) {
+      loadNodeChildren(li);
+      return;
+    }
+    li.classList.toggle('expanded');
+    const kids = li.querySelector(':scope > .children');
+    if (kids) kids.classList.toggle('collapsed');
+  }
+
+  async function loadNodeChildren(li) {
+    const nodeId = li.dataset.id;
+    if (!nodeId) return;
+
+    const row = li.querySelector('.node-row');
+    const label = row ? row.querySelector('.node-label') : null;
+    const origText = label ? label.textContent : '';
+    if (label) label.textContent = origText + ' ⏳';
+
+    try {
+      const json = await fetchJson(API_BASE + '/device-tree?orgId=' + encodeURIComponent(nodeId));
+      if (json.success !== true) {
+        throw new Error(json.desc || '加载失败: ' + json.code);
+      }
+      const children = json.data;
+      if (!children || !Array.isArray(children) || children.length === 0) {
+        li.dataset.isParent = 'false';
+        li.classList.add('leaf');
+        const expIcon = li.querySelector('.expand-icon');
+        if (expIcon) expIcon.style.visibility = 'hidden';
+      } else {
+        const kidsUl = document.createElement('ul');
+        kidsUl.className = 'children';
+        await appendChildrenFlattened(children, kidsUl);
+        li.appendChild(kidsUl);
+      }
+      li.dataset.loaded = 'true';
+      li.classList.add('expanded');
+      const kidsUl = li.querySelector(':scope > .children');
+      if (kidsUl) kidsUl.classList.remove('collapsed');
+    } catch (err) {
+      console.error('加载子节点失败 nodeId=' + nodeId, err);
+      if (label) label.textContent = origText + ' ❌';
+      setTimeout(() => { if (label) label.textContent = origText; }, 2500);
+    } finally {
+      if (label) label.textContent = origText;
+    }
+  }
+
+  // ==================== 勾选/选中通道 ====================
+  function toggleQueueChannel(channelId, name, isOnline, checked) {
+    const existIdx = playbackQueue.findIndex(ch => ch.channelId === channelId);
+    if (checked) {
+      if (existIdx >= 0) return true;
+      if (playbackQueue.length >= MAX_CELLS) {
+        toast('最多同时回放' + MAX_CELLS + '路，请先取消勾选其他点位');
+        return false;
+      }
+      playbackQueue.push({ channelId: channelId, name: name, isOnline: isOnline });
+    } else {
+      if (existIdx >= 0) playbackQueue.splice(existIdx, 1);
+      // 取消勾选后其格子清空
+      releaseCellByChannel(channelId);
+    }
+    updateGridPlaceholders();
+    return true;
+  }
+
+  function releaseCellByChannel(channelId) {
+    for (let i = 0; i < MAX_CELLS; i++) {
+      const cc = cellChannels[i];
+      if (cc && cc.channelId === channelId) {
+        destroyCellPlayer(i);
+        delete cellChannels[i];
+        const cell = getCell(i);
+        if (cell) {
+          showCellPlaceholder(cell);
+          cell.classList.remove('selected');
+        }
+      }
+    }
+    timelineSegs = timelineSegs.filter(s => s.channelId !== channelId);
+    // ★ 取消勾选后队列压缩，后续格子内容前移对齐（格子序 = 勾选序）
+    compactCells();
+    renderTimeline();
+  }
+
+  /**
+   * 将后面的格子内容前移到前面的空槽位，保证"格子顺序 = 勾选队列顺序"。
+   * 仅迁移内容（video元素、hls实例、浮层状态），不销毁播放器。
+   */
+  function compactCells() {
+    let write = 0;
+    for (let read = 0; read < MAX_CELLS; read++) {
+      if (!cellChannels[read]) continue;
+      if (read !== write) {
+        moveCellContent(read, write);
+      }
+      write++;
+    }
+    // write 之后的格子应为空
+    for (let i = write; i < MAX_CELLS; i++) {
+      if (cellChannels[i]) {
+        destroyCellPlayer(i);
+        delete cellChannels[i];
+        const cell = getCell(i);
+        if (cell) showCellPlaceholder(cell);
+      }
+    }
+    updateGridPlaceholders();
+  }
+
+  /**
+   * 将格子 from 的播放内容整体迁移到格子 to（hls实例不销毁、video元素原样移动）
+   */
+  function moveCellContent(from, to) {
+    if (from === to) return;
+    const fromCell = getCell(from);
+    const toCell = getCell(to);
+    if (!fromCell || !toCell) return;
+
+    // 播放器与通道映射转移
+    hlsPlayers[to] = hlsPlayers[from];
+    delete hlsPlayers[from];
+    cellChannels[to] = cellChannels[from];
+    delete cellChannels[from];
+
+    // video元素迁移（appendChild自动从原格移除）
+    const video = fromCell.querySelector('video');
+    if (video) {
+      video.remove();
+      toCell.appendChild(video);
+    }
+
+    // 占位/警告状态迁移（重写retryCell内联索引为新格子号）
+    const phFrom = fromCell.querySelector('.placeholder');
+    const phTo = toCell.querySelector('.placeholder');
+    if (phFrom && phTo) {
+      phTo.innerHTML = phFrom.innerHTML.replace(/retryCell\(\d+\)/g, 'retryCell(' + to + ')');
+      phTo.style.display = phFrom.style.display;
+      phTo.dataset.warn = phFrom.dataset.warn || '';
+    }
+
+    // 底部信息浮层迁移
+    const infoFrom = fromCell.querySelector('.cell-info');
+    const infoTo = toCell.querySelector('.cell-info');
+    if (infoFrom && infoTo) {
+      infoTo.style.display = infoFrom.style.display;
+      const nameFrom = infoFrom.querySelector('.cell-name');
+      const nameTo = infoTo.querySelector('.cell-name');
+      if (nameFrom && nameTo) nameTo.textContent = nameFrom.textContent;
+    }
+
+    // 加载中状态迁移
+    const loadFrom = fromCell.querySelector('.cell-loading');
+    const loadTo = toCell.querySelector('.cell-loading');
+    if (loadFrom && loadTo) {
+      loadTo.classList.toggle('show', loadFrom.classList.contains('show'));
+      const ltFrom = loadFrom.querySelector('.loading-text');
+      const ltTo = loadTo.querySelector('.loading-text');
+      if (ltFrom && ltTo) ltTo.textContent = ltFrom.textContent;
+    }
+
+    // 原格恢复空占位
+    showCellPlaceholder(fromCell);
+
+    // 选中格跟随内容移动
+    if (selectedCell === from) selectedCell = to;
+    document.querySelectorAll('.video-cell').forEach(c => c.classList.remove('selected'));
+    const selCell = getCell(selectedCell);
+    if (selCell) selCell.classList.add('selected');
+    syncPlayhead();
+  }
+
+  function selectChannelRow(li, channelId, name, isOnline) {
+    // 树中高亮选中行
+    document.querySelectorAll('.tree-node.selected').forEach(n => n.classList.remove('selected'));
+    li.classList.add('selected');
+    selectedChannelId = channelId;
+
+    // 若未勾选则自动勾选并加入队列（点击行即选中点位），超限时回滚
+    const input = li.querySelector('.chk input');
+    if (input && !input.checked) {
+      input.checked = true;
+      if (!toggleQueueChannel(channelId, name, isOnline, true)) {
+        input.checked = false;
+      }
+    }
+    // 将其置为主区当前选中格子（若已播放）
+    for (let i = 0; i < MAX_CELLS; i++) {
+      if (cellChannels[i] && cellChannels[i].channelId === channelId) {
+        focusCell(i);
+        break;
+      }
+    }
+  }
+
+  function updateGridPlaceholders() {
+    for (let i = 0; i < MAX_CELLS; i++) {
+      const cell = getCell(i);
+      if (!cell) continue;
+      const ch = playbackQueue[i];
+      const cc = cellChannels[i];
+      const ph = cell.querySelector('.placeholder');
+      if (!cc) {
+        if (ph && !ph.dataset.warn) {
+          ph.querySelector('.ph-text').textContent = ch ? '等待查询回放' : '点击选择点位';
+        }
+      }
+    }
+  }
+
+  // ==================== 视频网格 ====================
+  function getCell(idx) {
+    return document.querySelector('.video-cell[data-index="' + idx + '"]');
+  }
+
+  function initGrid() {
+    const grid = document.getElementById('videoGrid');
+    let html = '';
+    for (let i = 0; i < MAX_CELLS; i++) {
+      html += '<div class="video-cell' + (i < currentLayout ? ' visible' : '') + '" data-index="' + i +
+        '" onclick="focusCell(' + i + ')" ondblclick="fullscreenCellAt(' + i + ')">' +
+        '<div class="placeholder"><div class="plus">+</div><div class="ph-text">点击选择点位</div></div>' +
+        '<div class="cell-loading"><div class="spinner"></div><span class="loading-text">正在加载录像...</span></div>' +
+        '<div class="cell-info"><span class="cell-name"></span><span class="cell-tags">' +
+        '<span class="tag live"><span class="dot"></span>回放</span>' +
+        '<span class="tag hd">HD</span></span></div>' +
+        '</div>';
+    }
+    grid.innerHTML = html;
+  }
+
+  function setLayout(n) {
+    currentLayout = n;
+    const grid = document.getElementById('videoGrid');
+    grid.className = 'video-grid layout-' + n;
+    for (let i = 0; i < MAX_CELLS; i++) {
+      const cell = getCell(i);
+      if (!cell) continue;
+      cell.classList.toggle('visible', i < n);
+
+      // ★ 布局缩小时隐藏格子的视频暂停（避免不可见时继续取流/转码浪费带宽）
+      const video = cell.querySelector('video');
+      if (!video) continue;
+      if (i < n) {
+        // 重新可见：恢复此前被布局隐藏而暂停的视频
+        if (video.dataset.layoutPaused === '1') {
+          delete video.dataset.layoutPaused;
+          video.play().catch(() => {});
+        }
+      } else {
+        if (!video.paused) {
+          video.dataset.layoutPaused = '1';
+          video.pause();
+        }
+      }
+    }
+    // 更新顶部图标与底部数字按钮选中态
+    document.querySelectorAll('.layout-ico, .layout-num').forEach(b => {
+      b.classList.toggle('active', parseInt(b.dataset.layout) === n);
+    });
+    // 选中格子超出布局范围时收敛
+    if (selectedCell >= n) focusCell(0);
+  }
+
+  function focusCell(idx) {
+    selectedCell = idx;
+    document.querySelectorAll('.video-cell').forEach(c => c.classList.remove('selected'));
+    const cell = getCell(idx);
+    if (cell) cell.classList.add('selected');
+    syncPlayhead();
+    syncPlayBtn();
+  }
+
+  function showCellPlaceholder(cell) {
+    const ph = cell.querySelector('.placeholder');
+    if (ph) {
+      ph.style.display = '';
+      ph.dataset.warn = '';
+      ph.querySelector('.ph-text').textContent = '点击选择点位';
+    }
+    const info = cell.querySelector('.cell-info');
+    if (info) info.style.display = 'none';
+  }
+
+  function showCellWarn(idx, msg) {
+    const cell = getCell(idx);
+    if (!cell) return;
+    const ph = cell.querySelector('.placeholder');
+    if (ph) {
+      ph.style.display = '';
+      ph.dataset.warn = '1';
+      ph.innerHTML = '<div class="ph-warn">⚠ ' + msg + '</div>' +
+        '<div class="ph-text" style="color:#8a93b5;cursor:pointer" onclick="retryCell(' + idx + ')">点击重试</div>';
+    }
+    const info = cell.querySelector('.cell-info');
+    if (info) info.style.display = 'none';
+  }
+
+  function setCellLoading(idx, show, text) {
+    const cell = getCell(idx);
+    if (!cell) return;
+    const loading = cell.querySelector('.cell-loading');
+    if (loading) {
+      loading.classList.toggle('show', show);
+      if (text) loading.querySelector('.loading-text').textContent = text;
+    }
+  }
+
+  function retryCell(idx) {
+    const ch = playbackQueue[idx];
+    const cc = cellChannels[idx];
+    if (!ch || !cc) return;
+    loadPlaybackForCell(idx, ch, cc.beginTime, cc.endTime);
+  }
+
+  // ==================== 查询回放 ====================
+  async function queryPlayback() {
+    const begin = parseTime(document.getElementById('beginInput').value);
+    const end = parseTime(document.getElementById('endInput').value);
+    if (!begin || !end) {
+      toast('请输入正确的回放时间');
+      return;
+    }
+    if (end <= begin) {
+      toast('结束时间必须晚于开始时间');
+      return;
+    }
+    queryRange = { begin: begin, end: end };
+
+    if (playbackQueue.length === 0) {
+      toast('请先在左侧勾选点位');
+      return;
+    }
+
+    // 重建勾选队列与格子的对应关系（按勾选顺序填充格子）
+    const oldMap = cellChannels;
+    playbackQueue.forEach((ch, i) => {
+      if (i >= MAX_CELLS) return;
+      const old = oldMap[i];
+      if (old && old.channelId === ch.channelId) {
+        // 同格子同通道：直接按新时间重新加载
+        loadPlaybackForCell(i, ch, begin, end);
+      } else {
+        if (old) {
+          destroyCellPlayer(i);
+          delete cellChannels[i];
+        }
+        loadPlaybackForCell(i, ch, begin, end);
+      }
+    });
+
+    // 超出队列长度的格子清空
+    for (let i = playbackQueue.length; i < MAX_CELLS; i++) {
+      const cc = cellChannels[i];
+      if (cc) {
+        destroyCellPlayer(i);
+        delete cellChannels[i];
+        const cell = getCell(i);
+        if (cell) showCellPlaceholder(cell);
+      }
+    }
+
+    timelineSegs = [];
+    renderTimeline();
+    focusCell(Math.min(selectedCell, playbackQueue.length - 1));
+  }
+
+  /**
+   * 为指定格子加载回放：查录像段 → 申请HLS回放流 → 播放
+   */
+  async function loadPlaybackForCell(cellIdx, ch, begin, end) {
+    const cell = getCell(cellIdx);
+    if (!cell) return;
+
+    // 清理旧播放器（重复查询回放时避免旧实例泄漏）
+    destroyCellPlayer(cellIdx);
+
+    // streamStart：实际回放流的起点（录像段起点，可能晚于查询范围begin）
+    cellChannels[cellIdx] = { channelId: ch.channelId, name: ch.name, beginTime: begin, endTime: end, streamStart: begin };
+    cell.querySelector('.cell-name').textContent = ch.name;
+    cell.querySelector('.cell-info').style.display = 'flex';
+
+    const ph = cell.querySelector('.placeholder');
+    if (ph) ph.style.display = 'none';
+    setCellLoading(cellIdx, true, '正在查询录像...');
+
+    try {
+      // 1. 查询录像段（按文件分段，不能跨文件）
+      const qResp = await fetchJson(API_BASE + '/record/query?channelId=' + encodeURIComponent(ch.channelId) +
+        '&startTime=' + begin + '&endTime=' + end);
+      if (qResp.success !== true) {
+        throw new Error(qResp.desc || '录像查询失败');
+      }
+      const segs = qResp.data || [];
+      if (!Array.isArray(segs) || segs.length === 0) {
+        setCellLoading(cellIdx, false);
+        showCellWarn(cellIdx, '该时间段无录像');
+        return;
+      }
+
+      // 2. 选取与查询范围相交的录像段（优先完全包含开始时间的段）
+      const seg = pickSegment(segs, begin, end);
+      if (!seg) {
+        setCellLoading(cellIdx, false);
+        showCellWarn(cellIdx, '该时间段无可用录像');
+        return;
+      }
+      const segStart = Math.max(parseInt(seg.startTime) || begin, begin);
+      const segEnd = Math.min(parseInt(seg.endTime) || end, end);
+
+      // 3. 申请HLS回放流（recordType与录像段类型保持一致：6定时录像→1普通录像）
+      const rt = normalizeRecordType(seg);
+      const rs = seg.recordSource || '3';
+      setCellLoading(cellIdx, true, '正在获取回放流...');
+      const sResp = await fetchJson(API_BASE + '/record/stream?channelId=' + encodeURIComponent(ch.channelId) +
+        '&beginTime=' + segStart + '&endTime=' + segEnd +
+        '&streamType=1&recordType=' + rt + '&recordSource=' + rs);
+      if (sResp.success !== true || !sResp.data || !sResp.data.url) {
+        throw new Error(sResp.desc || '获取回放流失败');
+      }
+
+      // 4. 播放（记录实际流起点，供时间轴指针换算）
+      cellChannels[cellIdx].streamStart = segStart;
+      setCellLoading(cellIdx, false);
+      playHls(cellIdx, sResp.data.url);
+
+      // 5. 时间轴录像段
+      timelineSegs.push({ channelId: ch.channelId, name: ch.name, start: segStart, end: segEnd });
+      renderTimeline();
+    } catch (err) {
+      console.error('加载录像失败:', err);
+      setCellLoading(cellIdx, false);
+      showCellWarn(cellIdx, err.message || '加载录像失败');
+    }
+  }
+
+  function pickSegment(segs, begin, end) {
+    let best = null;
+    for (const s of segs) {
+      const st = parseInt(s.startTime) || 0;
+      const en = parseInt(s.endTime) || 0;
+      if (st <= begin && en >= begin) return s;   // 完全包含开始时间
+      if (st < end && en > begin) {               // 有重叠，取最长的
+        if (!best || (en - st) > ((parseInt(best.endTime) || 0) - (parseInt(best.startTime) || 0))) {
+          best = s;
+        }
+      }
+    }
+    return best;
+  }
+
+  function normalizeRecordType(seg) {
+    // videoRecordType优先（中心录像专用类型字段）
+    if (seg.videoRecordType) return String(seg.videoRecordType);
+    const rt = String(seg.recordType || '1');
+    if (rt === '6') return '1';   // 定时录像 → 普通录像
+    if (rt === '2') return '2';   // 报警录像
+    return '1';
+  }
+
+  // ==================== HLS播放 ====================
+  function playHls(cellIdx, url) {
+    const cell = getCell(cellIdx);
+    if (!cell) return;
+
+    // 移除旧错误提示
+    const ph = cell.querySelector('.placeholder');
+    if (ph) ph.style.display = 'none';
+
+    let video = cell.querySelector('video');
+    if (!video) {
+      video = document.createElement('video');
+      video.muted = true;
+      video.autoplay = true;
+      video.playsInline = true;
+      video.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block';
+      cell.appendChild(video);
+      // ★ 动态查找所在格子（格子内容可能因取消勾选前移），不闭包捕获cellIdx
+      video.addEventListener('timeupdate', (e) => {
+        const parentCell = e.target.closest ? e.target.closest('.video-cell') : null;
+        if (parentCell && parseInt(parentCell.dataset.index) === selectedCell) syncPlayhead();
+      });
+    }
+    video.playbackRate = currentSpeed;
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: false,
+        lowLatencyMode: false,
+        backBufferLength: 90,
+        maxBufferLength: 60,
+        maxMaxBufferLength: 600,
+        fragLoadingTimeOut: 20000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 1000,
+        nudgeMaxRetry: 12,
+        nudgeOffset: 0.5
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.playbackRate = currentSpeed;
+        video.play().catch(() => {});
+      });
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.error('HLS回放错误:', data.type, data.details, data.fatal);
+        if (data.fatal) {
+          // 动态定位当前所在格子（格子内容可能因取消勾选前移）
+          const curCell = hls.media && hls.media.closest ? hls.media.closest('.video-cell') : null;
+          const curIdx = curCell ? parseInt(curCell.dataset.index) : cellIdx;
+          showCellWarn(curIdx, '回放流播放失败: ' + data.details);
+          hls.destroy();
+          delete hlsPlayers[curIdx];
+        }
+      });
+      hlsPlayers[cellIdx] = hls;
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.addEventListener('loadedmetadata', () => { video.play().catch(() => {}); });
+    } else {
+      showCellWarn(cellIdx, '浏览器不支持HLS播放，请使用Chrome/Firefox/Edge');
+    }
+  }
+
+  function destroyCellPlayer(cellIdx) {
+    const hls = hlsPlayers[cellIdx];
+    if (hls) {
+      hls.destroy();
+      delete hlsPlayers[cellIdx];
+    }
+    const cell = getCell(cellIdx);
+    if (cell) {
+      const video = cell.querySelector('video');
+      if (video) {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        video.remove();
+      }
+      const loading = cell.querySelector('.cell-loading');
+      if (loading) loading.classList.remove('show');
+    }
+  }
+
+  function getSelectedVideo() {
+    const cell = getCell(selectedCell);
+    return cell ? cell.querySelector('video') : null;
+  }
+
+  // ==================== 播放控制 ====================
+  /** 根据选中格子的视频状态同步播放/暂停按钮图标 */
+  function syncPlayBtn() {
+    const video = getSelectedVideo();
+    document.getElementById('playBtn').textContent = (video && !video.paused) ? '⏸' : '▶';
+  }
+
+  function togglePlay() {
+    const video = getSelectedVideo();
+    if (!video) {
+      toast('请先查询回放');
+      return;
+    }
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+    syncPlayBtn();
+  }
+
+  function stopPlayback() {
+    for (let i = 0; i < MAX_CELLS; i++) {
+      if (cellChannels[i]) {
+        destroyCellPlayer(i);
+        delete cellChannels[i];
+        const cell = getCell(i);
+        if (cell) showCellPlaceholder(cell);
+      }
+    }
+    timelineSegs = [];
+    renderTimeline();
+    updateGridPlaceholders();
+    syncPlayBtn();
+  }
+
+  function seek(delta) {
+    const video = getSelectedVideo();
+    if (!video) {
+      toast('请先查询回放');
+      return;
+    }
+    video.currentTime = Math.max(0, video.currentTime + delta);
+    syncPlayhead();
+  }
+
+  function setSpeed(n) {
+    currentSpeed = n;
+    document.getElementById('speedText').textContent = n + 'x';
+    document.querySelectorAll('#speedMenu .item').forEach(item => {
+      item.classList.toggle('active', parseFloat(item.textContent) === n);
+    });
+    const video = getSelectedVideo();
+    if (video) video.playbackRate = n;
+    closeSpeedMenu();
+  }
+
+  function toggleSpeedMenu(e) {
+    if (e) e.stopPropagation();
+    document.getElementById('speedMenu').classList.toggle('show');
+  }
+  function closeSpeedMenu() {
+    document.getElementById('speedMenu').classList.remove('show');
+  }
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.speed-box')) closeSpeedMenu();
+  });
+
+  // ==================== 截图/下载/全屏 ====================
+  function captureSnapshot() {
+    const video = getSelectedVideo();
+    if (!video || video.readyState < 2) {
+      toast('当前无正在播放的视频');
+      return;
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+      const a = document.createElement('a');
+      const cc = cellChannels[selectedCell];
+      // 文件名时间戳 = 实际回放流起点 + 播放进度
+      const shotTs = (cc ? (cc.streamStart || cc.beginTime) : queryRange.begin) + Math.floor(video.currentTime);
+      a.download = '截图_' + (cc ? cc.name.replace(/[\\/:*?"<>|]/g, '_') : 'video') +
+        '_' + fmtTime(shotTs).replace(/[: ]/g, '') + '.png';
+      a.href = canvas.toDataURL('image/png');
+      a.click();
+    } catch (err) {
+      console.error('截图失败:', err);
+      toast('截图失败：' + err.message);
+    }
+  }
+
+  function downloadRecord() {
+    toast('录像下载需部署ICC下载服务包，暂未开通');
+  }
+
+  function fullscreenSelectedCell() {
+    fullscreenCellAt(selectedCell);
+  }
+
+  function fullscreenCellAt(idx) {
+    const cell = getCell(idx);
+    if (!cell || !cellChannels[idx]) {
+      toast('该格子暂无回放视频');
+      return;
+    }
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else if (cell.requestFullscreen) {
+      cell.requestFullscreen().catch(() => {});
+    }
+  }
+
+  function togglePageFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else if (document.documentElement.requestFullscreen) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+  }
+
+  // ==================== 时间轴 ====================
+  function renderTimeline() {
+    const ruler = document.getElementById('timelineRuler');
+    const playhead = document.getElementById('playhead');
+    const begin = queryRange.begin;
+    const end = queryRange.end;
+
+    if (!begin || !end) {
+      ruler.innerHTML = '';
+      playhead.classList.remove('show');
+      return;
+    }
+
+    const rangeSec = end - begin;
+    // 自适应刻度步长：<1h→10分钟，<6h→30分钟，<24h→1小时，否则6小时
+    let stepSec;
+    if (rangeSec <= 3600) stepSec = 600;
+    else if (rangeSec <= 21600) stepSec = 1800;
+    else if (rangeSec <= 86400) stepSec = 3600;
+    else stepSec = 21600;
+
+    let html = '';
+    // 录像段蓝色条
+    timelineSegs.forEach(seg => {
+      const leftPct = Math.max(0, (seg.start - begin) / rangeSec * 100);
+      const widthPct = Math.min(100 - leftPct, Math.max(0, (seg.end - seg.start) / rangeSec * 100));
+      if (widthPct > 0.1) {
+        html += '<div class="ruler-seg" style="left:' + leftPct + '%;width:' + widthPct + '%" title="' +
+          seg.name + ' ' + fmtTime(seg.start) + ' ~ ' + fmtTime(seg.end) + '"></div>';
+      }
+    });
+    // 刻度线
+    const firstTick = Math.floor(begin / stepSec) * stepSec;
+    for (let t = firstTick; t <= end; t += stepSec) {
+      if (t < begin) continue;
+      const leftPct = (t - begin) / rangeSec * 100;
+      const major = (t % 3600 === 0);
+      html += '<div class="tick' + (major ? ' major' : '') + '" style="left:' + leftPct + '%"></div>' +
+        '<div class="tick-label" style="left:' + leftPct + '%">' + fmtTickLabel(t, stepSec) + '</div>';
+    }
+    ruler.innerHTML = html;
+
+    // 指针显示状态与初始位置（左/右 8px 对应ruler内边距，left用百分比）
+    const anyCell = cellChannels[selectedCell];
+    playhead.classList.toggle('show', !!anyCell);
+    syncPlayhead();
+  }
+
+  function fmtTickLabel(ts, stepSec) {
+    const d = new Date(ts * 1000);
+    const hm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    if (stepSec >= 3600) {
+      // 长跨度：显示日期+时分（每天首刻度）或时分
+      if (d.getHours() === 0 && d.getMinutes() === 0) {
+        return (d.getMonth() + 1) + '-' + pad(d.getDate());
+      }
+      return hm;
+    }
+    return hm;
+  }
+
+  function syncPlayhead() {
+    const playhead = document.getElementById('playhead');
+    const tip = document.getElementById('playheadTip');
+    const begin = queryRange.begin;
+    const end = queryRange.end;
+    if (!begin || !end) return;
+
+    const cc = cellChannels[selectedCell];
+    const video = getSelectedVideo();
+    if (!cc) {
+      playhead.classList.remove('show');
+      return;
+    }
+    playhead.classList.add('show');
+
+    let leftPct;
+    const streamStart = cc.streamStart || cc.beginTime;
+    if (video && !isNaN(video.currentTime) && video.readyState >= 1) {
+      // 当前播放位置 = 实际回放流起点 + 播放进度
+      const curTs = streamStart + video.currentTime;
+      leftPct = (curTs - begin) / (end - begin) * 100;
+      tip.textContent = fmtTime(Math.floor(curTs));
+    } else {
+      leftPct = (streamStart - begin) / (end - begin) * 100;
+      tip.textContent = fmtTime(streamStart);
+    }
+    if (leftPct < 0) leftPct = 0;
+    if (leftPct > 100) leftPct = 100;
+    // playhead 容器 left/right 均为 8px，left 百分比即 ruler 内坐标
+    playhead.style.left = leftPct + '%';
+  }
+
+  // ==================== 搜索过滤 ====================
+  function filterTree(keyword) {
+    keyword = (keyword || '').trim().toLowerCase();
+    document.querySelectorAll('.tree-node').forEach(node => {
+      const name = (node.dataset.name || '').toLowerCase();
+      const isLeaf = node.classList.contains('leaf');
+      const match = !keyword || name.includes(keyword);
+      if (isLeaf) {
+        node.style.display = match ? '' : 'none';
+        // 有匹配时展开其所有父级
+        if (match && keyword) {
+          let p = node.parentElement;
+          while (p && p.classList && !p.classList.contains('tree')) {
+            if (p.classList.contains('tree-node')) {
+              p.style.display = '';
+              p.classList.add('expanded');
+              const kids = p.querySelector(':scope > .children');
+              if (kids) kids.classList.remove('collapsed');
+            }
+            p = p.parentElement;
+          }
+        }
+      } else {
+        // 非叶子：始终显示（由叶子决定可见性），清空关键字时恢复
+        node.style.display = '';
+      }
+    });
+  }
+
+  // ==================== 启动 ====================
+  initTimeRange();
+  initGrid();
+  loadDeviceTree();
+  </script>
+</body>
+</html>
