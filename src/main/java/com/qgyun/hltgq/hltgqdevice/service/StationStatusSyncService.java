@@ -7,9 +7,11 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -31,6 +33,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       仅在整轮遍历无任何失败节点时执行，防止某子树查询失败被误判为通道消失。</li>
  * </ul>
  * ID生成、系统字段（corp_code/created_at等）与hltgq-mq站点写入规则一致。
+ * <p>同时联动视频设备表 {@code t_auto_hltgq_water_device}（{@link DeviceTableService}）：
+ * 每个视频站点对应 1 台设备（type=#5# 视频），新增站点自动创建设备，
+ * 设备运行状态随通道在线/离线同步，站点消失时联动设备标离线。
+ * <p>应用启动时立即异步同步一次（不等整点），与整点定时任务共用互斥锁，
+ * 同一时刻只允许一轮执行（防启动轮与整点轮并发导致重复建站/建设备）。
  *
  * @author hltgq-device
  */
@@ -61,16 +68,46 @@ public class StationStatusSyncService {
     private DahuaDeviceService deviceService;
 
     @Resource
+    private DeviceTableService deviceTableService;
+
+    @Resource
     private JdbcTemplate jdbcTemplate;
 
     @Value("${app.corp-code:hltgq}")
     private String corpCode;
 
+    /** 同步互斥：同一时刻只允许一轮执行（启动轮与整点定时轮共用） */
+    private final AtomicBoolean syncRunning = new AtomicBoolean(false);
+
     /**
-     * 每小时整点同步一次视频站点状态（服务器时间，如1:00、2:00）
+     * 启动时立即同步一次站点与视频设备（异步执行，不阻塞启动）：
+     * 部署后无需等整点即可完成站点入库/状态对齐与设备联动（数据库/ICC 不可达时内部容错跳过）。
+     * 依赖注入保证 DeviceTableService 已完成列元数据加载与历史迁移（依赖 bean 初始化先于本 bean）。
+     */
+    @PostConstruct
+    public void init() {
+        Thread startupSync = new Thread(() -> {
+            try {
+                syncVideoStationStatus();
+            } catch (Exception e) {
+                // syncVideoStationStatus 内部已捕获，此处兜底防线程静默死亡
+                log.error("[站点同步] 启动同步线程异常：", e);
+            }
+        }, "station-startup-sync");
+        startupSync.setDaemon(true);
+        startupSync.start();
+    }
+
+    /**
+     * 每小时整点同步一次视频站点状态（服务器时间，如1:00、2:00）；应用启动时由 init() 异步触发首轮。
+     * 上一轮未结束时本轮直接跳过（互斥，防并发重复建站/建设备）。
      */
     @Scheduled(cron = "0 0 * * * ?")
     public void syncVideoStationStatus() {
+        if (!syncRunning.compareAndSet(false, true)) {
+            log.info("[站点同步] 上一轮同步尚未结束，跳过本轮");
+            return;
+        }
         long start = System.currentTimeMillis();
         try {
             // 1. 递归遍历ICC设备树，收集全部视频通道
@@ -99,15 +136,26 @@ public class StationStatusSyncService {
                 // 用containsKey区分"站点不存在(新增)"与"存在但zebpsu为NULL(更新)"，
                 // 否则NULL状态站点会被误判为新增导致重复插入
                 boolean exists = existingStatus.containsKey(ch.devicecode);
+                String siteId;
+                String stationName;
                 if (!exists) {
                     // 新站点名称与站点表已有站点重名时追加"-视频"后缀（如"夏家湖渡槽-视频"），
                     // existing.names 由 uniqueStationName 登记本轮已用名称，防同轮多个同名新站点撞名
-                    String stationName = uniqueStationName(ch.name, existing.names);
-                    if (insertStation(ch, stationName, target)) inserted++;
-                } else if (!target.equals(existingStatus.get(ch.devicecode))) {
-                    if (updateStationStatus(ch.devicecode, target)) updated++;
+                    stationName = uniqueStationName(ch.name, existing.names);
+                    siteId = insertStation(ch, stationName, target);
+                    if (siteId != null) inserted++;
                 } else {
-                    unchanged++;
+                    siteId = existing.codeToId.get(ch.devicecode);
+                    stationName = existing.codeToName.get(ch.devicecode);
+                    if (!target.equals(existingStatus.get(ch.devicecode))) {
+                        if (updateStationStatus(ch.devicecode, target)) updated++;
+                    } else {
+                        unchanged++;
+                    }
+                }
+                // 视频设备联动：站点新增/已有均同步设备（查/建 + 在线状态同步）
+                if (siteId != null && stationName != null) {
+                    syncDevice(ch, siteId, stationName, target);
                 }
             }
 
@@ -124,7 +172,25 @@ public class StationStatusSyncService {
             }
         } catch (Exception e) {
             log.error("[站点同步] 视频站点状态同步失败：", e);
+        } finally {
+            syncRunning.set(false);
         }
+    }
+
+    /**
+     * 收集ICC设备树全部视频通道（视频告警轮巡检测复用，与站点同步共用同一遍历逻辑）。
+     *
+     * @return 通道列表；遍历存在失败节点时返回null（数据不完整，调用方自行决定本轮是否可用）
+     */
+    public List<VideoChannel> collectVideoChannels() {
+        List<VideoChannel> channels = new ArrayList<>();
+        AtomicBoolean traversalFailed = new AtomicBoolean(false);
+        collectChannels("001", null, channels, 0, traversalFailed);
+        if (traversalFailed.get()) {
+            log.warn("[视频告警] ICC设备树遍历存在失败节点，通道数据不完整，返回null");
+            return null;
+        }
+        return channels;
     }
 
     /**
@@ -182,7 +248,7 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 加载站点表现有数据：devicecode → zebpsu 状态映射 + 全部站点名称集合
+     * 加载站点表现有数据：devicecode → (id + zebpsu 状态 + zzkaec 名称) + 全部站点名称集合
      *
      * @return 站点数据快照；数据库不可达时返回null
      */
@@ -190,13 +256,21 @@ public class StationStatusSyncService {
         ExistingStations snapshot = new ExistingStations();
         try {
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(
-                    "SELECT devicecode, zebpsu, zzkaec FROM " + STATION_TABLE);
+                    "SELECT id, devicecode, zebpsu, zzkaec FROM " + STATION_TABLE);
             for (Map<String, Object> row : rows) {
                 Object code = row.get("devicecode");
                 Object status = row.get("zebpsu");
                 Object name = row.get("zzkaec");
+                Object id = row.get("id");
                 if (code != null && !String.valueOf(code).trim().isEmpty()) {
-                    snapshot.status.put(String.valueOf(code).trim(), status == null ? null : String.valueOf(status));
+                    String key = String.valueOf(code).trim();
+                    snapshot.status.put(key, status == null ? null : String.valueOf(status));
+                    if (id != null && !String.valueOf(id).trim().isEmpty()) {
+                        snapshot.codeToId.put(key, String.valueOf(id).trim());
+                    }
+                    if (name != null && !String.valueOf(name).trim().isEmpty()) {
+                        snapshot.codeToName.put(key, String.valueOf(name).trim());
+                    }
                 }
                 if (name != null && !String.valueOf(name).trim().isEmpty()) {
                     snapshot.names.add(String.valueOf(name).trim());
@@ -215,6 +289,10 @@ public class StationStatusSyncService {
     private static class ExistingStations {
         /** devicecode → zebpsu（zebpsu可能为NULL） */
         final Map<String, String> status = new HashMap<>();
+        /** devicecode → 站点ID（视频设备联动用） */
+        final Map<String, String> codeToId = new HashMap<>();
+        /** devicecode → zzkaec 站点名（视频设备联动用） */
+        final Map<String, String> codeToName = new HashMap<>();
         /** 全部站点名称（zzkaec），新增视频站点重名时追加"-视频"后缀 */
         final Set<String> names = new HashSet<>();
     }
@@ -258,9 +336,12 @@ public class StationStatusSyncService {
      * <p>
      * 必填：id、devicecode、zebpsu、zzkaec（站点名称，可能带"-视频"后缀）、mivbcz（站点位置，取所属组织名称）、
      * epjutj（默认#5#视频站点）；坐标bviiio_x/bviiio_y暂无来源留空；系统字段与hltgq-mq一致。
+     *
+     * @return 成功返回新站点ID（供视频设备联动），失败返回null
      */
-    private boolean insertStation(VideoChannel ch, String name, String status) {
+    private String insertStation(VideoChannel ch, String name, String status) {
         try {
+            String stationId = IdGenerator.generate();
             Timestamp now = new Timestamp(System.currentTimeMillis());
             String location = ch.orgName != null && !ch.orgName.trim().isEmpty()
                     ? ch.orgName.trim() : DEFAULT_LOCATION;
@@ -268,15 +349,33 @@ public class StationStatusSyncService {
                     " (id, corp_code, created_at, created_by, updated_at, updated_by, " +
                     "  devicecode, zebpsu, zzkaec, mivbcz, epjutj) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-            jdbcTemplate.update(sql, IdGenerator.generate(), corpCode, now, "SYSTEM", now, "SYSTEM",
+            jdbcTemplate.update(sql, stationId, corpCode, now, "SYSTEM", now, "SYSTEM",
                     ch.devicecode, status, name, location, VIDEO_TYPE);
             log.info("[站点同步] 新增视频站点: devicecode={}, 名称={}, 位置={}, 状态={}",
                     ch.devicecode, name, location, status);
-            return true;
+            return stationId;
         } catch (Exception e) {
             log.error("[站点同步] 新增视频站点失败: devicecode={}", ch.devicecode, e);
-            return false;
+            return null;
         }
+    }
+
+    /**
+     * 视频设备联动：每个视频站点对应 1 台设备（type=#5# 视频），查不到自动创建
+     * （防站点同步与设备入库脱节），设备运行状态随通道在线/离线同步。
+     */
+    private void syncDevice(VideoChannel ch, String siteId, String stationName, String status) {
+        String deviceName = deviceTableService.deviceNameOf(stationName);
+        // 安装位置：所属组织-站点名（如"库上防汛办-渠首电站上游"），org 缺失时仅站点名
+        String location = DeviceTableService.buildLocation(ch.orgName, stationName);
+        String deviceId = deviceTableService.lookupOrCreateDevice(deviceName, siteId,
+                DeviceTableService.DEVICE_TYPE_VIDEO, ch.devicecode, status, location);
+        if (deviceId == null) {
+            log.warn("[站点同步] 视频设备创建失败, devicecode={}, 设备名={}", ch.devicecode, deviceName);
+            return;
+        }
+        // 状态变化才更新（SQL 内 status IS DISTINCT FROM 条件，无变化不写库）
+        deviceTableService.updateDeviceStatus(deviceName, status);
     }
 
     /**
@@ -311,47 +410,81 @@ public class StationStatusSyncService {
     private int markMissingStationsOffline(Set<String> seenCodes) {
         int total = 0;
         Timestamp now = new Timestamp(System.currentTimeMillis());
+        // 本轮将标注离线的站点ID（供视频设备表联动标离线）
+        List<String> offlineSiteIds = new ArrayList<>();
         try {
             // 公共条件：视频类型站点、有devicecode、当前状态非离线
             String baseWhere = " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> ''" +
                     " AND zebpsu IS DISTINCT FROM ?";
             if (seenCodes.isEmpty()) {
                 // ICC已无任何视频通道（遍历成功但结果为空）：全部视频站点标离线
+                offlineSiteIds.addAll(queryOfflineStationIds(baseWhere, Collections.emptyList()));
                 String sql = "UPDATE " + STATION_TABLE + " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'"
                         + baseWhere;
                 int rows = jdbcTemplate.update(sql, STATUS_OFFLINE, now, STATUS_OFFLINE);
                 if (rows > 0) {
                     log.info("[站点同步] ICC无视频通道，全部视频站点标注离线: {} 个", rows);
                 }
-                return rows;
-            }
-            // 分批NOT IN（每批500个），超出部分分多轮UPDATE
-            List<String> codeList = new ArrayList<>(seenCodes);
-            for (int i = 0; i < codeList.size(); i += 500) {
-                List<String> chunk = codeList.subList(i, Math.min(i + 500, codeList.size()));
-                StringBuilder sql = new StringBuilder("UPDATE " + STATION_TABLE +
-                        " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'");
-                sql.append(baseWhere);
-                sql.append(" AND devicecode NOT IN (");
-                for (int j = 0; j < chunk.size(); j++) {
-                    sql.append(j == 0 ? "?" : ", ?");
+                total = rows;
+            } else {
+                // 分批NOT IN（每批500个），超出部分分多轮UPDATE
+                List<String> codeList = new ArrayList<>(seenCodes);
+                for (int i = 0; i < codeList.size(); i += 500) {
+                    List<String> chunk = codeList.subList(i, Math.min(i + 500, codeList.size()));
+                    offlineSiteIds.addAll(queryOfflineStationIds(baseWhere, chunk));
+                    StringBuilder sql = new StringBuilder("UPDATE " + STATION_TABLE +
+                            " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'");
+                    sql.append(baseWhere);
+                    sql.append(" AND devicecode NOT IN (");
+                    for (int j = 0; j < chunk.size(); j++) {
+                        sql.append(j == 0 ? "?" : ", ?");
+                    }
+                    sql.append(")");
+                    List<Object> params = new ArrayList<>();
+                    params.add(STATUS_OFFLINE);
+                    params.add(now);
+                    params.add(STATUS_OFFLINE);
+                    params.addAll(chunk);
+                    int rows = jdbcTemplate.update(sql.toString(), params.toArray());
+                    if (rows > 0) {
+                        log.info("[站点同步] ICC中已消失的视频站点标注离线: {} 个", rows);
+                    }
+                    total += rows;
                 }
-                sql.append(")");
-                List<Object> params = new ArrayList<>();
-                params.add(STATUS_OFFLINE);
-                params.add(now);
-                params.add(STATUS_OFFLINE);
-                params.addAll(chunk);
-                int rows = jdbcTemplate.update(sql.toString(), params.toArray());
-                if (rows > 0) {
-                    log.info("[站点同步] ICC中已消失的视频站点标注离线: {} 个", rows);
-                }
-                total += rows;
             }
         } catch (Exception e) {
             log.error("[站点同步] 消失站点离线标注失败：", e);
         }
+        // 联动视频设备表：消失站点对应的设备标注离线（#2#）
+        if (!offlineSiteIds.isEmpty()) {
+            int devices = deviceTableService.markOfflineBySiteIds(offlineSiteIds);
+            if (devices > 0) {
+                log.info("[站点同步] 消失站点联动视频设备标离线: {} 台", devices);
+            }
+        }
         return total;
+    }
+
+    /**
+     * 查询本轮将标注离线的视频站点ID（与站点UPDATE同条件），供设备表联动标离线
+     *
+     * @param baseWhere  公共WHERE（含 zebpsu IS DISTINCT FROM ? 占位）
+     * @param notInCodes devicecode 排除清单（空=不排除）
+     */
+    private List<String> queryOfflineStationIds(String baseWhere, List<String> notInCodes) {
+        StringBuilder sql = new StringBuilder("SELECT id FROM " + STATION_TABLE);
+        sql.append(baseWhere);
+        if (notInCodes != null && !notInCodes.isEmpty()) {
+            sql.append(" AND devicecode NOT IN (");
+            for (int j = 0; j < notInCodes.size(); j++) {
+                sql.append(j == 0 ? "?" : ", ?");
+            }
+            sql.append(")");
+        }
+        List<Object> params = new ArrayList<>();
+        params.add(STATUS_OFFLINE);
+        params.addAll(notInCodes);
+        return jdbcTemplate.queryForList(sql.toString(), String.class, params.toArray());
     }
 
     /**
@@ -376,23 +509,39 @@ public class StationStatusSyncService {
     }
 
     /**
-     * ICC设备树中的视频通道信息
+     * ICC设备树中的视频通道信息（站点同步与视频告警轮巡检测共用）
      */
-    private static class VideoChannel {
+    public static class VideoChannel {
         /** 设备编码（如1000231$1$0$10），匹配站点表devicecode */
-        final String devicecode;
+        private final String devicecode;
         /** 通道名称 → 站点名称zzkaec */
-        final String name;
+        private final String name;
         /** 归属组织名称 → 站点位置mivbcz */
-        final String orgName;
+        private final String orgName;
         /** 是否在线 → zebpsu */
-        final boolean online;
+        private final boolean online;
 
         VideoChannel(String devicecode, String name, String orgName, boolean online) {
             this.devicecode = devicecode;
             this.name = name;
             this.orgName = orgName;
             this.online = online;
+        }
+
+        public String getDevicecode() {
+            return devicecode;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public String getOrgName() {
+            return orgName;
+        }
+
+        public boolean isOnline() {
+            return online;
         }
     }
 }

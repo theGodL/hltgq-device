@@ -550,6 +550,35 @@ public class DahuaVideoService {
         }
     }
 
+    // ==================== 视频告警轮巡检测支持 ====================
+
+    /**
+     * 获取检测专用子码流原始地址（不构建代理URL，供 ffmpeg 抽帧直连）。
+     * <p>视频故障轮巡检测用：子码流带宽低、解码负担小，图像指标计算足够。
+     * 与 {@link #getStreamUrl} 播放链路互不影响（不写码流策略缓存）。
+     *
+     * @param channelId 通道ID
+     * @return NVR 原始子码流地址（含token），失败返回null
+     */
+    public String resolveInspectionStreamUrl(String channelId) {
+        return resolveRawStreamUrl(channelId, "2");
+    }
+
+    /**
+     * 探测流是否可取（M3U8 可拉取即视为可用）。
+     * <p>视频故障轮巡检测用：设备在线但取不到流 → "取流异常"故障候选。
+     * 复用 {@link #probeStream} 探测逻辑（M3U8拉取失败返回 UNAVAILABLE）。
+     *
+     * @param rawUrl NVR 原始流地址（含token）
+     * @return true-流可取，false-流不可取
+     */
+    public boolean isStreamAvailable(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) {
+            return false;
+        }
+        return probeStream(rawUrl) != ProbeResult.UNAVAILABLE;
+    }
+
     /**
      * 探测HLS流的编码格式及可用性。
      * <p>
