@@ -95,7 +95,10 @@ class DeviceTableServiceTest {
     /** 首次创建：INSERT 设备表，字段含 name/site/type=#5#/code/status/位置/启用日期/系统字段 */
     @Test
     void createDeviceFirstTime() {
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
 
@@ -128,10 +131,13 @@ class DeviceTableServiceTest {
         assertEquals(2, timestampCount, "仅 created_at/updated_at 两个系统时间戳");
     }
 
-    /** 缓存复用：同设备名第二次调用不再查库/写库 */
+    /** 缓存复用：同设备 code 第二次调用不再查库/写库（code 为唯一匹配键） */
     @Test
     void cachedReuseSkipsSecondLookup() {
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
 
@@ -139,8 +145,12 @@ class DeviceTableServiceTest {
         String id2 = service.lookupOrCreateDevice(DEVICE_NAME, SITE_ID, "#5#", DEVICECODE, "#1#", LOCATION);
 
         assertEquals(id1, id2);
+        // 首次调用：按 code 查（未命中）→ 按 name 查（未命中）→ 创建；第二次全走缓存
         verify(jdbcTemplate, times(1)).queryForList(
-                argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+                argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE));
+        verify(jdbcTemplate, times(1)).queryForList(
+                argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME));
         verify(jdbcTemplate, times(1)).update(anyString(), any(Object.class));
     }
@@ -151,7 +161,10 @@ class DeviceTableServiceTest {
         ReflectionTestUtils.setField(service, "deviceColumns", new HashSet<>(Arrays.asList(
                 "id", "corp_code", "created_at", "created_by", "updated_at", "updated_by",
                 "name", "site", "type", "status")));
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
 
@@ -165,24 +178,41 @@ class DeviceTableServiceTest {
         assertTrue(sql.contains("\"type\""));
     }
 
-    /** 状态更新：仅状态变化写库（SQL 含 status IS DISTINCT FROM 条件） */
+    /** 状态更新：按 code（通道devicecode）精确匹配，仅状态变化写库（SQL 含 status IS DISTINCT FROM 条件） */
     @Test
     void updateDeviceStatusOnlyUpdatesWhenChanged() {
         when(jdbcTemplate.update(contains("t_auto_hltgq_water_device"), any(), any(), any(), any()))
                 .thenReturn(1);
 
-        int rows = service.updateDeviceStatus(DEVICE_NAME, "#2#");
+        int rows = service.updateDeviceStatus(DEVICECODE, "#2#");
 
         assertEquals(1, rows);
         verify(jdbcTemplate).update(
                 argThat(s -> s.contains("status IS DISTINCT FROM")),
-                eq("#2#"), any(), eq(DEVICE_NAME), eq("#2#"));
+                eq("#2#"), any(), eq(DEVICECODE), eq("#2#"));
+    }
+
+    /** 安装位置更新：按 code 精确匹配，仅位置变化写库（SQL 含 wlcvig IS DISTINCT FROM 条件，值截去首尾空白） */
+    @Test
+    void updateDeviceLocationOnlyUpdatesWhenChanged() {
+        when(jdbcTemplate.update(contains("t_auto_hltgq_water_device"), any(), any(), any(), any()))
+                .thenReturn(1);
+
+        int rows = service.updateDeviceLocation(DEVICECODE, " " + LOCATION + " ");
+
+        assertEquals(1, rows);
+        verify(jdbcTemplate).update(
+                argThat(s -> s.contains("wlcvig IS DISTINCT FROM")),
+                eq(LOCATION), any(), eq(DEVICECODE), eq(LOCATION));
     }
 
     /** 创建失败：返回 null 且不缓存，下次调用重试成功 */
     @Test
     void createFailureReturnsNullAndRetriesNextCall() {
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
         // 覆盖 setUp 的 doAnswer：第一次 UPDATE 抛异常（模拟数据库不可达），第二次成功
@@ -245,8 +275,11 @@ class DeviceTableServiceTest {
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz, zebpsu",
                 "t_auto_hltgq_5nw74_vnqqef"))))
                 .thenReturn(Collections.singletonList(station));
-        // 设备查找：不存在 → 创建
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        // 设备查找：按 code 未命中 → 按 name 兜底未命中 → 创建
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
 
@@ -260,26 +293,26 @@ class DeviceTableServiceTest {
         String deviceId = String.valueOf(insertArgs[0]);
         assertNotNull(deviceId);
         assertTrue(Arrays.asList(insertArgs).contains(DEVICE_NAME));
-        // 安装位置：组织-站点名（迁移侧同源派生）
+        // 安装位置：与站点位置 mivbcz 同源直取（不拼接站点名）
         assertTrue(insertSql.contains("wlcvig"));
-        assertTrue(Arrays.asList(insertArgs).contains(LOCATION));
+        assertTrue(Arrays.asList(insertArgs).contains(ORG_NAME));
         // 创建即带站点状态（zebpsu 传入 createDevice）
         assertTrue(insertSql.contains("status"));
         assertTrue(Arrays.asList(insertArgs).contains("#1#"));
 
-        // 状态对齐 UPDATE：SET status = ?（变化才写库）
+        // 状态对齐 UPDATE：SET status = ?（变化才写库），按 code 精确匹配
         String statusSql = (String) ((Invocation) updateInvocations.get(1)).getRawArguments()[0];
         Object[] statusArgs = (Object[]) ((Invocation) updateInvocations.get(1)).getRawArguments()[1];
         assertTrue(statusSql.contains("SET status = ?"));
-        assertEquals(DEVICE_NAME, statusArgs[2]);
+        assertEquals(DEVICECODE, statusArgs[2]);
 
-        // 安装位置回填 UPDATE：SET wlcvig = ?（仅空值写入）
+        // 安装位置回填 UPDATE：SET wlcvig = ?（仅空值写入，值取站点 mivbcz），按 code 精确匹配
         String locSql = (String) ((Invocation) updateInvocations.get(2)).getRawArguments()[0];
         Object[] locArgs = (Object[]) ((Invocation) updateInvocations.get(2)).getRawArguments()[1];
         assertTrue(locSql.contains("SET wlcvig = ?"));
         assertTrue(locSql.contains("wlcvig IS NULL OR wlcvig = ''"));
-        assertEquals(LOCATION, locArgs[0]);
-        assertEquals(DEVICE_NAME, locArgs[2]);
+        assertEquals(ORG_NAME, locArgs[0]);
+        assertEquals(DEVICECODE, locArgs[2]);
 
         // 告警 UPDATE：参数序 (deviceId, now, siteId, siteId)，条件 site=站点ID AND device=站点ID（幂等）
         String alertSql = (String) ((Invocation) updateInvocations.get(3)).getRawArguments()[0];
@@ -316,7 +349,10 @@ class DeviceTableServiceTest {
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz, zebpsu",
                 "t_auto_hltgq_5nw74_vnqqef"))))
                 .thenReturn(Collections.singletonList(station));
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "t_auto_hltgq_water_device")),
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
                 eq(String.class), eq(DEVICE_NAME)))
                 .thenReturn(new ArrayList<>());
 
@@ -327,5 +363,43 @@ class DeviceTableServiceTest {
         String lastSql = (String) ((Invocation) updateInvocations.get(3)).getRawArguments()[0];
         assertTrue(lastSql.contains("t_auto_hltgq_water_alert"));
         assertFalse(lastSql.contains("work_order"));
+    }
+
+    /** code 命中已有设备：不再按 name 兜底查询/创建（防重名站点命中同名僵尸设备） */
+    @Test
+    void codeMatchSkipsNameFallbackAndCreation() {
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(Collections.singletonList("device-001"));
+
+        String id = service.lookupOrCreateDevice(DEVICE_NAME, SITE_ID, "#5#", DEVICECODE, "#1#", LOCATION);
+
+        assertEquals("device-001", id);
+        verify(jdbcTemplate, never()).queryForList(
+                argThat(sqlContains("SELECT id FROM", "WHERE name")), eq(String.class), any());
+        verify(jdbcTemplate, never()).update(anyString(), any(Object.class));
+    }
+
+    /** 历史设备 code 缺失：按 name 兜底命中后回填 code（按设备ID精确更新，防重名波及多行） */
+    @Test
+    void nameFallbackBackfillsMissingCode() {
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
+                eq(String.class), eq(DEVICE_NAME)))
+                .thenReturn(Collections.singletonList("device-001"));
+
+        String id = service.lookupOrCreateDevice(DEVICE_NAME, SITE_ID, "#5#", DEVICECODE, "#1#", LOCATION);
+
+        assertEquals("device-001", id);
+        // 回填 code：按 id 精确 UPDATE，仅 code 为空时写入
+        verify(jdbcTemplate).update(
+                argThat(s -> s.contains("SET code = ?")
+                        && s.contains("WHERE id = ?")
+                        && s.contains("(code IS NULL OR code = '')")),
+                any(), any(), any());
+        // 不创建新设备
+        verify(jdbcTemplate, never()).update(argThat(s -> s.contains("INSERT INTO")), any(), any(), any());
     }
 }

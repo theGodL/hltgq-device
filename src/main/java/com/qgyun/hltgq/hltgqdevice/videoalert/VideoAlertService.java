@@ -365,10 +365,10 @@ public class VideoAlertService {
     private String resolveOrCreateDevice(String devicecode, SiteInfo site) {
         try {
             String deviceName = deviceTableService.deviceNameOf(site.name);
-            // 安装位置：站点位置（组织名）-站点名，org 缺失时仅站点名
-            String location = DeviceTableService.buildLocation(site.location, site.name);
+            // 安装位置：站点位置 mivbcz（已是"管理所-通道名"完整位置），直接使用不再拼站点名
+            // （历史教训：再拼站点名会产出"集岭管理所-大门外-大门外-视频"重复；mivbcz为空时留空，宁缺毋滥）
             return deviceTableService.lookupOrCreateDevice(deviceName, site.id,
-                    DeviceTableService.DEVICE_TYPE_VIDEO, devicecode, null, location);
+                    DeviceTableService.DEVICE_TYPE_VIDEO, devicecode, null, site.location);
         } catch (Exception e) {
             log.warn("[视频告警] 设备解析失败, devicecode={}: {}", devicecode, e.getMessage());
             return null;

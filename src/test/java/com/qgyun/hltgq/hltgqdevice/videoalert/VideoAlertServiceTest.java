@@ -46,7 +46,6 @@ class VideoAlertServiceTest {
     private static final String CONTENT = SITE_NAME + "-视频 信号丢失！";
     private static final String TITLE = SITE_NAME + "-视频 信号丢失";
     private static final String ORG_NAME = "库上防汛办";
-    private static final String LOCATION = ORG_NAME + "-" + SITE_NAME;
 
     private JdbcTemplate jdbcTemplate;
     private WorkOrderService workOrderService;
@@ -65,14 +64,14 @@ class VideoAlertServiceTest {
         ReflectionTestUtils.setField(service, "workOrderService", workOrderService);
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
-        // 站点预置，避免测试重复模拟查询（mivbcz=站点位置/组织名，供设备安装位置派生）
+        // 站点预置，避免测试重复模拟查询（mivbcz=站点位置"管理所-通道名"完整值，供设备安装位置直取）
         Map<String, Object> row = new HashMap<>();
         row.put("id", SITE_ID);
         row.put("zzkaec", SITE_NAME);
         row.put("mivbcz", ORG_NAME);
         when(jdbcTemplate.queryForList(anyString(), eq(DEVICECODE)))
                 .thenReturn(Arrays.asList(row));
-        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status 传 null、位置=组织-站点名）
+        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status 传 null、位置=mivbcz直取不拼接）
         when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 nullable(String.class), anyString())).thenReturn(DEVICE_ID);
@@ -130,10 +129,10 @@ class VideoAlertServiceTest {
             }
         }
         assertTrue(codeChecked, "告警编号 code 应存在于插入参数中");
-        // 兜底查/建设备：type=#5# 视频、code=通道devicecode、status 留空、位置=组织-站点名
+        // 兜底查/建设备：type=#5# 视频、code=通道devicecode、status 留空、位置=mivbcz 直取（不再拼站点名）
         verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), nullable(String.class),
-                eq(LOCATION));
+                eq(ORG_NAME));
         // 工单联动：alert=告警ID、site=站点ID、device=设备ID、title=content去"！"、content 与告警一致
         verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID), eq(TITLE), eq(CONTENT));
     }

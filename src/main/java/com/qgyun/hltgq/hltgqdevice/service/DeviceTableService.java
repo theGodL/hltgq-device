@@ -27,7 +27,10 @@ import java.util.concurrent.ConcurrentMap;
  *       （站点名含"-视频"后缀时如"夏家湖渡槽-视频摄像机#"），
  *       对齐 hltgq-mq "{站点名}{设备类型}#"（如"集岭管理所雨量计#"）命名风格；</li>
  *   <li>每个视频站点（通道）对应 1 台设备，site 存站点ID，code 存通道 devicecode；</li>
- *   <li>name → deviceId 永久缓存（设备名稳定，查询/创建失败不缓存可重试）；</li>
+ *   <li>设备匹配键 = code（通道 devicecode，唯一）；name 仅展示（创建时写入）。历史教训：
+ *       按 name 匹配时僵尸站点与树内站点重名（如两个"大门外"），树内同步会波及同名僵尸设备、
+ *       树内站点自身设备反而错配（2026-09-05 线上核对发现 21 条 wlcvig 不一致）；</li>
+ *   <li>code → deviceId 永久缓存（code 稳定，查询/创建失败不缓存可重试）；</li>
  *   <li>动态列适配：启动时加载设备表列元数据，列不存在自动跳过；</li>
  *   <li>设备运行状态 status（#1#在线/#2#离线）由站点同步维护；</li>
  *   <li>启动迁移（幂等）：为历史视频站点补建设备，并把历史告警/工单中 device=站点ID 的
@@ -72,7 +75,7 @@ public class DeviceTableService {
     /** 工单表是否含 device 列（启动迁移用，动态列适配） */
     private volatile boolean workOrderHasDevice = true;
 
-    /** 设备缓存：name → deviceId（永久缓存，创建失败不缓存可重试） */
+    /** 设备缓存：code → deviceId（code 缺失回退 name；永久缓存，创建失败不缓存可重试） */
     private final ConcurrentMap<String, String> deviceCache = new ConcurrentHashMap<>();
 
     @PostConstruct
@@ -137,9 +140,11 @@ public class DeviceTableService {
     // ======================== 查找 / 创建 ========================
 
     /**
-     * 按设备名查找或创建设备（带缓存），可选写入 type/code/status/location。
-     * <p>与 hltgq-mq lookupOrCreateDeviceByName 同模式：name 唯一，查询失败/创建失败返回 null
-     * 且不缓存，下次调用重试。
+     * 按通道 devicecode（code）查找或创建设备（带缓存），可选写入 type/code/status/location。
+     * <p>code 为设备唯一匹配键；name 仅作展示字段（创建时写入）。
+     * 历史设备可能缺失 code（早期版本按 name 创建），code 查不到时按 name 兜底并回填 code
+     * （按设备ID精确回填，避免 name 重名波及多行）。
+     * <p>查询失败/创建失败返回 null 且不缓存，下次调用重试。
      *
      * @param location 安装位置（wlcvig，可为 null；创建时写入，已存在设备不更新）
      * @return 设备ID；设备名缺失或数据库不可达时返回 null
@@ -149,31 +154,67 @@ public class DeviceTableService {
         if (name == null || name.trim().isEmpty()) {
             return null;
         }
-        String key = name.trim();
-        String cached = deviceCache.get(key);
+        // 匹配键：通道 devicecode 唯一；历史设备缺失 code 时回退 name（旧行为）
+        String matchKey = (code != null && !code.trim().isEmpty()) ? code.trim() : name.trim();
+        String cached = deviceCache.get(matchKey);
         if (cached != null) {
             return cached;
         }
         // computeIfAbsent 内返回 null 不缓存（ConcurrentHashMap 语义），创建失败下次重试
-        return deviceCache.computeIfAbsent(key, n -> {
-            String id = findDeviceByName(n);
-            return id != null ? id : createDevice(n, siteId, type, code, status, location);
+        return deviceCache.computeIfAbsent(matchKey, key -> {
+            String id = findDeviceByCodeOrName(key, name.trim());
+            return id != null ? id : createDevice(name.trim(), siteId, type, code, status, location);
         });
     }
 
-    /** 按设备名查设备ID（不创建），不存在或查询失败返回 null */
-    private String findDeviceByName(String name) {
+    /**
+     * 按 code 查设备ID；code 查不到时按 name 兜底（历史设备缺失 code 场景），
+     * 命中后回填 code（按设备ID精确更新），后续轮次即可按 code 匹配。
+     */
+    private String findDeviceByCodeOrName(String key, String name) {
+        String id = findDeviceByKey("code", key);
+        if (id != null) {
+            return id;
+        }
+        String byName = findDeviceByKey("name", name);
+        if (byName != null && !key.equals(name)) {
+            backfillCode(byName, key);
+        }
+        return byName;
+    }
+
+    /** 按设备表列（code/name，内部常量）查视频设备ID（不创建），不存在或查询失败返回 null */
+    private String findDeviceByKey(String column, String value) {
         try {
-            String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE name = ?";
-            List<String> results = jdbcTemplate.queryForList(sql, String.class, name);
+            // type 条件限定视频设备：站点表存在与视频通道同 devicecode 的其他类型站点
+            // （如闸门），其设备 code 相同，必须排除（2026-09-05 线上发现 1000230$1$0$11/1000328$1$0$0 重复）
+            String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE " + column
+                    + " = ? AND type = '" + DEVICE_TYPE_VIDEO + "'";
+            List<String> results = jdbcTemplate.queryForList(sql, String.class, value);
             if (results != null && !results.isEmpty()
                     && results.get(0) != null && !results.get(0).trim().isEmpty()) {
                 return results.get(0).trim();
             }
         } catch (Exception e) {
-            log.warn("[视频设备] 查找设备失败, name={}: {}", name, e.getMessage());
+            log.warn("[视频设备] 查找设备失败, {}={}: {}", column, value, e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * 历史设备 code 缺失回填：按设备ID精确更新（防 name 重名时波及多行），
+     * 仅 code 为空时写入，不覆盖已有 code。
+     */
+    private void backfillCode(String deviceId, String code) {
+        try {
+            String sql = "UPDATE " + DEVICE_TABLE +
+                    " SET code = ?, updated_at = ?, updated_by = 'SYSTEM' " +
+                    " WHERE id = ? AND (code IS NULL OR code = '')";
+            jdbcTemplate.update(sql, code, new Timestamp(System.currentTimeMillis()), deviceId);
+            log.info("[视频设备] 历史设备code回填: id={}, code={}", deviceId, code);
+        } catch (Exception e) {
+            log.warn("[视频设备] 设备code回填失败, id={}: {}", deviceId, e.getMessage());
+        }
     }
 
     /**
@@ -243,21 +284,53 @@ public class DeviceTableService {
 
     /**
      * 更新设备运行状态（#1#在线/#2#离线）：仅状态变化时更新（status IS DISTINCT FROM 条件）。
+     * 按通道 devicecode（code）精确匹配——历史教训：按 name 匹配会波及同名设备（僵尸/重名站点）。
      *
+     * @param code 通道 devicecode（唯一匹配键，为空跳过）
      * @return 实际更新的行数（无变化为 0）
      */
-    public int updateDeviceStatus(String name, String status) {
-        if (name == null || status == null) {
+    public int updateDeviceStatus(String code, String status) {
+        if (code == null || code.trim().isEmpty() || status == null) {
             return 0;
         }
         try {
             String sql = "UPDATE " + DEVICE_TABLE +
                     " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE name = ? AND status IS DISTINCT FROM ?";
+                    " WHERE code = ? AND type = '" + DEVICE_TYPE_VIDEO +
+                    "' AND status IS DISTINCT FROM ?";
             return jdbcTemplate.update(sql, status,
-                    new Timestamp(System.currentTimeMillis()), name, status);
+                    new Timestamp(System.currentTimeMillis()), code.trim(), status);
         } catch (Exception e) {
-            log.warn("[视频设备] 更新设备状态失败, name={}: {}", name, e.getMessage());
+            log.warn("[视频设备] 更新设备状态失败, code={}: {}", code, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * 更新设备安装位置（wlcvig变化时）：与站点位置同源（ICC设备树层级），
+     * 随设备树层级调整持续同步（IS DISTINCT FROM 变化才写库）。
+     * 按通道 devicecode（code）精确匹配（防 name 重名波及同名设备）。
+     * 设备表无 wlcvig 列时自动跳过（动态列适配）。
+     *
+     * @param code 通道 devicecode（唯一匹配键，为空跳过）
+     * @return 实际更新的行数（无变化为 0）
+     */
+    public int updateDeviceLocation(String code, String location) {
+        if (code == null || code.trim().isEmpty() || location == null || location.trim().isEmpty()) {
+            return 0;
+        }
+        if (!deviceColumns.isEmpty() && !deviceColumns.contains("wlcvig")) {
+            return 0;
+        }
+        try {
+            String sql = "UPDATE " + DEVICE_TABLE +
+                    " SET wlcvig = ?, updated_at = ?, updated_by = 'SYSTEM' " +
+                    " WHERE code = ? AND type = '" + DEVICE_TYPE_VIDEO +
+                    "' AND wlcvig IS DISTINCT FROM ?";
+            return jdbcTemplate.update(sql, location.trim(),
+                    new Timestamp(System.currentTimeMillis()), code.trim(), location.trim());
+        } catch (Exception e) {
+            log.warn("[视频设备] 更新设备安装位置失败, code={}: {}", code, e.getMessage());
             return 0;
         }
     }
@@ -308,7 +381,8 @@ public class DeviceTableService {
      * <p>幂等：迁移后 device=设备ID，再跑时 UPDATE 条件（device=站点ID）不再命中；
      * 仅处理 device=站点ID 的历史行，未来新数据（device=设备ID）不受影响。
      * <p>历史设备字段回填（仅空值写入，不覆盖人工编辑）：
-     * 运行状态按站点 zebpsu 对齐（变化才写库）、安装位置 wlcvig 空值回填。
+     * 运行状态按站点 zebpsu 对齐（变化才写库）、安装位置 wlcvig 空值回填（值取站点 mivbcz，
+     * 在树站点由同步轮持续修正为"管理所级组织-位置节点"格式）。
      * 入库日期 tm / 启用日期 ptlink 无真实数据源，不回填（留空人工维护，宁缺毋滥）。
      */
     private void migrateLegacyDeviceRefs() {
@@ -333,14 +407,15 @@ public class DeviceTableService {
                 if (deviceName == null) {
                     continue;
                 }
-                String location = buildLocation(
-                        row.get("mivbcz") == null ? null : String.valueOf(row.get("mivbcz")),
-                        String.valueOf(sname).trim());
+                // 匹配键 code（通道 devicecode，唯一）；历史设备缺失 code 时由 lookupOrCreateDevice 兜底回填
+                String deviceCode = row.get("devicecode") == null ? null
+                        : String.valueOf(row.get("devicecode")).trim();
+                String location = row.get("mivbcz") == null ? null
+                        : String.valueOf(row.get("mivbcz")).trim();
                 String stationStatus = row.get("zebpsu") == null ? null
                         : String.valueOf(row.get("zebpsu")).trim();
                 String deviceId = lookupOrCreateDevice(deviceName, siteId, DEVICE_TYPE_VIDEO,
-                        row.get("devicecode") == null ? null : String.valueOf(row.get("devicecode")).trim(),
-                        stationStatus, location);
+                        deviceCode, stationStatus, location);
                 if (deviceId == null) {
                     log.warn("[视频设备] 迁移: 设备创建失败, site={}, name={}", siteId, deviceName);
                     continue;
@@ -349,9 +424,9 @@ public class DeviceTableService {
                 // 安装位置空值回填（不覆盖人工编辑值）——
                 // 同步轮覆盖不到的消失站点设备也能对齐
                 if (stationStatus != null && !stationStatus.isEmpty()) {
-                    statusAligned += updateDeviceStatus(deviceName, stationStatus);
+                    statusAligned += updateDeviceStatus(deviceCode, stationStatus);
                 }
-                locationBackfilled += backfillLocation(deviceName, location);
+                locationBackfilled += backfillLocation(deviceCode, location);
                 stations++;
                 // 告警表：device=站点ID 的历史行 → 设备ID（幂等）
                 try {
@@ -390,12 +465,15 @@ public class DeviceTableService {
 
     /**
      * 安装位置空值回填（历史设备创建时未写 wlcvig，启动迁移补填）：
-     * 仅 wlcvig 为空时写入，不覆盖人工编辑值；设备表无 wlcvig 列自动跳过（动态列适配）。
+     * 回填值取站点位置 mivbcz（设备安装位置与站点位置同源；在树站点由同步轮持续修正为设备树层级值），
+     * 按通道 devicecode（code）精确匹配，仅 wlcvig 为空时写入，不覆盖人工编辑值；
+     * 设备表无 wlcvig 列自动跳过（动态列适配）。
      *
+     * @param code 通道 devicecode（唯一匹配键，为空跳过）
      * @return 实际回填的行数
      */
-    private int backfillLocation(String name, String location) {
-        if (name == null || location == null || location.trim().isEmpty()) {
+    private int backfillLocation(String code, String location) {
+        if (code == null || code.trim().isEmpty() || location == null || location.trim().isEmpty()) {
             return 0;
         }
         if (!deviceColumns.isEmpty() && !deviceColumns.contains("wlcvig")) {
@@ -404,11 +482,12 @@ public class DeviceTableService {
         try {
             String sql = "UPDATE " + DEVICE_TABLE +
                     " SET wlcvig = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE name = ? AND (wlcvig IS NULL OR wlcvig = '')";
+                    " WHERE code = ? AND type = '" + DEVICE_TYPE_VIDEO +
+                    "' AND (wlcvig IS NULL OR wlcvig = '')";
             return jdbcTemplate.update(sql, location.trim(),
-                    new Timestamp(System.currentTimeMillis()), name);
+                    new Timestamp(System.currentTimeMillis()), code.trim());
         } catch (Exception e) {
-            log.warn("[视频设备] 安装位置回填失败, name={}: {}", name, e.getMessage());
+            log.warn("[视频设备] 安装位置回填失败, code={}: {}", code, e.getMessage());
             return 0;
         }
     }
