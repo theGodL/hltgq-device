@@ -154,13 +154,15 @@ public class WorkOrderService {
      * alert 字段存告警ID精确关联；title 由告警 content 派生（去结尾"！"），
      * content 与告警 content 一致，关闭时按 content 匹配（与告警关闭条件同构）。
      *
-     * @param alertId  告警ID（精确关联，动态列适配：工单表无 alert 列时自动跳过）
-     * @param siteId   所属站点
-     * @param deviceId 关联设备（设备表视频设备ID，type=#5#）
-     * @param title    工单标题
-     * @param content  内容描述（与告警 content 一致）
+     * @param alertId       告警ID（精确关联，动态列适配：工单表无 alert 列时自动跳过）
+     * @param siteId        所属站点
+     * @param deviceId      关联设备（设备表视频设备ID，type=#5#）
+     * @param title         工单标题
+     * @param content       内容描述（与告警 content 一致）
+     * @param workOrderType 工单类型（qjulvf）：#hxqm#设备故障抢修 / #pfqj#安全隐患整改
      */
-    public void createIfAbsent(String alertId, String siteId, String deviceId, String title, String content) {
+    public void createIfAbsent(String alertId, String siteId, String deviceId, String title, String content,
+                               String workOrderType) {
         if (siteId == null || title == null) {
             return;
         }
@@ -171,7 +173,7 @@ public class WorkOrderService {
         if (orgId == null) {
             log.warn("[视频告警] 工单负责部门未解析, org留空: site={}, title={}", siteId, title);
         }
-        insertWorkOrder(alertId, siteId, deviceId, title, content, orgId);
+        insertWorkOrder(alertId, siteId, deviceId, title, content, orgId, workOrderType);
     }
 
     /** 同一 site+device+title 的未关闭工单（非 #3#已关闭/#4#已取消）是否存在 */
@@ -207,8 +209,9 @@ public class WorkOrderService {
         return downOrgId;
     }
 
-    /** 工单入库：alert 存告警ID，status=#1# 待处理，user/time/result/file 留空 */
-    private void insertWorkOrder(String alertId, String siteId, String deviceId, String title, String content, String orgId) {
+    /** 工单入库：alert 存告警ID，status=#1# 待处理，qjulvf 存工单类型，user/time/result/file 留空 */
+    private void insertWorkOrder(String alertId, String siteId, String deviceId, String title, String content,
+                                 String orgId, String workOrderType) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             Map<String, Object> fm = new LinkedHashMap<>();
@@ -230,6 +233,9 @@ public class WorkOrderService {
             }
             if (orgId != null) {
                 fm.put("org", orgId);
+            }
+            if (workOrderType != null) {
+                fm.put("qjulvf", workOrderType);
             }
             fm.put("status", STATUS_PENDING);
 

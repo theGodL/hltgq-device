@@ -73,6 +73,9 @@ public class VideoAlertScheduler {
     private VideoAlertService alertService;
 
     @Resource
+    private VideoEventService videoEventService;
+
+    @Resource
     private DahuaAuthService authService;
 
     /** 防抖状态机（阈值来自配置，@PostConstruct 构建后不再变更） */
@@ -280,6 +283,16 @@ public class VideoAlertScheduler {
         }
         log.info("[视频告警] 本轮检测完成: 完成{}路, 异常通道{}个, 防抖事件{}个",
                 snap.completedChannels.get(), abnormalByChannel.size(), events.size());
+
+        // ============ IVSS 智能事件轮询兜底（补偿订阅回调丢失的事件，与回调共用处理链路） ============
+        try {
+            int polled = videoEventService.pullRecentEvents();
+            if (polled > 0) {
+                snap.polledEvents = polled;
+            }
+        } catch (Exception e) {
+            log.warn("[智能事件] 轮询兜底异常: {}", e.getMessage());
+        }
     }
 
     /** 单路检测结果摘要（状态快照展示用） */
@@ -312,6 +325,8 @@ public class VideoAlertScheduler {
         private final AtomicInteger completedChannels = new AtomicInteger();
         private volatile int newAlerts;
         private volatile int recoveredAlerts;
+        /** 轮询兜底处理的事件条数（IVSS 智能事件，-1=拉取失败） */
+        private volatile int polledEvents;
         /** 轮级登录失败标记（LOGIN_FAIL 故障项） */
         private volatile boolean loginFailed;
         /** 中止原因/备注 */
@@ -349,6 +364,10 @@ public class VideoAlertScheduler {
 
         public int getRecoveredAlerts() {
             return recoveredAlerts;
+        }
+
+        public int getPolledEvents() {
+            return polledEvents;
         }
 
         public boolean isLoginFailed() {

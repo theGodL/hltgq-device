@@ -54,8 +54,15 @@ public class VideoAlertService {
     private static final String STATUS_UNCONFIRMED = "#1#";
     private static final String STATUS_CLOSED = "#4#";
 
-    /** 告警类型：#2# 异常告警（视频故障类） */
+    /** 告警类型：#1#阈值超限 #2#异常告警（图像质量/链路故障） #3#智能分析（IVSS 智能事件） */
     private static final String ALERT_TYPE_ABNORMAL = "#2#";
+    private static final String ALERT_TYPE_INTELLIGENT = "#3#";
+
+    /** 工单类型（qjulvf）：图像质量/链路故障 → 设备故障抢修工单 */
+    private static final String WORK_ORDER_TYPE_FAULT_REPAIR = "#hxqm#";
+
+    /** 工单类型（qjulvf）：IVSS 智能事件 → 安全隐患整改工单 */
+    private static final String WORK_ORDER_TYPE_SAFETY_RECTIFY = "#pfqj#";
 
     /** 告警编号时间格式（DateTimeFormatter 线程安全） */
     private static final DateTimeFormatter CODE_TIME_FORMATTER =
@@ -160,7 +167,7 @@ public class VideoAlertService {
         if (existsUnclosed(site.id, deviceId, content)) {
             return false;
         }
-        insertAlert(site.id, deviceId, content, levelOf(fault));
+        insertAlert(site.id, deviceId, content, levelOf(fault), WORK_ORDER_TYPE_FAULT_REPAIR, ALERT_TYPE_ABNORMAL);
         log.warn("[视频告警] 新增告警: site={}({}), device={}, fault={}, content={}",
                 site.id, site.name, deviceId, fault, content);
         return true;
@@ -192,15 +199,62 @@ public class VideoAlertService {
         return rows;
     }
 
+    // ======================== 智能事件告警（IVSS 事件接入复用） ========================
+
+    /**
+     * 新增智能事件告警（IVSS 事件接入复用入口）：content 由调用方拼装
+     * （"{站点}-视频智能事件 {事件名}！"，与图像故障 "{站点}-视频 {故障名}！" 前缀隔离防撞），
+     * device 存设备表视频设备 ID，去重（site+device+content）与工单联动同故障告警完全一致。
+     *
+     * @param siteId   站点ID（事件 nodeCode 匹配到的视频站点）
+     * @param deviceId 设备表视频设备ID
+     * @param content  告警内容
+     * @param level    告警级别（#1#~#4#，由事件 alarmGrade 映射）
+     * @return true-新增成功，false-已有未关闭同内容告警或入库失败
+     */
+    public boolean reportEventAlert(String siteId, String deviceId, String content, String level) {
+        if (siteId == null || deviceId == null || content == null || content.trim().isEmpty()) {
+            return false;
+        }
+        if (existsUnclosed(siteId, deviceId, content)) {
+            return false;
+        }
+        insertAlert(siteId, deviceId, content, level, WORK_ORDER_TYPE_SAFETY_RECTIFY, ALERT_TYPE_INTELLIGENT);
+        log.warn("[视频告警] 新增智能事件告警: site={}, device={}, content={}", siteId, deviceId, content);
+        return true;
+    }
+
+    /**
+     * 关闭智能事件告警（事件恢复复用入口）：按 site+device+content 精确匹配，
+     * 关闭未关闭告警（status → #4#）并联动关闭对应工单（人工已关闭的行不重复更新）。
+     *
+     * @return 实际关闭的告警条数
+     */
+    public int closeEventAlert(String siteId, String deviceId, String content) {
+        if (siteId == null || deviceId == null || content == null || content.trim().isEmpty()) {
+            return 0;
+        }
+        int rows = closeByContent(siteId, deviceId, content);
+        if (rows > 0) {
+            log.info("[视频告警] 智能事件恢复关警 {} 条: site={}, device={}, content={}",
+                    rows, siteId, deviceId, content);
+        }
+        workOrderService.closeByContent(siteId, deviceId, content);
+        return rows;
+    }
+
     // ======================== 数据库操作 ========================
 
     /**
-     * 新增告警行（动态列适配，status 默认 #1#，type=#2# 异常告警，time=当前时间）。
+     * 新增告警行（动态列适配，status 默认 #1#，type=告警类型，time=当前时间）。
      * 插入成功后自动联动生成工单（与 hltgq-mq insertAlert 联动模式一致）。
      *
-     * @param deviceId 设备表视频设备ID（device 字段）
+     * @param deviceId      设备表视频设备ID（device 字段）
+     * @param workOrderType 联动工单类型（qjulvf）：故障=#hxqm#设备故障抢修，智能事件=#pfqj#安全隐患整改
+     * @param alertType     告警类型：故障=#2#异常告警，智能事件=#3#智能分析
      */
-    private void insertAlert(String siteId, String deviceId, String content, String level) {
+    private void insertAlert(String siteId, String deviceId, String content, String level, String workOrderType,
+                             String alertType) {
         try {
             Timestamp now = new Timestamp(System.currentTimeMillis());
             String alertId = IdGenerator.generate();
@@ -215,7 +269,7 @@ public class VideoAlertService {
             fm.put("site", siteId);
             fm.put("device", deviceId);
             fm.put("content", content);
-            fm.put("type", ALERT_TYPE_ABNORMAL);
+            fm.put("type", alertType);
             fm.put("level", level);
             fm.put("status", STATUS_UNCONFIRMED);
             fm.put("time", now);
@@ -240,8 +294,8 @@ public class VideoAlertService {
             }
             String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
             jdbcTemplate.update(sql, vals.toArray());
-            // 告警新增成功 → 自动生成工单（alert 存告警ID精确关联；device 存设备表视频设备ID）
-            workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveTitle(content), content);
+            // 告警新增成功 → 自动生成工单（alert 存告警ID精确关联；device 存设备表视频设备ID；qjulvf 存工单类型）
+            workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveTitle(content), content, workOrderType);
         } catch (Exception e) {
             log.error("[视频告警] 告警入库失败, site={}, content={}: {}", siteId, content, e.getMessage());
         }

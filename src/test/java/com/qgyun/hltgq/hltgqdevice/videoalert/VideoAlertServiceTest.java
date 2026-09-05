@@ -133,8 +133,32 @@ class VideoAlertServiceTest {
         verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), nullable(String.class),
                 eq(ORG_NAME));
-        // 工单联动：alert=告警ID、site=站点ID、device=设备ID、title=content去"！"、content 与告警一致
-        verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID), eq(TITLE), eq(CONTENT));
+        // 工单联动：alert=告警ID、site=站点ID、device=设备ID、title=content去"！"、content 与告警一致、qjulvf=#hxqm#设备故障抢修
+        verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID), eq(TITLE), eq(CONTENT),
+                eq("#hxqm#"));
+    }
+
+    /** 智能事件告警：type=#3# 智能分析、工单 qjulvf=#pfqj# 安全隐患整改（与故障告警 #2#/#hxqm# 区分） */
+    @Test
+    void reportEventAlertInsertsWithIntelligentType() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+        String eventContent = SITE_NAME + "-视频智能事件 区域入侵！";
+
+        assertTrue(service.reportEventAlert(SITE_ID, DEVICE_ID, eventContent, "#2#"));
+
+        assertEquals(1, updateInvocations.size());
+        String sql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
+        Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
+        List<Object> vals = new ArrayList<>(Arrays.asList(args));
+        // type=#3# 智能分析与 level=#2#（调用参数）同时存在：两个字段独立映射
+        assertTrue(sql.contains("\"type\""));
+        assertTrue(vals.contains("#3#"));
+        assertTrue(vals.contains("#2#"));
+        assertTrue(vals.contains(eventContent));
+        // 工单联动：qjulvf=#pfqj# 安全隐患整改（title=content 去"！"）
+        verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID),
+                eq(SITE_NAME + "-视频智能事件 区域入侵"), eq(eventContent), eq("#pfqj#"));
     }
 
     /** 去重：已有未关闭同内容告警 → 不重复插入、不重复建工单 */
@@ -145,7 +169,7 @@ class VideoAlertServiceTest {
 
         assertFalse(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         assertTrue(updateInvocations.isEmpty());
-        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any());
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
     }
 
     /** 站点缺失：不插入告警、不建工单 */
@@ -155,7 +179,7 @@ class VideoAlertServiceTest {
                 .thenReturn(new ArrayList<>());
         assertFalse(service.reportFault("unknown-code", VideoFaultType.BLUR));
         assertTrue(updateInvocations.isEmpty());
-        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any());
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
     }
 
     /** 恢复关警：按 site+device+content 精确匹配，status 置 #4#，并联动关闭工单 */
@@ -224,7 +248,7 @@ class VideoAlertServiceTest {
 
         assertFalse(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         assertTrue(updateInvocations.isEmpty());
-        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any());
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
     }
 
     /** 恢复时设备缺失：返回 0，不关告警、不关工单 */

@@ -115,16 +115,18 @@ class WorkOrderServiceTest {
         when(jdbcTemplate.queryForList(anyString(), eq(String.class), eq(SITE_ID)))
                 .thenReturn(Arrays.asList("3206400001"));
 
-        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
 
         assertEquals(1, updateInvocations.size());
         String sql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
         Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
         List<Object> vals = new ArrayList<>(Arrays.asList(args));
-        // org 为方言保留字需双引号；status=#1# 待处理；alert 存告警ID精确关联
+        // org 为方言保留字需双引号；status=#1# 待处理；alert 存告警ID精确关联；qjulvf 存工单类型
         assertTrue(sql.contains("\"org\""));
+        assertTrue(sql.contains("qjulvf"));
         assertTrue(vals.contains("org-up-id"));
         assertTrue(vals.contains("#1#"));
+        assertTrue(vals.contains("#hxqm#"));
         assertTrue(vals.contains(ALERT_ID));
         assertTrue(vals.contains(SITE_ID));
         assertTrue(vals.contains(DEVICE_ID));
@@ -150,7 +152,7 @@ class WorkOrderServiceTest {
         when(jdbcTemplate.queryForList(anyString(), eq(String.class), eq(SITE_ID)))
                 .thenReturn(Arrays.asList("3206409999"));
 
-        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
 
         Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
         List<Object> vals = Arrays.asList(args);
@@ -166,7 +168,7 @@ class WorkOrderServiceTest {
         when(jdbcTemplate.queryForList(anyString(), eq(String.class), eq(SITE_ID)))
                 .thenReturn(Arrays.asList(""));
 
-        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
 
         Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
         List<Object> vals = Arrays.asList(args);
@@ -180,7 +182,7 @@ class WorkOrderServiceTest {
         when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any(), any()))
                 .thenReturn(1);
 
-        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
 
         assertTrue(updateInvocations.isEmpty());
         verify(jdbcTemplate, never()).queryForList(anyString(), eq(String.class), eq(SITE_ID));
@@ -189,7 +191,7 @@ class WorkOrderServiceTest {
     /** siteId 为空 → 直接跳过，无任何数据库写操作 */
     @Test
     void createIfAbsentNullSiteSkips() {
-        service.createIfAbsent(ALERT_ID, null, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, null, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
         assertTrue(updateInvocations.isEmpty());
         verify(jdbcTemplate, never())
                 .queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any(), any());
@@ -227,7 +229,7 @@ class WorkOrderServiceTest {
         when(jdbcTemplate.queryForList(anyString(), eq(String.class), eq(SITE_ID)))
                 .thenReturn(Arrays.asList("3206400001"));
 
-        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT);
+        service.createIfAbsent(ALERT_ID, SITE_ID, DEVICE_ID, TITLE, CONTENT, "#hxqm#");
 
         String sql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
         assertFalse(sql.toLowerCase().contains("alert"));

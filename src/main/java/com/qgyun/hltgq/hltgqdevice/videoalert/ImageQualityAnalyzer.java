@@ -11,8 +11,10 @@ import java.util.Set;
 
 /**
  * 视频图像质量分析器（纯 Java，零新增依赖）。
- * <p>对 ffmpeg 抽出的 JPEG 帧做像素级统计，判定 9 类 B 层图像故障：
- * 过亮、过暗、偏色、黑白、模糊、对比度、噪声、冻结、遮挡。
+ * <p>对 ffmpeg 抽出的 JPEG 帧做像素级统计，判定 7 类 B 层图像故障：
+ * 过亮、过暗、偏色、黑白、模糊、对比度、噪声。
+ * <p>智能类告警（画面冻结/视频遮挡等）不在此分析：由大华 IVSS 智能分析事件推送接入，
+ * 本项目不代理大华做出智能告警。
  * <p>故障判定阈值均为配置项 {@code video-alert.threshold.*}（默认值基于子码流
  * D1/CIF 分辨率 + 抽帧降采样 320 宽标定的经验初值），现场联调时按实际设备
  * 图像质量校准（重点：夜间红外场景过暗误报、背光场景过亮误报），
@@ -58,18 +60,6 @@ public class ImageQualityAnalyzer {
     /** 噪声残差（与3x3邻域均值的平均绝对差）超过此值 → 噪声干扰，配置项 video-alert.threshold.noise-residual */
     @Value("${video-alert.threshold.noise-residual:12.0}")
     private double noiseResidual;
-
-    /** 帧间平均绝对差（MAD）低于此值 → 画面冻结，配置项 video-alert.threshold.frozen-mad */
-    @Value("${video-alert.threshold.frozen-mad:0.6}")
-    private double frozenMad;
-
-    /** 遮挡：Laplacian 方差低于此值且灰度标准差低于 contrastStdDev（画面近似纯色），配置项 video-alert.threshold.occluded-laplacian-var */
-    @Value("${video-alert.threshold.occluded-laplacian-var:60.0}")
-    private double occludedLaplacianVar;
-
-    /** 遮挡灰度标准差上限，配置项 video-alert.threshold.occluded-std-dev */
-    @Value("${video-alert.threshold.occluded-std-dev:8.0}")
-    private double occludedStdDev;
 
     /** 参与计算的图像最大边长（缩小采样控制 CPU 占用，子码流本就不大） */
     private static final int MAX_ANALYSIS_WIDTH = 640;
@@ -186,31 +176,6 @@ public class ImageQualityAnalyzer {
             double noiseResidualAvg = noiseSum / inner;
             if (noiseResidualAvg > noiseResidual) {
                 faults.add(VideoFaultType.NOISE);
-            }
-
-            // ============ 视频遮挡（边缘极弱 + 画面近似纯色，比模糊更严苛） ============
-            if (lapVar < occludedLaplacianVar && stdY < occludedStdDev) {
-                faults.add(VideoFaultType.OCCLUDED);
-            }
-        }
-
-        // ============ 画面冻结（帧间 MAD） ============
-        if (frames.size() >= 2) {
-            BufferedImage second = downscale(frames.get(frames.size() - 1));
-            if (second.getWidth() == w && second.getHeight() == h) {
-                int[] rgb2 = second.getRGB(0, 0, w, h, null, 0, w);
-                double madSum = 0;
-                for (int i = 0; i < n; i++) {
-                    int p1 = rgb[i];
-                    int p2 = rgb2[i];
-                    madSum += Math.abs(((p1 >> 16) & 0xFF) - ((p2 >> 16) & 0xFF))
-                            + Math.abs(((p1 >> 8) & 0xFF) - ((p2 >> 8) & 0xFF))
-                            + Math.abs((p1 & 0xFF) - (p2 & 0xFF));
-                }
-                double mad = madSum / n / 3.0;
-                if (mad < frozenMad) {
-                    faults.add(VideoFaultType.FROZEN);
-                }
             }
         }
 

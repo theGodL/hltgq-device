@@ -45,6 +45,17 @@ public class DahuaConfig {
     /** 读取超时时间（毫秒，-1表示不设置） */
     private Long readTimeout = -1L;
 
+    // ========== ICC 事件订阅配置（IVSS 智能事件接入） ==========
+
+    /** 事件订阅总开关（默认false，联调通过后打开） */
+    private Boolean eventEnabled = false;
+
+    /** 事件回调地址（ICC服务器可访问的本服务地址，如 http://192.168.x.x:18686/api/dahua/event/receive） */
+    private String eventCallbackUrl;
+
+    /** 订阅组织码（逗号分隔；留空=订阅全部，靠处理侧过滤非视频站点） */
+    private String eventOrgs;
+
     // ========== Getters & Setters ==========
 
     public String getHost() {
@@ -145,6 +156,30 @@ public class DahuaConfig {
 
     public void setReadTimeout(Long readTimeout) {
         this.readTimeout = readTimeout;
+    }
+
+    public Boolean getEventEnabled() {
+        return eventEnabled;
+    }
+
+    public void setEventEnabled(Boolean eventEnabled) {
+        this.eventEnabled = eventEnabled;
+    }
+
+    public String getEventCallbackUrl() {
+        return eventCallbackUrl;
+    }
+
+    public void setEventCallbackUrl(String eventCallbackUrl) {
+        this.eventCallbackUrl = eventCallbackUrl;
+    }
+
+    public String getEventOrgs() {
+        return eventOrgs;
+    }
+
+    public void setEventOrgs(String eventOrgs) {
+        this.eventOrgs = eventOrgs;
     }
 
     /**

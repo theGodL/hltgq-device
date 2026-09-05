@@ -46,9 +46,10 @@ public class AuthInterceptor implements HandlerInterceptor {
     @Value("${auth.white-list:}")
     private String whiteListConfig;
 
-    /** 代码固定白名单（不受配置影响） */
+    /** 代码固定白名单（不受配置影响）：错误页 + 大华ICC事件订阅回调（平台无鉴权推送） */
     private static final Set<String> FIXED_WHITE_LIST = new HashSet<>(Arrays.asList(
-            "/error"
+            "/error",
+            "/api/dahua/event/"
     ));
 
     @Override
