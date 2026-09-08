@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>实时监控</title>
+<!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265)，与PC端一致 -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+/* ===== 移动端原型规范：浅灰白底，视频区纯黑，主色紫蓝 #7B6CFF ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* 导航栏：标题居中，左侧返回，右侧回放按钮 */
+.nav-bar {
+  height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  position: relative; flex-shrink: 0;
+}
+.nav-bar .back { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 22px; color: #1F1F1F; cursor: pointer; padding: 4px; }
+.nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nav-bar .playback-btn {
+  position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
+  font-size: 14px; color: #7B6CFF; border: 1px solid #7B6CFF; border-radius: 4px;
+  padding: 4px 10px; cursor: pointer; background: #FFFFFF;
+}
+
+/* 视频区：撑满剩余空间（与回放播放页一致），消除下方空白 */
+.video-area {
+  width: 100%; flex: 1; min-height: 0; background: #000000; position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.video-area video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+/* 加载占位：纯转圈动画，不显示技术文案（业主可读性） */
+.video-placeholder { text-align: center; color: #666; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.video-placeholder .spinner {
+  width: 28px; height: 28px; border: 3px solid rgba(255,255,255,0.25);
+  border-top-color: #7B6CFF; border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.video-placeholder .main { font-size: 14px; margin-top: 8px; }
+.video-placeholder .sub { font-size: 12px; margin-top: 4px; }
+.play-btn {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 56px; height: 56px; border-radius: 50%; background: rgba(255,255,255,0.85);
+  border: none; font-size: 24px; color: #1F1F1F; cursor: pointer; z-index: 2;
+}
+/* 右上角录制点 */
+.record-dot {
+  position: absolute; right: 16px; top: 12px; width: 8px; height: 8px; border-radius: 50%;
+  background: #FF4D4F; border: 2px solid #FFFFFF; display: none;
+}
+/* 加载失败遮罩 */
+.video-error {
+  position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.65);
+  color: #FFF; font-size: 13px; text-align: center; padding: 6px 12px; display: none;
+}
+
+/* 云台控制条：横排按钮放底部（与回放播放页控制条风格一致） */
+.ptz-bar {
+  display: flex; align-items: center; justify-content: center; gap: 12px;
+  padding: 12px 16px 4px; background: #FFFFFF; flex-shrink: 0;
+}
+.ptz-bar.disabled { opacity: 0.45; pointer-events: none; }
+.ptz-btn {
+  width: 46px; height: 46px; border-radius: 10px; border: 1px solid #E5E6EB;
+  background: #F5F6FA; font-size: 18px; color: #8C8C8C; cursor: pointer; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-user-select: none; user-select: none; touch-action: none;
+}
+.ptz-btn.pressing { background: #7B6CFF; border-color: #7B6CFF; color: #FFFFFF; }
+/* 停止按钮（红色强调） */
+.ptz-stop {
+  width: 46px; height: 46px; border-radius: 10px; border: 1px solid #E5E6EB;
+  background: #F5F6FA; font-size: 15px; color: #FF4D4F; cursor: pointer; padding: 0;
+  display: flex; align-items: center; justify-content: center; margin-left: 4px;
+}
+/* 云台权限提示 */
+.ptz-tip { text-align: center; font-size: 12px; color: #999; padding: 6px 0 10px; background: #FFFFFF; display: none; flex-shrink: 0; }
+.ptz-tip.locked { color: #FF4D4F; display: block; }
+
+/* AI 检测状态栏（视频区下方，控制条上方） */
+.ai-bar {
+  height: 44px; margin: 10px 16px 0; background: #F6FFED; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  font-size: 13px; color: #52C41A; padding: 0 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ai-bar.alert { background: #FFF1F0; color: #FF4D4F; }
+.ai-bar .bulb { margin-right: 6px; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.75); color: #FFF; font-size: 14px; padding: 10px 18px;
+  border-radius: 8px; z-index: 99; display: none; max-width: 80%;
+}
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <span class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')">&lt;</span>
+  <span class="nav-title" id="navTitle">实时监控</span>
+  <span class="playback-btn" id="playbackBtn">回放</span>
+</div>
+
+<div class="video-area" id="videoArea">
+  <div class="video-placeholder" id="videoPlaceholder">
+    <div class="spinner"></div>
+  </div>
+  <video id="video" playsinline webkit-playsinline muted></video>
+  <button class="play-btn" id="playBtn" style="display:none">▶</button>
+  <span class="record-dot" id="recordDot"></span>
+  <div class="video-error" id="videoError"></div>
+</div>
+
+<div class="ai-bar" id="aiBar"><span class="bulb">💡</span><span id="aiText">当前画面未检测到异常</span></div>
+
+<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止），无权限/无云台能力时整体置灰 -->
+<div class="ptz-bar disabled" id="ptzBar">
+  <button class="ptz-btn" data-dir="left">◀</button>
+  <button class="ptz-btn" data-dir="up">▲</button>
+  <button class="ptz-btn" data-dir="down">▼</button>
+  <button class="ptz-btn" data-dir="right">▶</button>
+  <button class="ptz-stop" id="ptzCenter">■</button>
+</div>
+<div class="ptz-tip" id="ptzTip"></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== 常量与全局 ====================
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  if (path.indexOf('/api/') === 0) return APP_BASE + path;
+  return path;
+}
+const params = new URLSearchParams(location.search);
+const channelId = params.get('channelId') || '';
+const channelName = params.get('name') || '实时监控';
+const cameraType = parseInt(params.get('cameraType')) || 1;
+const hasPtz = cameraType >= 2;   // 与 PC 端一致：球机及以上支持云台（1=枪机 2=球机 3=半球 4=云台）
+
+let userIsAdmin = false;      // 云台操作权限（系统管理员）
+let hlsInstance = null;       // hls.js 实例
+let ptzUserInteracting = false;
+let ptzTimer = null;          // 1秒心跳
+let ptzHardTimeout = null;    // 3秒硬超时兜底
+let lastPtzDirection = null;
+let ptzChain = Promise.resolve();  // ★ 命令发送链：严格串行，保证 START 先于 STOP 到达后端
+let ptzInFlight = 0;               // 链上排队+执行中的命令数（心跳节流用）
+
+// ==================== 工具 ====================
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2500);
+}
+
+// ==================== fetch 封装（与 PC 端同一权限语义） ====================
+async function apiGet(url) {
+  const resp = await fetch(url, { headers: sessionHeaders() });
+  if (resp.status === 401) {
+    const body = await resp.json().catch(() => ({}));
+    location.href = body.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) throw new Error('无操作权限，仅系统管理员可操作');
+  if (resp.status === 503) throw new Error('权限服务不可用，请稍后重试');
+  return resp.json();
+}
+async function apiPost(url, body) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, sessionHeaders()),
+    body: JSON.stringify(body)
+  });
+  if (resp.status === 401) {
+    const j = await resp.json().catch(() => ({}));
+    location.href = j.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) { showToast('无操作权限，仅系统管理员可操作'); throw new Error('403'); }
+  if (resp.status === 503) { showToast('权限服务不可用，请稍后重试'); throw new Error('503'); }
+  return resp.json();
+}
+function sessionHeaders() {
+  const headers = {};
+  const m = document.cookie.match(/(?:^|;\s*)sessionId=([^;]+)/);
+  if (m && m[1]) headers['X-Session-Id'] = m[1];
+  return headers;
+}
+
+// ==================== 播放 ====================
+/**
+ * 获取实时流并起播：stream-url 返回 hls-proxy 代理地址（内网修正/HEVC转码已由后端完成）。
+ * 进入页面立即加载并尝试静音自动播放（video 标签 muted，iOS/Android 均允许）；
+ * 若浏览器拦截自动播放（play() 被中断），静默显示播放按钮，不提示错误文案。
+ */
+/** 判定自动播放被浏览器拦截类错误（不展示给用户） */
+function isPlayInterrupted(err, msg) {
+  if (err) {
+    if (err.name === 'NotAllowedError' || err.name === 'AbortError') return true;
+    if (/play\(\) request was interrupted/i.test(err.message || '')) return true;
+  }
+  return /play\(\) request was interrupted/i.test(msg || '');
+}
+
+async function startPlay() {
+  const video = document.getElementById('video');
+  const errorEl = document.getElementById('videoError');
+  errorEl.style.display = 'none';
+  document.getElementById('playBtn').style.display = 'none';
+  try {
+    const json = await apiGet(API_BASE + '/stream-url?channelId=' + encodeURIComponent(channelId) +
+      '&streamType=2&protocol=hls');
+    if (json.success !== true || !json.data || !json.data.url) {
+      throw new Error(json.desc || '获取视频流失败');
+    }
+    const url = proxyUrl(json.data.url);
+    if (Hls.isSupported()) {
+      if (hlsInstance) hlsInstance.destroy();
+      hlsInstance = new Hls({ enableWorker: true });
+      hlsInstance.loadSource(url);
+      hlsInstance.attachMedia(video);
+      hlsInstance.on(Hls.Events.ERROR, (evt, data) => {
+        // 仅致命错误才提示（网络抖动由 hls.js 自动重试）；
+        // 自动播放被中断不提示，静默显示播放按钮
+        if (data.fatal) {
+          console.error('[HLS] 致命错误：', data);
+          if (isPlayInterrupted(null, data.details || (data.error && data.error.message))) {
+            document.getElementById('playBtn').style.display = 'block';
+          } else {
+            showVideoError('视频流加载失败，请重试');
+          }
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // iOS Safari 原生 HLS
+      video.src = url;
+    } else {
+      throw new Error('当前浏览器不支持 HLS 播放');
+    }
+    // 静音自动播放（移动端策略允许）；被拦截则静默显示播放按钮
+    try {
+      await video.play();
+    } catch (playErr) {
+      if (isPlayInterrupted(playErr)) {
+        console.warn('[Play] 自动播放被浏览器拦截，显示播放按钮：', playErr.name);
+        document.getElementById('playBtn').style.display = 'block';
+      } else {
+        throw playErr;
+      }
+    }
+  } catch (err) {
+    console.error('[Play] 播放失败：', err);
+    if (err.message && err.message !== '未登录') showVideoError(err.message);
+  }
+}
+
+function showVideoError(msg) {
+  const errorEl = document.getElementById('videoError');
+  errorEl.textContent = msg;
+  errorEl.style.display = 'block';
+  document.getElementById('videoPlaceholder').style.display = 'none';
+  document.getElementById('playBtn').style.display = 'block';
+}
+
+/** 清理播放器（切页面/刷新时） */
+function destroyPlayer() {
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  const video = document.getElementById('video');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+}
+
+// ==================== 云台控制（与 PC 端同一权限语义：仅系统管理员） ====================
+function updatePtzState() {
+  const bar = document.getElementById('ptzBar');
+  const tip = document.getElementById('ptzTip');
+  if (!hasPtz) {
+    bar.classList.add('disabled');
+    tip.textContent = '当前设备不支持云台控制';
+    tip.classList.add('locked');
+    return;
+  }
+  if (!userIsAdmin) {
+    bar.classList.add('disabled');
+    tip.textContent = '仅系统管理员可操作云台';
+    tip.classList.add('locked');
+    return;
+  }
+  bar.classList.remove('disabled');
+  tip.textContent = '';
+  tip.classList.remove('locked');
+}
+
+/** 发送方向命令（按压持续：START + 1秒心跳维持，与 PC 端官方模式一致） */
+/**
+ * 真正发送一次命令（在链内执行），返回是否成功。
+ * 403 时同步本地权限状态（后端拒绝权限类失败）。
+ */
+async function doSendPtz(url, body) {
+  try {
+    const json = await apiPost(API_BASE + url, body);
+    if (json.success !== true) {
+      console.warn('[PTZ] 命令返回失败：', json.desc || json.code);
+      if (String(json.code) === '403') { userIsAdmin = false; updatePtzState(); }
+      return false;
+    }
+    return true;
+  } catch (err) {
+    if (err.message === '403') { userIsAdmin = false; updatePtzState(); }
+    return false;
+  }
+}
+
+/**
+ * 入链串行发送：所有 PTZ 命令严格按入队顺序逐个发出。
+ * ★ 关键：此前 START/STOP 并发 fire-and-forget，STOP 可能先于 START 到达后端，
+ * 后端 FIFO 按到达序执行 → STOP 无效、START 成为最后指令，设备持续转动停不下来。
+ */
+function enqueuePtz(url, body) {
+  ptzInFlight++;
+  const p = ptzChain.then(() => doSendPtz(url, body));
+  ptzChain = p.then(() => { ptzInFlight--; }, () => { ptzInFlight--; });
+  return p;   // 本次命令的结果（true/false）
+}
+
+function ptzStart(direction) {
+  if (!userIsAdmin || !hasPtz) return;
+  console.log('[PTZ] 按下方向：' + direction);
+  ptzUserInteracting = true;
+  lastPtzDirection = direction;
+  enqueuePtz('/ptz/direct', { channelId: channelId, direction: direction, speed: 5 });
+  if (ptzTimer) clearInterval(ptzTimer);
+  ptzTimer = setInterval(() => {
+    // 链上有积压时跳过本次心跳，避免排队 START 拖慢 STOP
+    if (ptzInFlight === 0) {
+      enqueuePtz('/ptz/direct', { channelId: channelId, direction: lastPtzDirection, speed: 5 });
+    }
+  }, 1000);
+  // 3秒硬超时兜底：即使 touchend 丢失也强制停止，防止设备永久失控
+  if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+  ptzHardTimeout = setTimeout(() => {
+    console.error('[PTZ] ⚠ 3秒硬超时触发！强制停止');
+    ptzStop();
+  }, 3000);
+}
+
+async function ptzStop() {
+  if (!ptzUserInteracting) return;
+  // ★ 先保存本次停止的方向（后端要求 STOP 的 direct 与 START 一致，否则设备无法停止）
+  const stopDir = lastPtzDirection;
+  console.log('[PTZ] 松开，停止方向：' + stopDir);
+  ptzUserInteracting = false;
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  lastPtzDirection = null;
+  // ★ 等链上在途命令（START）完成后才发 STOP：保证后端按 START→STOP 顺序执行
+  await ptzChain;
+  // STOP ×1 + 失败重试（最多3次，间隔300ms），全部走链保持顺序
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (ptzUserInteracting) return; // 用户已开始新操作，放弃本次停止
+    const ok = await enqueuePtz('/ptz/stop', { channelId: channelId, direction: stopDir });
+    if (ok) {
+      console.log('[PTZ] 停止命令第' + attempt + '次成功');
+      return;
+    }
+    console.warn('[PTZ] 停止命令第' + attempt + '次失败，重试中...');
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] ⚠ 停止命令3次均失败！请检查网络');
+}
+
+function bindPtzButton(btn) {
+  const dir = btn.dataset.dir;
+  // ★ 移动端按压：touch 事件（pointer 事件在部分移动浏览器不可靠）
+  btn.addEventListener('touchstart', (e) => {
+    e.preventDefault();          // 防 300ms 延迟与滚动
+    btn.classList.add('pressing');
+    ptzStart(dir);
+  }, { passive: false });
+  btn.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    btn.classList.remove('pressing');
+    ptzStop();
+  }, { passive: false });
+  btn.addEventListener('touchcancel', (e) => {
+    btn.classList.remove('pressing');
+    ptzStop();
+  });
+  // 禁止长按弹出菜单/拖拽
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+// ==================== AI 检测状态栏 ====================
+/**
+ * 查询该通道未关闭告警（type=#3# 智能分析 / #2# 异常告警），
+ * 有告警 → 红底提示事件内容；无 → 绿底「未检测到异常」。
+ */
+async function loadAiStatus() {
+  try {
+    const json = await apiGet(API_BASE + '/alert/active?channelId=' + encodeURIComponent(channelId));
+    const bar = document.getElementById('aiBar');
+    const text = document.getElementById('aiText');
+    if (json.success === true && json.data && json.data.list && json.data.list.length > 0) {
+      const first = json.data.list[0];
+      const extra = json.data.count > 1 ? ' 等' + json.data.count + '条' : '';
+      bar.classList.add('alert');
+      text.textContent = '：检测到 ' + (first.content || '异常事件') + extra;
+    } else {
+      bar.classList.remove('alert');
+      text.textContent = '：当前画面未检测到异常';
+    }
+  } catch (err) {
+    console.warn('[AI] 状态查询失败：', err);
+  }
+}
+
+// ==================== 初始化 ====================
+async function loadCurrentUserPermission() {
+  try {
+    const json = await apiGet(API_BASE + '/auth/current-user');
+    userIsAdmin = !!(json.success === true && json.data && json.data.isAdmin === true);
+    console.log('[Auth] 云台权限 isAdmin=' + userIsAdmin);
+  } catch (err) {
+    console.warn('[Auth] 权限查询失败，默认无云台权限：', err);
+    userIsAdmin = false;
+  }
+  updatePtzState();
+}
+
+function init() {
+  document.getElementById('navTitle').textContent = channelName;
+  // 回放按钮 → 回放列表页
+  document.getElementById('playbackBtn').addEventListener('click', () => {
+    location.href = appUrl('/mobile/playback.html?channelId=') + encodeURIComponent(channelId) +
+      '&name=' + encodeURIComponent(channelName);
+  });
+  // 播放按钮（自动播放被浏览器拦截时兜底）
+  document.getElementById('playBtn').addEventListener('click', () => {
+    const video = document.getElementById('video');
+    if (hlsInstance || video.src) { video.play().catch(() => {}); }
+    else startPlay();
+  });
+  // 视频元素点击也可起播（iOS Safari 用户手势）
+  document.getElementById('videoArea').addEventListener('click', () => {
+    const video = document.getElementById('video');
+    if (video.paused) {
+      if (hlsInstance || video.src) { video.play().catch(() => {}); }
+      else startPlay();
+    }
+  });
+  // 画面开始播放后隐藏加载占位
+  const video = document.getElementById('video');
+  video.addEventListener('playing', () => {
+    document.getElementById('videoPlaceholder').style.display = 'none';
+    document.getElementById('playBtn').style.display = 'none';
+    document.getElementById('recordDot').style.display = 'block';
+  });
+  // 云台方向按钮
+  document.querySelectorAll('.ptz-btn').forEach(bindPtzButton);
+  // 中心停止按钮：点击即停止
+  document.getElementById('ptzCenter').addEventListener('click', () => ptzStop());
+  // 全局兜底：任何位置松开/页面隐藏都强制停止，防止漏 touchend 设备失控
+  document.addEventListener('touchend', () => {
+    if (ptzUserInteracting) { document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing')); ptzStop(); }
+  });
+  // 切后台/锁屏兜底（对应 PC 端 window.blur）：按着按钮切 App 时 touchend 丢失，立即停止
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && ptzUserInteracting) {
+      document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+      ptzStop();
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    // 页面卸载兑底：fetch 可能被浏览器取消，用 sendBeacon 同步排队保证 STOP 送达
+    // （sendBeacon 自动携带同域 Cookie，后端会话校验可通过；重复 STOP 后端队列去重无害）
+    if (ptzUserInteracting && channelId) {
+      const stopDir = lastPtzDirection;
+      try {
+        navigator.sendBeacon(API_BASE + '/ptz/stop',
+          new Blob([JSON.stringify({ channelId: channelId, direction: stopDir })], { type: 'application/json' }));
+      } catch (e) { console.warn('[PTZ] sendBeacon 兑底失败：', e); }
+    }
+    ptzStop();
+    destroyPlayer();
+  });
+
+  updatePtzState();          // 初始按无权限/无云台能力灰显
+  loadCurrentUserPermission();
+  loadAiStatus();
+  // ★ 进入页面立即加载视频（静音自动播放；被浏览器拦截时显示播放按钮兜底）
+  startPlay();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

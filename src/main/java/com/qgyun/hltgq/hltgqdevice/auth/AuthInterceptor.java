@@ -38,9 +38,13 @@ public class AuthInterceptor implements HandlerInterceptor {
     @Resource
     private RolePermissionService rolePermissionService;
 
-    /** 平台登录页地址（未登录页面导航跳转），与 hltgq-site 同平台同地址 */
+    /** 平台 PC 站点登录页地址（PC 页面/接口未登录跳转），与 hltgq-site PC 站点同地址 */
     @Value("${auth.login-page-url:http://220.179.1.110:8081/login/user/login}")
     private String loginPageUrl;
+
+    /** 平台 H5 站点登录页地址（/mobile/ H5 页面/接口未登录跳转），与 hltgq-site H5 站点同地址 */
+    @Value("${auth.login-page-url-h5:http://220.179.1.110:8081/hlt/#/login/user/login}")
+    private String loginPageUrlH5;
 
     /** 可配置白名单（逗号分隔，前缀匹配），与代码固定白名单合并 */
     @Value("${auth.white-list:}")
@@ -65,7 +69,7 @@ public class AuthInterceptor implements HandlerInterceptor {
             String sessionId = sessionContextService.extractSessionId(request);
             if (sessionId == null) {
                 log.warn("未登录：{} {} 未携带会话 ID", request.getMethod(), relativePath);
-                handleUnauthorized(request, response);
+                handleUnauthorized(request, response, relativePath);
                 return false;
             }
             UserContext user = sessionContextService.resolveUser(sessionId);
@@ -76,7 +80,7 @@ public class AuthInterceptor implements HandlerInterceptor {
             return true;
         } catch (UnauthorizedException e) {
             log.warn("未登录：{} {} - {}", request.getMethod(), relativePath, e.getMessage());
-            handleUnauthorized(request, response);
+            handleUnauthorized(request, response, relativePath);
             return false;
         } catch (SessionUnavailableException e) {
             log.error("会话服务不可用：{} {} - {}", request.getMethod(), relativePath, e.getMessage());
@@ -152,16 +156,32 @@ public class AuthInterceptor implements HandlerInterceptor {
     }
 
     /**
-     * 未登录处理：页面导航 302 跳转登录页；AJAX/API 返回 401 JSON（携带 redirectUrl 供前端跳转）
+     * 未登录处理：按请求来源区分登录页——
+     * H5 请求（/mobile/ 路径的页面导航，或 Referer 含 /mobile/ 的接口请求）跳平台 H5 登录页；
+     * 其余（PC 页面/接口、第三方调用）跳平台 PC 登录页。
+     * <p>页面导航（Accept 含 text/html）302 跳转；AJAX/API 返回 401 JSON（携带 redirectUrl 供前端跳转）。
      */
-    private void handleUnauthorized(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    private void handleUnauthorized(HttpServletRequest request, HttpServletResponse response,
+                                    String relativePath) throws Exception {
+        String loginUrl = isH5Request(request, relativePath) ? loginPageUrlH5 : loginPageUrl;
         String accept = request.getHeader("Accept");
         if (accept != null && accept.contains("text/html")) {
-            response.sendRedirect(loginPageUrl);
+            response.sendRedirect(loginUrl);
             return;
         }
         writeJson(response, HttpServletResponse.SC_UNAUTHORIZED,
-                "{\"code\":401,\"message\":\"未登录\",\"redirectUrl\":\"" + loginPageUrl + "\"}");
+                "{\"code\":401,\"message\":\"未登录\",\"redirectUrl\":\"" + loginUrl + "\"}");
+    }
+
+    /**
+     * H5 请求判定：请求路径以 /mobile/ 开头（H5 页面直接导航）或 Referer 含 /mobile/（H5 页面发起的接口请求）。
+     */
+    private boolean isH5Request(HttpServletRequest request, String relativePath) {
+        if (relativePath.startsWith("/mobile/")) {
+            return true;
+        }
+        String referer = request.getHeader("Referer");
+        return referer != null && referer.contains("/mobile/");
     }
 
     /**

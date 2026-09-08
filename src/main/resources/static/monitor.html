@@ -363,7 +363,18 @@ let channelCountCache = null;     // { online, offline } 全量统计缓存，�
 let hlsPlayers = {};
 
 // ==================== 常量 ====================
-const API_BASE = '/api/dahua';
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  if (path.indexOf('/api/') === 0) return APP_BASE + path;
+  return path;
+}
 const FILTERED_ORG_NAMES = ['高低点视频', '分析服务器'];
 function isFilteredOrg(name) {
   if (!name) return false;
@@ -953,6 +964,8 @@ async function loadStreamForCell(cellIdx) {
 }
 
 function playHls(cellIdx, url) {
+  // ★ nginx 前缀适配：后端返回绝对代理地址，经 /hltgq-device/ 访问时补前缀
+  url = proxyUrl(url);
   const cell = document.querySelector('.video-cell[data-index="' + cellIdx + '"]');
   if (!cell) return;
 

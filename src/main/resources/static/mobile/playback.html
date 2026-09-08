@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>回放</title>
+<style>
+/* ===== 移动端原型规范：浅灰白底，主蓝分割线，主色紫蓝 #7B6CFF ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* 导航栏：标题居中，左侧返回，右侧刷新 */
+.nav-bar {
+  height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  position: relative; flex-shrink: 0;
+}
+.nav-bar .back { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 22px; color: #1F1F1F; cursor: pointer; padding: 4px; }
+.nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 62%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nav-bar .refresh-btn { position: absolute; right: 16px; top: 50%; transform: translateY(-50%); font-size: 18px; color: #333; cursor: pointer; padding: 4px; }
+
+/* 日期切换行 */
+.date-row { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 16px 4px; flex-shrink: 0; }
+.date-row button {
+  background: #FFFFFF; border: 1px solid #E5E6EB; border-radius: 6px; font-size: 14px;
+  color: #333; padding: 4px 12px; cursor: pointer;
+}
+.date-row .date-text { font-size: 14px; color: #333; min-width: 110px; text-align: center; }
+
+/* 蓝色分割线 */
+.divider { height: 2px; background: #7B6CFF; flex-shrink: 0; margin-top: 8px; }
+
+/* 录像段列表 */
+.seg-list { flex: 1; overflow-y: auto; padding: 4px 16px 16px; -webkit-overflow-scrolling: touch; }
+.seg-card {
+  background: #FFFFFF; border-radius: 8px; display: flex; align-items: center;
+  padding: 8px 10px; margin-top: 6px; cursor: pointer;
+}
+.seg-card:active { background: #FAFAFC; }
+.seg-icon {
+  width: 60px; height: 60px; border-radius: 8px; background: #E8E8E8; flex-shrink: 0;
+  position: relative; display: flex; align-items: center; justify-content: center;
+  font-size: 22px; color: #8C8C8C;
+}
+.seg-icon .dur-label {
+  position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,0.72); color: #FFF;
+  font-size: 11px; padding: 1px 5px; border-radius: 2px;
+}
+.seg-info { flex: 1; margin-left: 12px; min-width: 0; }
+.seg-name { font-size: 16px; font-weight: 600; color: #1F1F1F; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seg-meta { font-size: 13px; color: #999; margin-top: 4px; }
+.seg-play { font-size: 24px; color: #C0C4CC; flex-shrink: 0; margin-left: 8px; }
+.seg-card.playing .seg-play { color: #7B6CFF; }
+
+/* 空态/加载态 */
+.empty-state { text-align: center; color: #999; font-size: 14px; padding: 40px 0; }
+
+/* 底部蓝分割线 */
+.divider-bottom { height: 2px; background: #7B6CFF; flex-shrink: 0; margin-bottom: 8px; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.75); color: #FFF; font-size: 14px; padding: 10px 18px;
+  border-radius: 8px; z-index: 99; display: none; max-width: 80%;
+}
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <span class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')">&lt;</span>
+  <span class="nav-title" id="navTitle">回放</span>
+  <span class="refresh-btn" id="refreshBtn">🔄</span>
+</div>
+
+<div class="date-row">
+  <button id="prevDay">‹ 前一天</button>
+  <span class="date-text" id="dateText"></span>
+  <button id="nextDay">后一天 ›</button>
+</div>
+<div class="divider"></div>
+
+<div class="seg-list" id="segList">
+  <div class="empty-state">⏳ 正在加载录像列表...</div>
+</div>
+
+<div class="divider-bottom"></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== 常量与全局 ====================
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  if (path.indexOf('/api/') === 0) return APP_BASE + path;
+  return path;
+}
+const params = new URLSearchParams(location.search);
+const channelId = params.get('channelId') || '';
+const channelName = params.get('name') || '回放';
+
+let currentDate = new Date();      // 当前查询日期（默认今天）
+let sortedSegments = [];           // 按开始时间倒序排序后的录像段（卡片下标即数组下标）
+
+// ==================== 工具 ====================
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2500);
+}
+function fmtDate(d) { return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日'; }
+function fmtTime(sec) {
+  const d = new Date(sec * 1000);
+  const p = (n) => (n < 10 ? '0' + n : '' + n);
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function fmtDuration(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const p = (n) => (n < 10 ? '0' + n : '' + n);
+  return (h > 0 ? p(h) + ':' : '') + p(m) + ':' + p(s);
+}
+
+// ==================== fetch 封装（与 PC 端同一权限语义） ====================
+async function apiGet(url) {
+  const resp = await fetch(url, { headers: sessionHeaders() });
+  if (resp.status === 401) {
+    const body = await resp.json().catch(() => ({}));
+    location.href = body.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) throw new Error('无操作权限，仅系统管理员可操作');
+  if (resp.status === 503) throw new Error('权限服务不可用，请稍后重试');
+  return resp.json();
+}
+function sessionHeaders() {
+  const headers = {};
+  const m = document.cookie.match(/(?:^|;\s*)sessionId=([^;]+)/);
+  if (m && m[1]) headers['X-Session-Id'] = m[1];
+  return headers;
+}
+
+// ==================== 录像段加载 ====================
+/**
+ * 查询当天（00:00 ~ 次日00:00）录像段。
+ * ICC 按文件分段返回（startTime/endTime 秒级），回放不能跨段。
+ */
+async function loadSegments() {
+  const list = document.getElementById('segList');
+  list.innerHTML = '<div class="empty-state">⏳ 正在加载录像列表...</div>';
+  const dayStart = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate());
+  const dayEnd = new Date(dayStart.getTime() + 24 * 3600 * 1000);
+  const startSec = Math.floor(dayStart.getTime() / 1000);
+  const endSec = Math.floor(dayEnd.getTime() / 1000);
+  try {
+    const json = await apiGet(API_BASE + '/record/query?channelId=' + encodeURIComponent(channelId) +
+      '&startTime=' + startSec + '&endTime=' + endSec);
+    if (json.success !== true || !Array.isArray(json.data)) {
+      throw new Error(json.desc || '录像查询失败');
+    }
+    // 按开始时间倒序（最近的在前），下标即卡片渲染下标
+    sortedSegments = json.data.slice().sort((a, b) => (parseInt(b.startTime) || 0) - (parseInt(a.startTime) || 0));
+    renderSegments();
+  } catch (err) {
+    console.error('[Record] 录像查询失败：', err);
+    if (err.message && err.message !== '未登录') {
+      list.innerHTML = '<div class="empty-state">❌ ' + escapeHtml(err.message) + '</div>';
+    }
+  }
+}
+
+function renderSegments() {
+  const list = document.getElementById('segList');
+  if (!sortedSegments || sortedSegments.length === 0) {
+    list.innerHTML = '<div class="empty-state">当日暂无录像</div>';
+    return;
+  }
+  let html = '';
+  sortedSegments.forEach((seg, i) => {
+    const st = parseInt(seg.startTime) || 0;
+    const et = parseInt(seg.endTime) || 0;
+    const dur = Math.max(0, et - st);
+    html += '<div class="seg-card" data-idx="' + i + '">' +
+      '<div class="seg-icon">🎬<span class="dur-label">' + fmtDuration(dur) + '</span></div>' +
+      '<div class="seg-info">' +
+        '<div class="seg-name">' + fmtTime(st) + ' 段</div>' +
+        '<div class="seg-meta">' + fmtTime(st) + ' ~ ' + fmtTime(et) + ' · ' + fmtDuration(dur) + '</div>' +
+      '</div>' +
+      '<span class="seg-play">▶</span>' +
+      '</div>';
+  });
+  list.innerHTML = html;
+  // 点击段 → 跳转独立回放播放页（支持播放/暂停与倍速）
+  list.querySelectorAll('.seg-card').forEach(el => {
+    el.addEventListener('click', () => {
+      const seg = sortedSegments[parseInt(el.dataset.idx)];
+      if (!seg) return;
+      const st = parseInt(seg.startTime) || 0;
+      const et = parseInt(seg.endTime) || 0;
+      if (st <= 0 || et <= st) { showToast('录像段时间无效'); return; }
+      // 与 PC 端一致：recordType 与段类型保持一致（6定时→1普通），recordSource 用段返回的来源
+      const rt = normalizeRecordType(seg);
+      const rs = seg.recordSource || '3';
+      location.href = appUrl('/mobile/playback-player.html?channelId=') + encodeURIComponent(channelId) +
+        '&name=' + encodeURIComponent(channelName) +
+        '&beginTime=' + st + '&endTime=' + et +
+        '&recordType=' + encodeURIComponent(rt) + '&recordSource=' + encodeURIComponent(rs);
+    });
+  });
+}
+
+/** 录像段类型归一化（与 PC 端 normalizeRecordType 一致） */
+function normalizeRecordType(seg) {
+  if (seg.videoRecordType) return String(seg.videoRecordType);
+  const rt = String(seg.recordType || '1');
+  if (rt === '6') return '1';   // 定时录像 → 普通录像
+  if (rt === '2') return '2';   // 报警录像
+  return '1';
+}
+
+// ==================== 日期切换 ====================
+function changeDay(delta) {
+  currentDate = new Date(currentDate.getTime() + delta * 24 * 3600 * 1000);
+  document.getElementById('dateText').textContent = fmtDate(currentDate);
+  loadSegments();
+}
+
+// ==================== 初始化 ====================
+function init() {
+  document.getElementById('navTitle').textContent = '回放 - ' + channelName;
+  document.getElementById('dateText').textContent = fmtDate(currentDate);
+  document.getElementById('refreshBtn').addEventListener('click', loadSegments);
+  document.getElementById('prevDay').addEventListener('click', () => changeDay(-1));
+  document.getElementById('nextDay').addEventListener('click', () => changeDay(1));
+  loadSegments();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

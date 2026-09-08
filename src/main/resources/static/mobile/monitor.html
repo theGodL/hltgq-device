@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>视频监视</title>
+<style>
+/* ===== 移动端原型规范：浅灰白底 #F5F6FA，卡片纯白，主色紫蓝 #7B6CFF ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  display: flex; flex-direction: column;
+}
+
+/* 导航栏：44pt，标题居中，左侧返回 */
+.nav-bar {
+  height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  position: relative; flex-shrink: 0;
+}
+.nav-bar .back { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 22px; color: #1F1F1F; cursor: pointer; padding: 4px; }
+.nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; }
+
+/* 搜索框：蓝紫色虚线边框 */
+.search-wrap { padding: 8px 16px 0; flex-shrink: 0; }
+.search-box {
+  height: 40px; background: #FFFFFF; border: 1.5px dashed #7B6CFF; border-radius: 8px;
+  display: flex; align-items: center; padding: 0 12px;
+}
+.search-box .icon { color: #C0C4CC; margin-right: 8px; font-size: 15px; }
+.search-box input { flex: 1; border: none; outline: none; font-size: 14px; color: #333; background: transparent; }
+.search-box input::placeholder { color: #C0C4CC; }
+
+/* 统计标签行 */
+.stats-row { display: flex; align-items: center; padding: 12px 16px 4px; font-size: 14px; color: #333; gap: 16px; flex-shrink: 0; }
+.stats-row .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+.dot-online { background: #52C41A; }
+.dot-offline { background: #BFBFBF; }
+.dot-alert { background: #FF4D4F; }
+
+/* 卡片列表 */
+.card-list { flex: 1; overflow-y: auto; padding: 8px 16px 16px; -webkit-overflow-scrolling: touch; }
+.card {
+  background: #FFFFFF; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  display: flex; align-items: center; padding: 10px; margin-bottom: 12px; cursor: pointer;
+}
+.card:active { background: #FAFAFC; }
+.thumb {
+  width: 100px; height: 80px; border-radius: 8px; background: #E8E8E8; flex-shrink: 0;
+  position: relative; display: flex; align-items: center; justify-content: center;
+  font-size: 34px; color: #B0B0B0;
+}
+.thumb .status-dot {
+  position: absolute; right: 6px; top: 6px; width: 8px; height: 8px; border-radius: 50%;
+  border: 2px solid #FFFFFF;
+}
+.card-info { flex: 1; margin-left: 12px; min-width: 0; }
+.card-title { font-size: 16px; font-weight: 600; color: #1F1F1F; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-title .warn-mark { color: #FF4D4F; }
+.card-loc { font-size: 14px; color: #999; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-loc .loc-icon { color: #FF4D4F; }
+.card-status { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+.card-status .tags { display: flex; align-items: center; gap: 6px; }
+.tag { font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+.tag-online { background: #F6FFED; color: #52C41A; }
+.tag-offline { background: #F5F5F5; color: #8C8C8C; }
+.tag-alert { background: #FFF1F0; color: #FF4D4F; }
+.card-status .aux { font-size: 12px; color: #999; }
+.card-arrow { color: #C0C4CC; font-size: 14px; flex-shrink: 0; margin-left: 8px; }
+
+/* 空态 / 加载态 */
+.empty-state { text-align: center; color: #999; font-size: 14px; padding: 40px 0; }
+.loading-state { text-align: center; color: #999; font-size: 14px; padding: 40px 0; }
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <span class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')">&lt;</span>
+  <span class="nav-title">视频监视</span>
+</div>
+
+<div class="search-wrap">
+  <div class="search-box">
+    <span class="icon">🔍</span>
+    <input type="text" id="searchInput" placeholder="请输入站点名称查询">
+  </div>
+</div>
+
+<div class="stats-row">
+  <span><span class="dot dot-online"></span>在线 <b id="statOnline">0</b></span>
+  <span><span class="dot dot-offline"></span>离线 <b id="statOffline">0</b></span>
+  <span><span class="dot dot-alert"></span>告警 <b id="statAlert">0</b></span>
+</div>
+
+<div class="card-list" id="cardList">
+  <div class="loading-state">⏳ 正在加载设备列表...</div>
+</div>
+
+<script>
+// ==================== 常量与全局 ====================
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
+// 与 PC 端一致的组织过滤规则（高低点视频/分析服务器 为平台内部节点，不展示）
+const FILTERED_ORG_NAMES = ['高低点视频', '分析服务器'];
+function isFilteredOrg(name) {
+  if (!name) return false;
+  return FILTERED_ORG_NAMES.some(keyword => name.includes(keyword));
+}
+
+let allChannels = [];        // 全量通道：{channelId, name, orgPath, isOnline, cameraType}
+let alertByChannel = {};     // {通道devicecode: 未关闭告警数}
+
+// ==================== fetch 封装（与 PC 端同一权限语义） ====================
+/**
+ * 统一 fetch：401 → 跳平台登录页（redirectUrl）；403/503 → 抛错由调用方 toast。
+ * 会话凭证：同域 Cookie 自动携带；另补 X-Session-Id 头（跨域部署场景兼容，读平台会话 Cookie）。
+ */
+async function apiGet(url) {
+  const resp = await fetch(url, { headers: sessionHeaders() });
+  if (resp.status === 401) {
+    const body = await resp.json().catch(() => ({}));
+    location.href = body.redirectUrl || resp.headers.get('Location') || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) throw new Error('无操作权限，仅系统管理员可操作');
+  if (resp.status === 503) throw new Error('权限服务不可用，请稍后重试');
+  return resp.json();
+}
+
+function sessionHeaders() {
+  const headers = {};
+  // 平台会话 Cookie 形如 sessionId=dev_hltgq_session:xxxx；跨域部署时以 Header 携带
+  const m = document.cookie.match(/(?:^|;\s*)sessionId=([^;]+)/);
+  if (m && m[1]) headers['X-Session-Id'] = m[1];
+  return headers;
+}
+
+// ==================== 设备树拉平 ====================
+/** 递归遍历组织树，收集全部视频通道（ch 节点），带组织路径，供本地搜索过滤 */
+async function loadChannels() {
+  allChannels = [];
+  async function recurse(parentId, orgPath) {
+    try {
+      const json = await apiGet(API_BASE + '/device-tree?orgId=' + encodeURIComponent(parentId));
+      if (json.success !== true) {
+        console.warn('[Tree] 返回失败 parentId=' + parentId, json);
+        return;
+      }
+      const children = json.data;
+      if (!children || !Array.isArray(children)) return;
+      const tasks = [];
+      for (const child of children) {
+        if (isFilteredOrg(child.name)) continue;
+        const name = child.name || String(child.id || '');
+        if (child.nodeType === 'ch') {
+          // ★ 在线判定只认 isOnline（与 PC 端一致）
+          allChannels.push({
+            channelId: String(child.id || ''),
+            name: name,
+            orgPath: orgPath,
+            isOnline: child.isOnline === 1,
+            cameraType: parseInt(child.cameraType) || 1
+          });
+        }
+        if (child.isParent === true && child.nodeType !== 'ch') {
+          const nextPath = orgPath ? orgPath + '·' + name : name;
+          tasks.push(recurse(String(child.id || ''), nextPath));
+        }
+      }
+      await Promise.all(tasks);
+    } catch (err) {
+      console.warn('[Tree] 递归失败 parentId=' + parentId, err);
+    }
+  }
+  await recurse('001', '');
+  // 名称排序（同层级组织自然序近似），保证列表稳定
+  allChannels.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+}
+
+/** 未关闭告警汇总：{total, byChannel:{通道code: 告警数}} */
+async function loadAlertSummary() {
+  try {
+    const json = await apiGet(API_BASE + '/alert/active');
+    if (json.success === true && json.data) {
+      alertByChannel = json.data.byChannel || {};
+      return json.data.total || 0;
+    }
+  } catch (err) {
+    console.warn('[Alert] 告警汇总获取失败：', err);
+  }
+  return 0;
+}
+
+// ==================== 渲染 ====================
+function renderCards(keyword) {
+  const list = document.getElementById('cardList');
+  const kw = (keyword || '').trim();
+  const items = allChannels.filter(c => !kw || c.name.includes(kw));
+  if (items.length === 0) {
+    list.innerHTML = '<div class="empty-state">' +
+      (kw ? '未找到匹配「' + escapeHtml(kw) + '」的站点' : '暂无视频设备') + '</div>';
+    return;
+  }
+  let html = '';
+  for (const c of items) {
+    const alertCount = alertByChannel[c.channelId] || 0;
+    // ★ 告警不覆盖在线/离线主状态（告警可能只是画面质量问题，业主关注的是设备是否在线），
+    // 告警作为主 Tag 旁的独立红色小 Tag 附加展示，标题保留红色三角角标
+    const dotCls = c.isOnline ? 'dot-online' : 'dot-offline';
+    const tagCls = c.isOnline ? 'tag-online' : 'tag-offline';
+    const tagText = c.isOnline ? '在线' : '离线';
+    let auxText = c.isOnline ? '信号良好' : '设备离线';
+    let warnMark = '';
+    let alertTag = '';
+    if (alertCount > 0) {
+      alertTag = '<span class="tag tag-alert">告警 ' + alertCount + '</span>';
+      auxText = '存在未关闭告警';
+      warnMark = '<span class="warn-mark">△</span>';
+    }
+    const locText = c.orgPath ? c.orgPath : '花凉亭灌区';
+    html += '<div class="card" data-id="' + escapeHtml(c.channelId) + '" ' +
+      'data-name="' + escapeHtml(c.name) + '" data-cam="' + c.cameraType + '">' +
+      '<div class="thumb">📷<span class="status-dot ' + dotCls + '"></span></div>' +
+      '<div class="card-info">' +
+        '<div class="card-title">' + warnMark + escapeHtml(c.name) + '</div>' +
+        '<div class="card-loc"><span class="loc-icon">📍</span> ' + escapeHtml(locText) + '</div>' +
+        '<div class="card-status"><span class="tags">' +
+        '<span class="tag ' + tagCls + '">' + tagText + '</span>' + alertTag + '</span>' +
+        '<span class="aux">' + escapeHtml(auxText) + '</span></div>' +
+      '</div>' +
+      '<span class="card-arrow">&gt;</span>' +
+      '</div>';
+  }
+  list.innerHTML = html;
+  // 点击卡片 → 实时监控页（带名称/云台能力参数）
+  list.querySelectorAll('.card').forEach(el => {
+    el.addEventListener('click', () => {
+      location.href = appUrl('/mobile/live.html?channelId=') + encodeURIComponent(el.dataset.id) +
+        '&name=' + encodeURIComponent(el.dataset.name) +
+        '&cameraType=' + encodeURIComponent(el.dataset.cam);
+    });
+  });
+}
+
+function updateStats() {
+  let online = 0, offline = 0;
+  for (const c of allChannels) {
+    if (c.isOnline) online++; else offline++;
+  }
+  document.getElementById('statOnline').textContent = online;
+  document.getElementById('statOffline').textContent = offline;
+  document.getElementById('statAlert').textContent = alertTotal;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+let alertTotal = 0;
+
+// ==================== 初始化 ====================
+async function init() {
+  try {
+    // 设备树与告警汇总并行加载
+    const [_, total] = await Promise.all([loadChannels(), loadAlertSummary()]);
+    alertTotal = total;
+    updateStats();
+    renderCards('');
+  } catch (err) {
+    console.error('[Init] 页面初始化失败：', err);
+    document.getElementById('cardList').innerHTML =
+      '<div class="empty-state">❌ 加载失败：' + escapeHtml(err.message) + '</div>';
+  }
+}
+
+// 搜索：本地过滤，防抖 200ms
+let searchTimer;
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderCards(e.target.value), 200);
+});
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

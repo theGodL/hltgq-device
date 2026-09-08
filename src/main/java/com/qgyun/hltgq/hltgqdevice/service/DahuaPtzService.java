@@ -58,6 +58,14 @@ public class DahuaPtzService {
     /** 每通道最后一次方向 START 使用的速度（step），STOP 需与 START 保持一致（官方文档要求） */
     private final ConcurrentHashMap<String, String> lastDirectStep = new ConcurrentHashMap<>();
 
+    /**
+     * 每通道最后一次方向 START 使用的方向码（direct），STOP 需与 START 保持一致（官方文档要求）。
+     * <p>
+     * 历史教训：H5 端 STOP 请求不携带 direction（只有 channelId），此前 stopDirect 解析失败
+     * 后默认 direct="1"（上方向），与 START 的方向码不一致 → 设备无法停止、持续转动。
+     */
+    private final ConcurrentHashMap<String, String> lastDirectCode = new ConcurrentHashMap<>();
+
     /** 镜头控制最后状态缓存（key=channelId），STOP 时需要使用与 START 一致的参数 */
     private final ConcurrentHashMap<String, LensParams> lastLensParams = new ConcurrentHashMap<>();
 
@@ -70,6 +78,39 @@ public class DahuaPtzService {
             this.direct = direct;
             this.step = step;
         }
+    }
+
+    /** STOP 方向码解析结果 */
+    static class StopDirectCode {
+        final String code;
+        /** 是否复用了最近一次 START 的方向码（成功停止后需清理缓存） */
+        final boolean fromCache;
+        StopDirectCode(String code, boolean fromCache) {
+            this.code = code;
+            this.fromCache = fromCache;
+        }
+    }
+
+    /**
+     * 解析 STOP 使用的方向码。
+     * <p>
+     * 未传 direction（H5 端 STOP 只带 channelId）时，复用最近一次 START 的方向码，
+     * 保证 STOP 的 direct 与 START 严格一致（官方文档要求，否则设备无法停止）。
+     * 注意：此处只读缓存不删除，STOP 成功后（含 no need）由调用方清理，失败重试仍可用。
+     *
+     * @return 方向码与是否来自缓存的组合结果；无缓存时默认 "1"（上方向）
+     */
+    private StopDirectCode resolveStopDirectCode(String channelId, String direction) {
+        String directCode = mapDirectionToCode(direction);
+        if (directCode != null) {
+            return new StopDirectCode(directCode, false);
+        }
+        directCode = lastDirectCode.get(channelId);
+        if (directCode == null) {
+            return new StopDirectCode("1", false); // 无历史 START 记录时才默认上方向
+        }
+        log.info("停止云台移动（STOP 复用 START 方向码）：channelId={}, directCode={}", channelId, directCode);
+        return new StopDirectCode(directCode, true);
     }
 
     /**
@@ -101,8 +142,9 @@ public class DahuaPtzService {
 
         String step = String.valueOf(Math.max(1, Math.min(8, speed)));
 
-        // ★ 缓存本次 START 的 step，供 STOP 使用（官方文档要求 STOP 参数与 START 一致）
+        // ★ 缓存本次 START 的 step 与方向码，供 STOP 使用（官方文档要求 STOP 参数与 START 一致）
         lastDirectStep.put(channelId, step);
+        lastDirectCode.put(channelId, directCode);
 
         try {
             Map<String, Object> body = new HashMap<>();
@@ -165,10 +207,9 @@ public class DahuaPtzService {
      */
     public void stopDirect(String channelId, String direction) {
         channelId = normalizeChannelId(channelId);
-        String directCode = mapDirectionToCode(direction);
-        if (directCode == null) {
-            directCode = "1"; // 默认上方向，兼容旧版不传direction的调用
-        }
+        StopDirectCode resolved = resolveStopDirectCode(channelId, direction);
+        String directCode = resolved.code;
+        boolean reuseCachedCode = resolved.fromCache;
 
         try {
             Map<String, Object> body = new HashMap<>();
@@ -207,11 +248,14 @@ public class DahuaPtzService {
                 String errDesc = response.getString("desc");
                 if (errDesc != null && errDesc.contains("no need")) {
                     log.info("停止云台移动（设备已停止）：channelId={}, desc={}", channelId, errDesc);
+                    if (reuseCachedCode) lastDirectCode.remove(channelId);
                     return;
                 }
                 log.warn("停止云台移动失败：{}", errDesc);
                 throw new RuntimeException("停止云台移动失败：" + errDesc);
             }
+            // STOP 成功：清理方向码缓存，避免残留影响后续操作
+            if (reuseCachedCode) lastDirectCode.remove(channelId);
 
         } catch (ClientException e) {
             log.error("停止云台移动异常：{}", e.getErrMsg(), e);
@@ -436,7 +480,7 @@ public class DahuaPtzService {
      * <p>
      * 前端可能传入仅含设备编码的短格式（如URL参数 channelId=1000230），
      * 但ICC PTZ API要求完整格式 {@code deviceCode$channelType$...$channelSeq}（如1000230$1$0$0）。
-     * 此方法与 {@link DahuaVideoService#getJointHlsUrl} 的默认补齐逻辑保持一致：
+     * 此方法与 DahuaVideoService 的 getJointHlsUrl 默认补齐逻辑保持一致：
      * channelSeq默认为"0"（首通道），channelType默认为"1"（视频通道）。
      * <p>
      * 若channelId已包含'$'分隔符，说明已是标准ICC格式，直接返回原值。

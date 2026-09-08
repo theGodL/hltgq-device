@@ -221,7 +221,16 @@ html,body{height:100%;font-family:"Microsoft YaHei","PingFang SC",sans-serif;fon
 
 <script>
 // ==================== 全局状态 ====================
-const API_BASE = '/api/dahua';
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  if (path.indexOf('/api/') === 0) return APP_BASE + path;
+  return path;
+}
 
 let channelId = null;           // URL参数原始值（可能只是设备编码，如1000230）
 let resolvedChannelId = null;   // 从设备树解析出的完整通道ID（如1000230$1$0$0），用于PTZ命令
@@ -333,6 +342,8 @@ async function loadStream() {
 }
 
 function playHls(url) {
+  // ★ nginx 前缀适配：后端返回绝对代理地址，经 /hltgq-device/ 访问时补前缀
+  url = proxyUrl(url);
   // 销毁旧播放器
   destroyPlayer();
 

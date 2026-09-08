@@ -279,7 +279,9 @@ public class DahuaStreamProxyController {
      * - 绝对路径：/live/cameraid/xxx/1_0.ts
      * - 完整URL：http://192.168.14.20:7086/live/cameraid/xxx/1_0.ts
      * <p>
-     * 全部改写为经过代理的URL：/api/dahua/hls-proxy?url={编码后的绝对URL}
+     * 全部改写为经过代理的相对URL：hls-proxy/{ts文件名}?url={编码后的绝对URL}
+     * <p>★ 相对路径以 m3u8 响应URL 为基准解析：兼容 nginx /hltgq-device/ 前缀代理（浏览器基准带前缀）
+     * 与直连部署（基准无前缀）两种模式，分片请求始终回到本控制器。
      *
      * @param m3u8Content 原始m3u8内容
      * @param m3u8Url     m3u8文件自身的完整URL
@@ -321,7 +323,9 @@ public class DahuaStreamProxyController {
                 String encoded = URLEncoder.encode(absoluteUrl, "UTF-8");
                 // 提取原始TS文件名，作为代理URL路径的一部分，让hls.js通过.ts后缀识别分片类型
                 String tsFilename = trimmed.substring(trimmed.lastIndexOf('/') + 1);
-                sb.append("/api/dahua/hls-proxy/").append(tsFilename).append("?url=").append(encoded).append("\n");
+                // ★ 相对路径（非 /api/dahua/ 绝对路径）：nginx 前缀代理模式（/hltgq-device/）下
+                // 浏览器以带前缀的 m3u8 URL 为基准解析，绝对路径会绕过 nginx 前缀导致 404
+                sb.append("hls-proxy/").append(tsFilename).append("?url=").append(encoded).append("\n");
 
             } catch (UnsupportedEncodingException e) {
                 // 编码失败时保留原始行

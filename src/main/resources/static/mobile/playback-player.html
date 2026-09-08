@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>回放播放</title>
+<!-- hls.js 用于回放流播放，与PC端一致（回放流同为HLS m3u8） -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+/* ===== 与 live.html 同一风格：浅灰白底，视频区纯黑，主色紫蓝 #7B6CFF ===== */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+/* 导航栏：标题居中，左侧返回 */
+.nav-bar {
+  height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  position: relative; flex-shrink: 0;
+}
+.nav-bar .back { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 22px; color: #1F1F1F; cursor: pointer; padding: 4px; }
+.nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 70%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* 视频区：黑底居中，加载占位纯转圈 */
+.video-area {
+  flex: 1; background: #000000; position: relative; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.video-area video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+.video-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: #666; }
+.video-placeholder .spinner {
+  width: 28px; height: 28px; border: 3px solid rgba(255,255,255,0.25);
+  border-top-color: #7B6CFF; border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.video-error {
+  position: absolute; left: 24px; right: 24px; top: 50%; transform: translateY(-50%);
+  color: #FFF; font-size: 14px; text-align: center; display: none; flex-direction: column; gap: 12px;
+}
+.video-error.show { display: flex; }
+.retry-btn {
+  background: #7B6CFF; color: #FFF; border: none; border-radius: 6px;
+  font-size: 14px; padding: 8px 24px; cursor: pointer;
+}
+
+/* 回放信息行 */
+.seg-info-bar {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 16px; background: #FFFFFF; flex-shrink: 0;
+  font-size: 13px; color: #666;
+}
+.seg-info-bar .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #7B6CFF; }
+
+/* 控制条 */
+.control-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px; background: #FFFFFF; flex-shrink: 0; border-top: 1px solid #F0F2F5;
+}
+.ctrl-left { display: flex; align-items: center; gap: 12px; }
+.play-toggle {
+  width: 40px; height: 40px; border-radius: 50%; border: none; cursor: pointer;
+  background: #7B6CFF; color: #FFF; font-size: 16px; display: flex; align-items: center; justify-content: center;
+}
+.time-text { font-size: 13px; color: #333; min-width: 96px; text-align: center; }
+.speed-group { display: flex; align-items: center; gap: 6px; }
+.speed-btn {
+  background: #F5F6FA; border: 1px solid #E5E6EB; border-radius: 4px;
+  font-size: 12px; color: #666; padding: 4px 10px; cursor: pointer;
+}
+.speed-btn.active { background: #7B6CFF; border-color: #7B6CFF; color: #FFF; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.75); color: #FFF; font-size: 14px; padding: 10px 18px;
+  border-radius: 8px; z-index: 99; display: none; max-width: 80%;
+}
+</style>
+</head>
+<body>
+<div class="nav-bar">
+  <span class="back" onclick="history.back()">&lt;</span>
+  <span class="nav-title" id="navTitle">回放</span>
+</div>
+
+<div class="video-area" id="videoArea">
+  <div class="video-placeholder" id="videoPlaceholder">
+    <div class="spinner"></div>
+  </div>
+  <video id="video" playsinline webkit-playsinline muted></video>
+  <div class="video-error" id="videoError">
+    <span id="videoErrorText">回放加载失败，请重试</span>
+    <button class="retry-btn" id="retryBtn">重新加载</button>
+  </div>
+</div>
+
+<div class="seg-info-bar">
+  <span class="live-dot"></span>
+  <span id="segInfo">回放时段</span>
+</div>
+
+<div class="control-bar">
+  <div class="ctrl-left">
+    <button class="play-toggle" id="playToggle">⏸</button>
+    <span class="time-text" id="timeText">00:00 / 00:00</span>
+  </div>
+  <div class="speed-group">
+    <button class="speed-btn" data-speed="0.5">0.5x</button>
+    <button class="speed-btn active" data-speed="1">1x</button>
+    <button class="speed-btn" data-speed="1.5">1.5x</button>
+    <button class="speed-btn" data-speed="2">2x</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== 常量与全局 ====================
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时（nginx rewrite 掉前缀后转发后端），
+// 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  if (path.indexOf('/api/') === 0) return APP_BASE + path;
+  return path;
+}
+const params = new URLSearchParams(location.search);
+const channelId = params.get('channelId') || '';
+const channelName = params.get('name') || '回放';
+const beginTime = parseInt(params.get('beginTime')) || 0;
+const endTime = parseInt(params.get('endTime')) || 0;
+const recordType = params.get('recordType') || '1';
+const recordSource = params.get('recordSource') || '3';
+const totalDur = Math.max(0, endTime - beginTime);
+
+let hlsInstance = null;
+let currentSpeed = 1;
+
+// ==================== 工具 ====================
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function p(n) { return (n < 10 ? '0' + n : '' + n); }
+function fmtClock(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+  return (h > 0 ? p(h) + ':' : '') + p(m) + ':' + p(s);
+}
+function fmtTime(sec) {
+  const d = new Date(sec * 1000);
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+    ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2500);
+}
+
+// ==================== fetch 封装（与 PC 端同一权限语义） ====================
+async function apiGet(url) {
+  const resp = await fetch(url, { headers: sessionHeaders() });
+  if (resp.status === 401) {
+    const body = await resp.json().catch(() => ({}));
+    location.href = body.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) throw new Error('无操作权限，仅系统管理员可操作');
+  if (resp.status === 503) throw new Error('权限服务不可用，请稍后重试');
+  return resp.json();
+}
+function sessionHeaders() {
+  const headers = {};
+  const m = document.cookie.match(/(?:^|;\s*)sessionId=([^;]+)/);
+  if (m && m[1]) headers['X-Session-Id'] = m[1];
+  return headers;
+}
+
+// ==================== 回放播放 ====================
+/** 判定自动播放被浏览器拦截类错误（不展示给用户） */
+function isPlayInterrupted(err, msg) {
+  if (err) {
+    if (err.name === 'NotAllowedError' || err.name === 'AbortError') return true;
+    if (/play\(\) request was interrupted/i.test(err.message || '')) return true;
+  }
+  return /play\(\) request was interrupted/i.test(msg || '');
+}
+
+function showPlayError(msg) {
+  document.getElementById('videoErrorText').textContent = msg;
+  document.getElementById('videoError').classList.add('show');
+  document.getElementById('videoPlaceholder').style.display = 'none';
+}
+
+/**
+ * 获取回放流并起播：与 PC 端一致带全参数（recordType/recordSource 必须与录像段一致，
+ * 否则后端按默认「中心源普通录像」查询不到设备存储的录像流）。
+ */
+async function loadPlayback() {
+  const video = document.getElementById('video');
+  const errorEl = document.getElementById('videoError');
+  errorEl.classList.remove('show');
+  document.getElementById('videoPlaceholder').style.display = 'flex';
+  try {
+    const json = await apiGet(API_BASE + '/record/stream?channelId=' + encodeURIComponent(channelId) +
+      '&beginTime=' + beginTime + '&endTime=' + endTime +
+      '&streamType=1&recordType=' + encodeURIComponent(recordType) +
+      '&recordSource=' + encodeURIComponent(recordSource));
+    if (json.success !== true || !json.data || !json.data.url) {
+      throw new Error(json.desc || '获取录像回放流失败');
+    }
+    const url = proxyUrl(json.data.url);
+    if (Hls.isSupported()) {
+      if (hlsInstance) hlsInstance.destroy();
+      hlsInstance = new Hls({ enableWorker: true });
+      hlsInstance.loadSource(url);
+      hlsInstance.attachMedia(video);
+      hlsInstance.on(Hls.Events.ERROR, (evt, data) => {
+        // 仅致命错误才提示；自动播放被中断静默处理（播放/暂停按钮兜底）
+        if (data.fatal) {
+          console.error('[HLS] 回放致命错误：', data);
+          if (isPlayInterrupted(null, data.details || (data.error && data.error.message))) {
+            console.warn('[Play] 自动播放被浏览器拦截');
+          } else {
+            showPlayError('回放加载失败，请重试');
+          }
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // iOS Safari 原生 HLS
+      video.src = url;
+    } else {
+      throw new Error('当前浏览器不支持 HLS 播放');
+    }
+    // 静音自动播放（移动端策略允许）；被拦截则切换为暂停态等用户点击
+    try {
+      await video.play();
+    } catch (playErr) {
+      if (isPlayInterrupted(playErr)) {
+        console.warn('[Play] 自动播放被浏览器拦截，等用户点击播放');
+      } else {
+        throw playErr;
+      }
+    }
+  } catch (err) {
+    console.error('[Record] 回放播放失败：', err);
+    if (err.message && err.message !== '未登录') showPlayError(err.message);
+  }
+}
+
+// ==================== 播放控制（暂停/播放 + 倍速） ====================
+function syncPlayToggle() {
+  const video = document.getElementById('video');
+  document.getElementById('playToggle').textContent = video.paused ? '▶' : '⏸';
+}
+
+function togglePlay() {
+  const video = document.getElementById('video');
+  if (video.paused) {
+    video.play().catch(() => {});
+  } else {
+    video.pause();
+  }
+  syncPlayToggle();
+}
+
+function setSpeed(speed) {
+  currentSpeed = speed;
+  const video = document.getElementById('video');
+  video.playbackRate = speed;
+  document.querySelectorAll('.speed-btn').forEach(b => {
+    b.classList.toggle('active', parseFloat(b.dataset.speed) === speed);
+  });
+}
+
+// 时间显示：回放流起点为 beginTime，播放进度 = beginTime + video.currentTime
+function updateTimeText() {
+  const video = document.getElementById('video');
+  const elapsed = Math.min(video.currentTime || 0, totalDur);
+  document.getElementById('timeText').textContent =
+    fmtClock(elapsed) + ' / ' + fmtClock(totalDur);
+}
+
+// ==================== 初始化 ====================
+function init() {
+  if (!channelId || beginTime <= 0 || endTime <= beginTime) {
+    showPlayError('回放参数无效，请返回重新选择录像');
+    return;
+  }
+  document.getElementById('navTitle').textContent = channelName;
+  document.getElementById('segInfo').textContent =
+    '回放时段 ' + fmtTime(beginTime) + ' ~ ' + fmtTime(endTime);
+
+  document.getElementById('playToggle').addEventListener('click', togglePlay);
+  document.querySelectorAll('.speed-btn').forEach(b => {
+    b.addEventListener('click', () => setSpeed(parseFloat(b.dataset.speed)));
+  });
+  document.getElementById('retryBtn').addEventListener('click', (e) => {
+    e.stopPropagation();   // 阻止冒泡到视频区点击（切换播放/暂停）
+    loadPlayback();
+  });
+
+  const video = document.getElementById('video');
+  video.addEventListener('playing', () => {
+    document.getElementById('videoPlaceholder').style.display = 'none';
+    document.getElementById('videoError').classList.remove('show');
+    syncPlayToggle();
+  });
+  video.addEventListener('pause', syncPlayToggle);
+  video.addEventListener('timeupdate', updateTimeText);
+  video.addEventListener('loadedmetadata', () => { video.playbackRate = currentSpeed; });
+  // 视频区点击切换播放/暂停
+  document.getElementById('videoArea').addEventListener('click', togglePlay);
+
+  window.addEventListener('pagehide', () => {
+    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+  });
+
+  updateTimeText();
+  loadPlayback();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

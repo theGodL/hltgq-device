@@ -46,6 +46,8 @@ public class PtzCommandDispatcher {
         final Category category;
         final Op op;
         final String channelId;
+        /** 入队时间戳（后端接收时刻），用于丢弃 STOP 之后才到达的旧 START */
+        final long ts = System.currentTimeMillis();
         // —— 方向类 ——
         final String direction;   // up/down/left/right/...
         final int speed;
@@ -103,6 +105,12 @@ public class PtzCommandDispatcher {
         final LinkedList<Cmd> queue = new LinkedList<>();
         final AtomicBoolean draining = new AtomicBoolean(false);
         final String channelId;
+        /**
+         * 最近一次已执行 STOP 的入队时间戳。
+         * 若某条 START 的入队时间早于此时间戳，说明它是 STOP 之后才送达的旧指令
+         * （前端发送乱序 / 网络延迟重放），执行它会让设备在停止后再次转动 → 直接丢弃。
+         */
+        private volatile long lastStopTs = 0;
 
         ChannelQueue(String channelId) {
             this.channelId = channelId;
@@ -198,18 +206,30 @@ public class PtzCommandDispatcher {
         }
 
         private void execute(Cmd cmd) {
+            // ★ 乱序兑底：STOP 执行完之后才到达的旧 START 直接丢弃，防止设备停而复转
+            if (cmd.op == Op.START && cmd.ts < lastStopTs) {
+                log.warn("[PTZ-Q] 丢弃 STOP 之后到达的旧 START：{}（ts={} < lastStopTs={}）", cmd, cmd.ts, lastStopTs);
+                return;
+            }
             log.info("[PTZ-Q] 执行 {}", cmd);
-            if (cmd.category == Category.DIRECTION) {
-                if (cmd.op == Op.START) {
-                    ptzService.operateDirect(cmd.channelId, cmd.direction, cmd.speed);
+            try {
+                if (cmd.category == Category.DIRECTION) {
+                    if (cmd.op == Op.START) {
+                        ptzService.operateDirect(cmd.channelId, cmd.direction, cmd.speed);
+                    } else {
+                        ptzService.stopDirect(cmd.channelId, cmd.direction);
+                    }
                 } else {
-                    ptzService.stopDirect(cmd.channelId, cmd.direction);
+                    if (cmd.op == Op.START) {
+                        ptzService.operateLens(cmd.channelId, cmd.action, cmd.speed);
+                    } else {
+                        ptzService.operateLens(cmd.channelId, "stop", 0);
+                    }
                 }
-            } else {
-                if (cmd.op == Op.START) {
-                    ptzService.operateLens(cmd.channelId, cmd.action, cmd.speed);
-                } else {
-                    ptzService.operateLens(cmd.channelId, "stop", 0);
+            } finally {
+                // STOP 无论成败都记录时间戳，作为后续旧 START 的丢弃基准
+                if (cmd.op == Op.STOP) {
+                    lastStopTs = cmd.ts;
                 }
             }
         }

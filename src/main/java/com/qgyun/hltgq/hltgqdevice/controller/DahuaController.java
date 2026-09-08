@@ -13,6 +13,7 @@ import com.qgyun.hltgq.hltgqdevice.service.DahuaPtzService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaRecordService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaVideoService;
 import com.qgyun.hltgq.hltgqdevice.service.PtzCommandDispatcher;
+import com.qgyun.hltgq.hltgqdevice.videoalert.AlertQueryService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
@@ -54,6 +55,9 @@ public class DahuaController {
 
     @Resource
     private RolePermissionService rolePermissionService;
+
+    @Resource
+    private AlertQueryService alertQueryService;
 
     // ==================== 设备树 ====================
 
@@ -323,6 +327,37 @@ public class DahuaController {
         } catch (Exception e) {
             log.error("录像回放流接口异常：", e);
             return ApiResponse.fail("获取录像回放流失败：" + e.getMessage());
+        }
+    }
+
+    // ==================== 告警查询（H5 移动端列表统计 / 详情 AI 状态栏） ====================
+
+    /**
+     * 未关闭告警查询（H5 移动端视频页面，仅登录，无管理员限制）。
+     * <p>不带 channelId → 汇总：{@code {total: 告警总数, byChannel: {通道devicecode: 告警数}}}；
+     * 带 channelId → 该通道未关闭告警列表（content/time/type/level/status，按发生时间倒序）。
+     * <p>前端调用：
+     * <ul>
+     *   <li>列表页统计行/卡片告警态：GET /api/dahua/alert/active</li>
+     *   <li>详情页 AI 检测状态栏：GET /api/dahua/alert/active?channelId=xxx</li>
+     * </ul>
+     */
+    @GetMapping("/alert/active")
+    public ApiResponse<Map<String, Object>> activeAlerts(
+            @RequestParam(required = false) String channelId) {
+        try {
+            if (channelId == null || channelId.trim().isEmpty()) {
+                return ApiResponse.success(alertQueryService.activeSummary());
+            }
+            List<Map<String, Object>> list = alertQueryService.activeAlertsOfChannel(channelId.trim());
+            Map<String, Object> result = new HashMap<>();
+            result.put("channelId", channelId.trim());
+            result.put("count", list.size());
+            result.put("list", list);
+            return ApiResponse.success(result);
+        } catch (Exception e) {
+            log.error("未关闭告警查询接口异常：", e);
+            return ApiResponse.fail("告警查询失败：" + e.getMessage());
         }
     }
 
