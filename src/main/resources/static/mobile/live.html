@@ -21,7 +21,16 @@ body {
   height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
   position: relative; flex-shrink: 0;
 }
-.nav-bar .back { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 22px; color: #1F1F1F; cursor: pointer; padding: 4px; }
+.nav-bar .back {
+  position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+  display: flex; align-items: center; gap: 3px;
+  height: 30px; padding: 0 12px;
+  border: none; border-radius: 9999px;
+  background: #F2F3F5; color: #333333;
+  font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: background 0.15s ease;
+}
+.nav-bar .back:active { background: #E5E6E8; }
 .nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nav-bar .playback-btn {
   position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
@@ -35,8 +44,11 @@ body {
   display: flex; align-items: center; justify-content: center;
 }
 .video-area video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-/* 加载占位：纯转圈动画，不显示技术文案（业主可读性） */
-.video-placeholder { text-align: center; color: #666; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+/* 加载占位：绝对定位居中（不被 video 挤到左侧），纯转圈动画，不显示技术文案（业主可读性） */
+.video-placeholder {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  color: #666; display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
 .video-placeholder .spinner {
   width: 28px; height: 28px; border: 3px solid rgba(255,255,255,0.25);
   border-top-color: #7B6CFF; border-radius: 50%; animation: spin 0.9s linear infinite;
@@ -103,7 +115,7 @@ body {
 </head>
 <body>
 <div class="nav-bar">
-  <span class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')">&lt;</span>
+  <button class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>返回</button>
   <span class="nav-title" id="navTitle">实时监控</span>
   <span class="playback-btn" id="playbackBtn">回放</span>
 </div>
