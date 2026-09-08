@@ -11,18 +11,31 @@
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
 body {
-  padding-top: env(safe-area-inset-top);
-  padding-bottom: env(safe-area-inset-bottom);
+  /* 安全区：顶部由 .nav-bar 吸收（背景延伸至状态栏后），左右/底部由 body 承担 */
+  padding-left: constant(safe-area-inset-left, 0px);   /* 旧 iOS 兼容 */
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: constant(safe-area-inset-right, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: constant(safe-area-inset-bottom, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   display: flex; flex-direction: column; overflow: hidden;
 }
 
 /* 导航栏：标题居中，左侧返回 */
 .nav-bar {
-  height: 44px; background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  /* 顶部安全区：背景延伸至状态栏/刘海后方，内容区保持 44px 且避开安全区 */
+  padding-top: constant(safe-area-inset-top, 0px); /* 旧 iOS 兼容 */
+  padding-top: env(safe-area-inset-top, 0px);
+  height: calc(44px + constant(safe-area-inset-top, 0px));
+  height: calc(44px + env(safe-area-inset-top, 0px));
+  background: #FFFFFF; display: flex; align-items: center; justify-content: center;
   position: relative; flex-shrink: 0;
 }
 .nav-bar .back {
-  position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+  position: absolute; left: 16px;
+  /* 垂直居中于内容区（安全区之下），不受 nav-bar 顶部 padding 影响 */
+  top: constant(safe-area-inset-top, 0px); top: env(safe-area-inset-top, 0px);
+  bottom: 0; margin-top: auto; margin-bottom: auto;
   display: flex; align-items: center; gap: 3px;
   height: 30px; padding: 0 12px;
   border: none; border-radius: 9999px;
