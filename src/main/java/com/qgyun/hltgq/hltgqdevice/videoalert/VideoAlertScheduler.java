@@ -73,6 +73,9 @@ public class VideoAlertScheduler {
     private VideoAlertService alertService;
 
     @Resource
+    private VideoPatrolRecordService patrolRecordService;
+
+    @Resource
     private VideoEventService videoEventService;
 
     @Resource
@@ -218,6 +221,8 @@ public class VideoAlertScheduler {
         // 本轮实际完成检测的通道（正常+异常）：未检测（超时取消/检测异常）的通道不参与防抖判定，
         // 防止排队任务被误杀后把"没检测到"误判为"已恢复"而错误关闭告警与工单
         Set<String> inspectedChannels = ConcurrentHashMap.newKeySet();
+        // 检测异常/超时的通道（巡检留痕记 result=error，与防抖口径独立）
+        Set<String> errorChannels = ConcurrentHashMap.newKeySet();
         int poolSize = Math.max(1, Math.min(parallel, channels.size()));
         ExecutorService pool = Executors.newFixedThreadPool(poolSize, r -> {
             Thread t = new Thread(r, "video-alert-inspect");
@@ -236,6 +241,7 @@ public class VideoAlertScheduler {
                     } catch (Exception e) {
                         log.warn("[视频告警] 单路检测异常: code={}, err={}", ch.getDevicecode(), e.getMessage());
                         snap.channelResults.put(ch.getDevicecode(), "检测异常");
+                        errorChannels.add(ch.getDevicecode());
                         // 检测异常通道不加入 inspectedChannels（异常≠正常，防抖计数保持不变）
                     } finally {
                         snap.completedChannels.incrementAndGet();
@@ -265,6 +271,13 @@ public class VideoAlertScheduler {
             }
         } finally {
             pool.shutdownNow();
+        }
+
+        // ============ 巡检留痕落库（统计大屏口径：不过防抖，按每轮原始结果计数） ============
+        try {
+            patrolRecordService.saveRound(snap.startTime, abnormalByChannel, inspectedChannels, errorChannels);
+        } catch (Exception e) {
+            log.warn("[视频告警] 巡检留痕落库异常: {}", e.getMessage());
         }
 
         // ============ 防抖判定 → 告警新增/恢复 ============
