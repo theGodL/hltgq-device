@@ -45,11 +45,16 @@ body {
 .nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 62%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nav-bar .refresh-btn {
   position: absolute; right: 16px;
-  /* 垂直居中于内容区（安全区之下） */
+  /* 垂直居中于内容区（安全区之下），固定尺寸避免 top/bottom 拉伸 */
   top: constant(safe-area-inset-top, 0px); top: env(safe-area-inset-top, 0px);
   bottom: 0; margin-top: auto; margin-bottom: auto;
-  font-size: 18px; color: #333; cursor: pointer; padding: 4px;
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px;
+  border: none; border-radius: 50%;
+  background: #F2F3F5; color: #333333;
+  cursor: pointer; transition: background 0.15s ease;
 }
+.nav-bar .refresh-btn:active { background: #E5E6E8; }
 
 /* 日期切换行 */
 .date-row { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 16px 4px; flex-shrink: 0; }
@@ -102,7 +107,7 @@ body {
 <div class="nav-bar">
   <button class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>返回</button>
   <span class="nav-title" id="navTitle">回放</span>
-  <span class="refresh-btn" id="refreshBtn">🔄</span>
+  <span class="refresh-btn" id="refreshBtn" title="刷新"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span>
 </div>
 
 <div class="date-row">

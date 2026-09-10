@@ -47,11 +47,13 @@ body {
 .nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nav-bar .playback-btn {
   position: absolute; right: 16px;
-  /* 垂直居中于内容区（安全区之下） */
+  /* 垂直居中于内容区（安全区之下），固定高度避免 top/bottom 拉伸 */
   top: constant(safe-area-inset-top, 0px); top: env(safe-area-inset-top, 0px);
   bottom: 0; margin-top: auto; margin-bottom: auto;
+  display: flex; align-items: center;
+  height: 30px; padding: 0 10px;
   font-size: 14px; color: #7B6CFF; border: 1px solid #7B6CFF; border-radius: 4px;
-  padding: 4px 10px; cursor: pointer; background: #FFFFFF;
+  cursor: pointer; background: #FFFFFF;
 }
 
 /* 视频区：撑满剩余空间（与回放播放页一致），消除下方空白 */
