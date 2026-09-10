@@ -8,6 +8,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.sql.Timestamp;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -17,7 +18,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -28,7 +31,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * 视频巡检留痕与采集统计单测：落库三态映射、统计聚合口径（已结束完整窗）、窗数与比率纯函数。
+ * 视频巡检留痕与采集统计单测：落库三态映射、统计聚合口径（已结束完整窗）、区间查询与参数校验、窗数与比率纯函数。
  */
 class VideoPatrolRecordServiceTest {
 
@@ -217,5 +220,200 @@ class VideoPatrolRecordServiceTest {
         assertEquals(100.0, VideoPatrolRecordService.rate(15, 15));
         assertEquals(97.6, VideoPatrolRecordService.rate(703, 720));
         assertEquals(0.0, VideoPatrolRecordService.rate(0, 720));
+    }
+
+    // ======================== 区间查询（2026-09-10 落地，口径见 数据统计.md 7.1 区间口径定稿） ========================
+
+    /** 区间统计：expected=通道数×区间已结束窗数（末日<今天=全天窗），聚合 SQL 区间 [start0点, 末日次日0点) */
+    @Test
+    void rangeStatsMultiDayAggregatesRange() {
+        when(jdbcTemplate.queryForObject(
+                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                .thenReturn(15L);
+        Map<String, Object> rowOk = new HashMap<>();
+        rowOk.put("result", "ok");
+        rowOk.put("cnt", 10L);
+        Map<String, Object> rowFail = new HashMap<>();
+        rowFail.put("result", "fail");
+        rowFail.put("cnt", 3L);
+        doAnswer(inv -> {
+            queryInvocations.add(inv);
+            return Arrays.asList(rowOk, rowFail);
+        }).when(jdbcTemplate).queryForList(
+                argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
+                any(Timestamp.class), any(Timestamp.class));
+
+        LocalDate start = LocalDate.of(2026, 9, 1);
+        LocalDate end = LocalDate.of(2026, 9, 8);   // 历史区间（末日<今天 2026-09-10）
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        long nowMs = todayStartMs + 15 * 3600000L;
+        Map<String, Object> stats = service.rangeStats(start, end, today, todayStartMs, nowMs);
+
+        long windows = 8L * 48; // 8 天 × 30min 窗
+        assertEquals("视频数据", stats.get("dataType"));
+        assertEquals(15L * windows, stats.get("expected"));
+        assertEquals(13L, stats.get("collected"));
+        assertEquals(10L, stats.get("success"));
+        assertEquals(3L, stats.get("failed"));
+        assertEquals(VideoPatrolRecordService.rate(10, 15L * windows), stats.get("successRate"));
+
+        Object[] args = (Object[]) ((Invocation) queryInvocations.get(0)).getRawArguments()[1];
+        assertEquals(new Timestamp(VideoPatrolRecordService.dayStartMillis(start)), args[0]);
+        assertEquals(new Timestamp(VideoPatrolRecordService.dayStartMillis(end.plusDays(1))), args[1]);
+    }
+
+    /** 区间统计：末日=今天时截断到已结束窗上界（进行中窗不计入分母与聚合） */
+    @Test
+    void rangeStatsEndTodayCutsOffUnfinishedWindow() {
+        when(jdbcTemplate.queryForObject(
+                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                .thenReturn(15L);
+        doAnswer(inv -> {
+            queryInvocations.add(inv);
+            return new ArrayList<>();
+        }).when(jdbcTemplate).queryForList(
+                argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
+                any(Timestamp.class), any(Timestamp.class));
+
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        long nowMs = todayStartMs + 15 * 3600000L;   // 15:00，已结束 30 个窗，第 31 个进行中
+        Map<String, Object> stats = service.rangeStats(today, today, today, todayStartMs, nowMs);
+
+        assertEquals(15L * 30, stats.get("expected")); // 只算已结束窗
+        Object[] args = (Object[]) ((Invocation) queryInvocations.get(0)).getRawArguments()[1];
+        assertEquals(new Timestamp(todayStartMs), args[0]);
+        assertEquals(new Timestamp(todayStartMs + 30 * 1800000L), args[1]); // cutoff=15:00 进行中窗起点
+    }
+
+    /** 区间统计：endDate=未来日 → 未来日贡献 0 窗，末日按今天截断 */
+    @Test
+    void rangeStatsFutureEndDateZeroContribution() {
+        when(jdbcTemplate.queryForObject(
+                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                .thenReturn(15L);
+        doAnswer(inv -> {
+            queryInvocations.add(inv);
+            return new ArrayList<>();
+        }).when(jdbcTemplate).queryForList(
+                argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
+                any(Timestamp.class), any(Timestamp.class));
+
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        long nowMs = todayStartMs + 15 * 3600000L;
+        Map<String, Object> stats = service.rangeStats(
+                LocalDate.of(2026, 9, 8), LocalDate.of(2026, 9, 20), today, todayStartMs, nowMs);
+
+        long windows = 2L * 48 + 30; // 09-08/09-09 全天 + 09-10 已结束 30 窗（09-11~20 贡献 0）
+        assertEquals(15L * windows, stats.get("expected"));
+        Object[] args = (Object[]) ((Invocation) queryInvocations.get(0)).getRawArguments()[1];
+        assertEquals(new Timestamp(todayStartMs + 30 * 1800000L), args[1]); // cutoff=今日已结束窗上界
+    }
+
+    /** 区间统计：聚合查询失败降级返回 0 值不抛异常（大屏不中断） */
+    @Test
+    void rangeStatsQueryFailureDegradesGracefully() {
+        when(jdbcTemplate.queryForObject(
+                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                .thenReturn(15L);
+        doThrow(new RuntimeException("db down")).when(jdbcTemplate).queryForList(
+                argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
+                any(Timestamp.class), any(Timestamp.class));
+
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        Map<String, Object> stats = service.rangeStats(today, today, today, todayStartMs, todayStartMs);
+
+        assertEquals(0L, stats.get("collected"));
+        assertEquals(0L, stats.get("success"));
+        assertEquals(0L, stats.get("failed"));
+        assertEquals(0.0, stats.get("successRate"));
+    }
+
+    /** 纯函数：区间已结束窗数三态（历史区间/末日今天/末日未来/区间全未来/防除零） */
+    @Test
+    void totalFinishedWindowsPureFunction() {
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        long nowMs = todayStartMs + 15 * 3600000L;
+
+        // 末日<今天：全历史日 × 48
+        assertEquals(5L * 48,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 5), today, todayStartMs, nowMs, 30));
+        // 末日=今天：完整历史日 × 48 + 今日已结束窗
+        assertEquals(9L * 48 + 30,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 10), today, todayStartMs, nowMs, 30));
+        // 末日>今天：与末日=今天同结果（未来日 0 窗）
+        assertEquals(9L * 48 + 30,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 20), today, todayStartMs, nowMs, 30));
+        // 单日=今天：与 todayStats 的 finishedWindows 一致
+        assertEquals(30L,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        today, today, today, todayStartMs, nowMs, 30));
+        // 区间全在未来：0
+        assertEquals(0L,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        LocalDate.of(2026, 9, 11), LocalDate.of(2026, 9, 20), today, todayStartMs, nowMs, 30));
+        // 窗长非法：0
+        assertEquals(0L,
+                VideoPatrolRecordService.totalFinishedWindows(
+                        LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 5), today, todayStartMs, nowMs, 0));
+    }
+
+    /** 纯函数：聚合 SQL 上界（末日<今天 → 次日0点；末日≥今天 → 今日已结束窗上界） */
+    @Test
+    void rangeCutoffPureFunction() {
+        LocalDate today = LocalDate.of(2026, 9, 10);
+        long todayStartMs = VideoPatrolRecordService.dayStartMillis(today);
+        long nowMs = todayStartMs + 15 * 3600000L;
+
+        assertEquals(VideoPatrolRecordService.dayStartMillis(LocalDate.of(2026, 9, 9)),
+                VideoPatrolRecordService.rangeCutoff(
+                        LocalDate.of(2026, 9, 8), today, todayStartMs, nowMs, 30));
+        assertEquals(todayStartMs + 30 * 1800000L,
+                VideoPatrolRecordService.rangeCutoff(today, today, todayStartMs, nowMs, 30));
+        assertEquals(todayStartMs + 30 * 1800000L,
+                VideoPatrolRecordService.rangeCutoff(
+                        LocalDate.of(2026, 9, 20), today, todayStartMs, nowMs, 30));
+        assertEquals(todayStartMs,
+                VideoPatrolRecordService.rangeCutoff(today, today, todayStartMs, nowMs, 0));
+    }
+
+    /** 参数解析校验：缺省规则/只传一端/格式非法/倒置/730 天上限 */
+    @Test
+    void parseRangeDefaultsAndValidation() {
+        LocalDate today = LocalDate.of(2026, 9, 10);
+
+        // 都空 = 今日
+        assertArrayEquals(new LocalDate[]{today, today},
+                VideoPatrolRecordService.parseRange(null, null, today, 730));
+        assertArrayEquals(new LocalDate[]{today, today},
+                VideoPatrolRecordService.parseRange("", "  ", today, 730));
+        // 只传 startDate = 该日至今日
+        assertArrayEquals(new LocalDate[]{LocalDate.of(2026, 9, 1), today},
+                VideoPatrolRecordService.parseRange("2026-09-01", null, today, 730));
+        // 只传 endDate = 单日
+        assertArrayEquals(new LocalDate[]{LocalDate.of(2026, 9, 3), LocalDate.of(2026, 9, 3)},
+                VideoPatrolRecordService.parseRange(null, "2026-09-03", today, 730));
+        // 两端都传 = 原样
+        assertArrayEquals(new LocalDate[]{LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 3)},
+                VideoPatrolRecordService.parseRange("2026-09-01", "2026-09-03", today, 730));
+
+        // 格式非法
+        assertThrows(IllegalArgumentException.class,
+                () -> VideoPatrolRecordService.parseRange("2026/09/01", null, today, 730));
+        // 倒置
+        assertThrows(IllegalArgumentException.class,
+                () -> VideoPatrolRecordService.parseRange("2026-09-05", "2026-09-01", today, 730));
+        // 上限：DAYS.between=729（含两端 730 天）允许；=730（731 天）拒绝
+        assertArrayEquals(new LocalDate[]{LocalDate.of(2024, 9, 10), LocalDate.of(2026, 9, 9)},
+                VideoPatrolRecordService.parseRange("2024-09-10", "2026-09-09", today, 730));
+        assertThrows(IllegalArgumentException.class,
+                () -> VideoPatrolRecordService.parseRange("2024-09-10", "2026-09-10", today, 730));
     }
 }

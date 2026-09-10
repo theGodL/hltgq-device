@@ -8,6 +8,9 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -52,6 +55,10 @@ public class VideoPatrolRecordService {
     /** 巡检统计窗长（分钟，须与 video-alert.cron 的轮次间隔保持一致，默认 30） */
     @Value("${video-alert.patrol-window-minutes:30}")
     private int windowMinutes;
+
+    /** 统计查询区间上限（天，与 hltgq-mq 730 天上限保持一致，见 数据统计.md 4.4） */
+    @Value("${video-alert.stats-max-range-days:730}")
+    private int maxRangeDays;
 
     // ======================== 巡检留痕落库 ========================
 
@@ -156,17 +163,10 @@ public class VideoPatrolRecordService {
                     + "SELECT devicecode FROM " + STATION_TABLE
                     + " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> '')"
                     + " GROUP BY result";
-            for (Map<String, Object> row : jdbcTemplate.queryForList(sql, dayStart, cutoff)) {
-                Object r = row.get("result");
-                Object c = row.get("cnt");
-                long n = c == null ? 0 : Long.parseLong(String.valueOf(c));
-                collected += n;
-                if (RESULT_OK.equals(r)) {
-                    success = n;
-                } else {
-                    failed += n;
-                }
-            }
+            long[] sums = sumByResult(jdbcTemplate.queryForList(sql, dayStart, cutoff));
+            collected = sums[0];
+            success = sums[1];
+            failed = sums[2];
         } catch (Exception e) {
             log.error("[视频巡检] 采集统计查询失败: {}", e.getMessage());
         }
@@ -177,6 +177,119 @@ public class VideoPatrolRecordService {
         stats.put("successRate", rate(success, expected));
         stats.put("failRate", rate(failed, expected));
         return stats;
+    }
+
+    // ======================== 采集统计（日期区间） ========================
+
+    /**
+     * 区间视频采集统计（startDate/endDate 含两端，规则见 数据统计.md 7.1 区间口径定稿）：
+     * <ul>
+     *   <li>expected = 参与通道数（当前快照）× 区间已结束完整窗总数（末日截断，未来日 0 窗）；</li>
+     *   <li>collected/success/failed 按留痕表 round_time ∈ [start日0点, cutoff) 聚合（与 expected 同窗界）；</li>
+     *   <li>留痕起始日（2026-09-09 部署）之前的日期无数据 → collected=0，属真实语义不补偿。</li>
+     * </ul>
+     */
+    public Map<String, Object> rangeStats(LocalDate start, LocalDate end) {
+        LocalDate today = LocalDate.now();
+        long nowMs = System.currentTimeMillis();
+        return rangeStats(start, end, today, dayStartMillis(today), nowMs);
+    }
+
+    /** 区间统计（时间参数可注入，便于测试固定“当前时刻”） */
+    Map<String, Object> rangeStats(LocalDate start, LocalDate end, LocalDate today,
+                                   long todayStartMs, long nowMs) {
+        Map<String, Object> stats = new LinkedHashMap<>();
+        stats.put("dataType", "视频数据");
+        long startMs = dayStartMillis(start);
+        long cutoffMs = rangeCutoff(end, today, todayStartMs, nowMs, windowMinutes);
+        long expected = 0;
+        long collected = 0;
+        long success = 0;
+        long failed = 0;
+        try {
+            int channelCount = countPatrolChannels();
+            long windows = totalFinishedWindows(start, end, today, todayStartMs, nowMs, windowMinutes);
+            expected = channelCount * windows;
+            String sql = "SELECT result, COUNT(*) AS cnt FROM " + PATROL_TABLE
+                    + " WHERE round_time >= ? AND round_time < ? AND channel_code IN ("
+                    + "SELECT devicecode FROM " + STATION_TABLE
+                    + " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> '')"
+                    + " GROUP BY result";
+            long[] sums = sumByResult(
+                    jdbcTemplate.queryForList(sql, new Timestamp(startMs), new Timestamp(cutoffMs)));
+            collected = sums[0];
+            success = sums[1];
+            failed = sums[2];
+        } catch (Exception e) {
+            log.error("[视频巡检] 采集统计区间查询失败: {}", e.getMessage());
+        }
+        stats.put("expected", expected);
+        stats.put("collected", collected);
+        stats.put("success", success);
+        stats.put("failed", failed);
+        stats.put("successRate", rate(success, expected));
+        stats.put("failRate", rate(failed, expected));
+        return stats;
+    }
+
+    /**
+     * 解析并校验区间参数（规则见 数据统计.md 7.1）：
+     * 都空=今日；只传 startDate=该日至今日；只传 endDate=该单日；
+     * 格式非法/startDate>endDate/超出 stats-max-range-days 上限抛 IllegalArgumentException（controller 转 fail）。
+     */
+    public LocalDate[] parseRange(String startDate, String endDate) {
+        return parseRange(startDate, endDate, LocalDate.now(), maxRangeDays);
+    }
+
+    /** 解析校验（today/maxRangeDays 可注入，便于测试） */
+    static LocalDate[] parseRange(String startDate, String endDate, LocalDate today, int maxRangeDays) {
+        boolean hasStart = startDate != null && !startDate.trim().isEmpty();
+        boolean hasEnd = endDate != null && !endDate.trim().isEmpty();
+        LocalDate start;
+        LocalDate end;
+        try {
+            if (!hasStart && !hasEnd) {
+                start = today;
+                end = today;
+            } else {
+                start = hasStart ? LocalDate.parse(startDate.trim()) : today;
+                end = hasEnd ? LocalDate.parse(endDate.trim()) : today;
+                if (!hasStart) {
+                    start = end;   // 只传 endDate → 单日
+                }
+                if (!hasEnd) {
+                    end = today;   // 只传 startDate → 至今日
+                }
+            }
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("日期格式非法，应为 yyyy-MM-dd");
+        }
+        if (start.isAfter(end)) {
+            throw new IllegalArgumentException("startDate 不能晚于 endDate");
+        }
+        if (ChronoUnit.DAYS.between(start, end) >= maxRangeDays) {
+            throw new IllegalArgumentException("查询区间超出上限 " + maxRangeDays + " 天");
+        }
+        return new LocalDate[]{start, end};
+    }
+
+    /** 按 result 三态汇总聚合行，返回 long[3]{collected, success, failed} */
+    private long[] sumByResult(List<Map<String, Object>> rows) {
+        long collected = 0;
+        long success = 0;
+        long failed = 0;
+        for (Map<String, Object> row : rows) {
+            Object r = row.get("result");
+            Object c = row.get("cnt");
+            long n = c == null ? 0 : Long.parseLong(String.valueOf(c));
+            collected += n;
+            if (RESULT_OK.equals(r)) {
+                success = n;
+            } else {
+                failed += n;
+            }
+        }
+        return new long[]{collected, success, failed};
     }
 
     /** 参与统计的视频通道数 = 站点表视频站点数（epjutj 含 #5#，按 devicecode 去重），与站点同步口径一致 */
@@ -196,6 +309,54 @@ public class VideoPatrolRecordService {
         cal.set(java.util.Calendar.SECOND, 0);
         cal.set(java.util.Calendar.MILLISECOND, 0);
         return cal.getTimeInMillis();
+    }
+
+    /** 某自然日 0 点毫秒时间戳（服务器本地时区） */
+    static long dayStartMillis(LocalDate day) {
+        return Timestamp.valueOf(day.atStartOfDay()).getTime();
+    }
+
+    /**
+     * 区间内已结束完整窗总数（O(1) 公式，不逐日循环，任意长区间安全）：
+     * <ul>
+     *   <li>start 在未来 → 0；</li>
+     *   <li>末日≤今天 → 完整历史日数 × 全天窗数 + 末日窗数（末日&lt;今天→全天窗；=今天→当前已结束窗）；</li>
+     *   <li>末日&gt;今天 → 末日按今天截断（未来日贡献 0 窗）。</li>
+     * </ul>
+     */
+    static long totalFinishedWindows(LocalDate start, LocalDate end, LocalDate today,
+                                     long todayStartMs, long nowMs, int windowMinutes) {
+        if (windowMinutes <= 0) {
+            return 0;
+        }
+        if (start.isAfter(today)) {
+            return 0;
+        }
+        long windowsPerDay = 1440L / windowMinutes;
+        LocalDate last = end.isAfter(today) ? today : end;
+        long fullDays = ChronoUnit.DAYS.between(start, last);
+        long total = fullDays * windowsPerDay;
+        if (!end.isBefore(today)) {
+            total += (nowMs - todayStartMs) / (windowMinutes * 60000L);
+        } else {
+            total += windowsPerDay;
+        }
+        return total;
+    }
+
+    /**
+     * 区间聚合 SQL 上界（与 expected 同窗界，避免 collected>expected）：
+     * 末日&lt;今天 → 末日次日 0 点；末日≥今天 → 今日已结束窗上界（=当前进行中窗起点）。
+     */
+    static long rangeCutoff(LocalDate end, LocalDate today, long todayStartMs, long nowMs, int windowMinutes) {
+        if (windowMinutes <= 0) {
+            return todayStartMs;
+        }
+        if (end.isBefore(today)) {
+            return dayStartMillis(end.plusDays(1));
+        }
+        long finished = (nowMs - todayStartMs) / (windowMinutes * 60000L);
+        return todayStartMs + finished * windowMinutes * 60000L;
     }
 
     /** 当日已结束完整窗数（进行中窗不计，同 mq「已结束完整窗」规则；windowMinutes≤0 防除零） */
