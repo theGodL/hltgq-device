@@ -10,6 +10,11 @@
 /* ===== 移动端原型规范：浅灰白底，视频区纯黑，主色紫蓝 #7B6CFF ===== */
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+/* 顶部安全区变量：env 优先（旧 iOS constant 兼容）；JS 检测 env 失灵（部分 webview 沉浸式下返回 0）时改写为兜底值 */
+:root {
+  --sat: constant(safe-area-inset-top, 0px); /* 旧 iOS 兼容 */
+  --sat: env(safe-area-inset-top, 0px);
+}
 body {
   /* 安全区：顶部由 .nav-bar 吸收（背景延伸至状态栏后），左右/底部由 body 承担 */
   padding-left: constant(safe-area-inset-left, 0px);   /* 旧 iOS 兼容 */
@@ -24,17 +29,15 @@ body {
 /* 导航栏：标题居中，左侧返回，右侧回放按钮 */
 .nav-bar {
   /* 顶部安全区：背景延伸至状态栏/刘海后方，内容区保持 44px 且避开安全区 */
-  padding-top: constant(safe-area-inset-top, 0px); /* 旧 iOS 兼容 */
-  padding-top: env(safe-area-inset-top, 0px);
-  height: calc(44px + constant(safe-area-inset-top, 0px));
-  height: calc(44px + env(safe-area-inset-top, 0px));
+  padding-top: var(--sat);
+  height: calc(44px + var(--sat));
   background: #FFFFFF; display: flex; align-items: center; justify-content: center;
   position: relative; flex-shrink: 0;
 }
 .nav-bar .back {
   position: absolute; left: 16px;
   /* 垂直居中于内容区（安全区之下），不受 nav-bar 顶部 padding 影响 */
-  top: constant(safe-area-inset-top, 0px); top: env(safe-area-inset-top, 0px);
+  top: var(--sat);
   bottom: 0; margin-top: auto; margin-bottom: auto;
   display: flex; align-items: center; gap: 3px;
   height: 30px; padding: 0 12px;
@@ -48,7 +51,7 @@ body {
 .nav-bar .playback-btn {
   position: absolute; right: 16px;
   /* 垂直居中于内容区（安全区之下），固定高度避免 top/bottom 拉伸 */
-  top: constant(safe-area-inset-top, 0px); top: env(safe-area-inset-top, 0px);
+  top: var(--sat);
   bottom: 0; margin-top: auto; margin-bottom: auto;
   display: flex; align-items: center;
   height: 30px; padding: 0 10px;
@@ -130,6 +133,25 @@ body {
   border-radius: 8px; z-index: 99; display: none; max-width: 80%;
 }
 </style>
+<script>
+/* 顶部安全区兜底：部分 webview/浏览器沉浸式全屏下页面延伸到状态栏后，但 env(safe-area-inset-top)
+   返回 0（内核未上报挖孔/刘海安全区），导致导航栏被状态栏或前置摄像头遮挡。
+   探测到该情况时按平台常识值补偿（iOS 44px / Android 32px）；env 正常时不做任何事。 */
+(function () {
+  try {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top,0px);';
+    document.documentElement.appendChild(d);
+    var envTop = parseFloat(getComputedStyle(d).paddingTop) || 0;
+    d.parentNode.removeChild(d);
+    if (envTop > 0) return;                                /* env 生效，CSS 已处理 */
+    var ua = navigator.userAgent;
+    if (!/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return;
+    if (window.innerHeight < screen.height - 60) return;   /* 视口未顶到屏幕顶（普通浏览器），无遮挡风险 */
+    document.documentElement.style.setProperty('--sat', /iPhone|iPad|iPod/i.test(ua) ? '44px' : '32px');
+  } catch (e) { /* 探测失败则保持 CSS env 原值 */ }
+})();
+</script>
 </head>
 <body>
 <div class="nav-bar">
