@@ -20,6 +20,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -62,13 +63,14 @@ class StationStatusSyncServiceTest {
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
     }
 
-    /** 在线通道节点 */
+    /** 在线通道节点（cameraType=球机，供通道信息缓存用例断言） */
     private DahuaDeviceService.DeviceTreeNode onlineChannel() {
         DahuaDeviceService.DeviceTreeNode node = new DahuaDeviceService.DeviceTreeNode();
         node.setId(DEVICECODE);
         node.setName(CHANNEL_NAME);
         node.setNodeType("ch");
         node.setIsOnline(1);
+        node.setCameraType(2);
         return node;
     }
 
@@ -349,5 +351,79 @@ class StationStatusSyncServiceTest {
         // 设备安装位置同源：管理所-通道名，按 devicecode 精确匹配
         verify(deviceTableService).updateDeviceLocation(org.mockito.ArgumentMatchers.eq(DEVICECODE),
                 org.mockito.ArgumentMatchers.eq(LOCATION));
+    }
+
+    // ==================== 通道信息缓存与查询（/channel-info 支撑） ====================
+
+    /** 设备树遍历成功 → 通道信息进入缓存；findChannel 命中缓存直接返回（不再触达设备树） */
+    @Test
+    void collectChannelsRefreshesCacheAndFindChannelHits() {
+        mockThreeLevelTree();
+
+        List<StationStatusSyncService.VideoChannel> channels = service.collectVideoChannels();
+
+        assertNotNull(channels, "遍历成功应返回通道列表");
+        assertEquals(1, channels.size());
+        // 缓存命中：返回设备树中的通道信息（含 cameraType）
+        StationStatusSyncService.VideoChannel found = service.findChannel(DEVICECODE);
+        assertNotNull(found, "findChannel 应命中缓存");
+        assertEquals(CHANNEL_NAME, found.getName());
+        assertEquals(2, found.getCameraType(), "cameraType 应从设备树收集");
+        assertTrue(found.isOnline());
+        // 命中缓存不触发设备树遍历：全部调用次数 = collect 遍历的 3 层（001→管理所→位置节点）
+        verify(deviceService, times(3)).getDeviceTreeWithStatus(anyString());
+    }
+
+    /** 缓存未命中（启动后首轮同步完成前）→ findChannel 实时遍历设备树兜底 */
+    @Test
+    void findChannelRealtimeTraversalOnCacheMiss() {
+        mockThreeLevelTree();
+
+        StationStatusSyncService.VideoChannel found = service.findChannel(DEVICECODE);
+
+        assertNotNull(found, "缓存未命中应实时遍历查得通道");
+        assertEquals(DEVICECODE, found.getDevicecode());
+        assertEquals(2, found.getCameraType());
+        assertEquals(CHANNEL_NAME, found.getName());
+        // 实时遍历 3 层
+        verify(deviceService, times(3)).getDeviceTreeWithStatus(anyString());
+    }
+
+    /** 设备树中不存在该通道 → findChannel 返回 null（前端提示"未找到该通道信息"）；空白入参直接返回 null */
+    @Test
+    void findChannelReturnsNullWhenAbsent() {
+        when(deviceService.getDeviceTreeWithStatus(anyString())).thenReturn(
+                DahuaDeviceService.DeviceTreeResult.success(Collections.emptyList()));
+
+        assertNull(service.findChannel("no-such-channel"), "不存在的通道应返回 null");
+        assertNull(service.findChannel("  "), "空白 channelId 应直接返回 null");
+    }
+
+    // ==================== 站点ID查询（/channel-info 响应含 siteId） ====================
+
+    /** findSiteId：按 devicecode 实时查站点表，SQL 必须限定视频站点类型（防命中同 devicecode 的闸门/水质站点） */
+    @Test
+    void findSiteIdQueriesVideoStationOnly() {
+        when(jdbcTemplate.queryForList(anyString(), org.mockito.ArgumentMatchers.eq(String.class), anyString()))
+                .thenReturn(Collections.singletonList("site-001"));
+
+        assertEquals("site-001", service.findSiteId(DEVICECODE), "应返回站点表主键 id");
+
+        org.mockito.ArgumentCaptor<String> sqlCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(),
+                org.mockito.ArgumentMatchers.eq(String.class),
+                org.mockito.ArgumentMatchers.eq(DEVICECODE));
+        assertTrue(sqlCaptor.getValue().contains("epjutj LIKE '%#5#%'"),
+                "站点ID查询必须限定视频站点类型，实际 SQL：" + sqlCaptor.getValue());
+    }
+
+    /** findSiteId：无对应站点返回 null（不阻断接口，响应中 siteId 可为空）；空白入参直接返回 null（不查库） */
+    @Test
+    void findSiteIdReturnsNullWhenAbsent() {
+        when(jdbcTemplate.queryForList(anyString(), org.mockito.ArgumentMatchers.eq(String.class), anyString()))
+                .thenReturn(new ArrayList<>());
+
+        assertNull(service.findSiteId(DEVICECODE), "无对应站点应返回 null");
+        assertNull(service.findSiteId("  "), "空白 devicecode 应直接返回 null");
     }
 }

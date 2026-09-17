@@ -8,8 +8,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import javax.annotation.Resource;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * 角色权限服务：判定当前用户是否为系统管理员（云台操作等敏感权限）。
@@ -18,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>本地缓存 5 分钟（避免每请求访问 Redis/库）；</li>
  *   <li>Redis 角色缓存（平台维护，TTL 30m）：
  *       LRANGE qx.auth.hltgq.user.{userId} 取 roleId 列表，
- *       逐个 HGET qx.auth.hltgq.role.{roleId} 的 code 字段比对 hltgq_default_admin；</li>
+ *       逐个 HGET qx.auth.hltgq.role.{roleId} 的 code 字段比对管理员角色编码（hltgq_default_admin / administra）；</li>
  *   <li>Redis 未明确命中管理员角色/异常 → 直连库查角色指派关系兜底（JdbcTemplate），
  *       保证判定与库数据一致（角色刚指派缓存未刷新、缓存值带 JSON 引号等场景不误判）。</li>
  * </ol>
@@ -29,8 +31,13 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class RolePermissionService {
 
-    /** 系统管理员角色编码：{corpCode}_default_admin（hltgq 场景） */
-    private static final String ADMIN_ROLE_CODE = "hltgq_default_admin";
+    /** 系统管理员角色编码集合：{corpCode}_default_admin（hltgq 场景）与平台 administra 角色，命中其一即为管理员 */
+    private static final List<String> ADMIN_ROLE_CODES = Arrays.asList("hltgq_default_admin", "administra");
+
+    /** 查库 SQL 的管理员角色 IN 列表（'a','b' 形式；编码为代码内常量，无注入风险） */
+    private static final String ADMIN_ROLE_SQL_IN = ADMIN_ROLE_CODES.stream()
+            .map(code -> "'" + code + "'")
+            .collect(Collectors.joining(","));
 
     /** 角色缓存中"无角色"占位值 */
     private static final String NO_ROLE_PLACEHOLDER = "0";
@@ -53,7 +60,7 @@ public class RolePermissionService {
     private final ConcurrentHashMap<String, CachedEntry> localCache = new ConcurrentHashMap<>();
 
     /**
-     * 判定用户是否为系统管理员：平台超管（会话 Hash 的 superAdmin=true/1）或拥有 hltgq_default_admin 角色。
+     * 判定用户是否为系统管理员：平台超管（会话 Hash 的 superAdmin=true/1）或拥有管理员角色（hltgq_default_admin / administra）。
      * <p>与 hltgq-site 前端判定（superAdmin）行为对齐：平台超管即使未绑定角色也可操作；
      * 非超管账号仍走角色判定链路（Redis 角色缓存 + 查库兜底）。
      */
@@ -70,7 +77,7 @@ public class RolePermissionService {
     }
 
     /**
-     * 判定用户是否为系统管理员（拥有 hltgq_default_admin 角色）
+     * 判定用户是否为系统管理员（拥有管理员角色：hltgq_default_admin / administra）
      *
      * @param userId 用户主键（t_apaas_uc_user.id）
      * @return true = 系统管理员
@@ -106,8 +113,12 @@ public class RolePermissionService {
                         continue;
                     }
                     Object codeValue = stringRedisTemplate.opsForHash().get(roleCacheKeyPrefix + "role." + roleId, "code");
-                    if (codeValue != null && ADMIN_ROLE_CODE.equals(stripQuotes(String.valueOf(codeValue)))) {
-                        return true;
+                    if (codeValue != null) {
+                        String code = stripQuotes(String.valueOf(codeValue));
+                        if (ADMIN_ROLE_CODES.contains(code)) {
+                            log.info("角色判定 userId={} Redis 命中管理员角色 code={}", userId, code);
+                            return true;
+                        }
                     }
                 }
             }
@@ -120,23 +131,28 @@ public class RolePermissionService {
     }
 
     /**
-     * 查库兜底：直接指派（field_id='USER'）的角色中含 hltgq_default_admin 即管理员，
+     * 查库兜底：直接指派（field_id='USER'）的角色中含管理员角色编码（hltgq_default_admin / administra）即管理员，
      * 黑名单（field_id='BLACK_LIST'）指向该角色时剔除（与 hltgq-site RoleMapper SQL 一致）。
+     * <p>查具体 code 而非计数：命中时可输出实际角色编码，供联调核对。
      */
     private boolean existsAdminRoleInDb(String userId) {
-        String sql = "SELECT COUNT(*) FROM \"qixiao-apaas\".\"t_apaas_auth_role_assign_rel\" rel " +
+        String sql = "SELECT r.code FROM \"qixiao-apaas\".\"t_apaas_auth_role_assign_rel\" rel " +
                 "JOIN \"qixiao-apaas\".\"t_apaas_auth_role\" r " +
                 "  ON rel.biz_id = r.id AND r.corp_code = 'hltgq' " +
                 "WHERE rel.rel_id = ? " +
                 "  AND rel.corp_code = 'hltgq' " +
                 "  AND rel.field_id = 'USER' " +
-                "  AND r.code = 'hltgq_default_admin' " +
+                "  AND r.code IN (" + ADMIN_ROLE_SQL_IN + ") " +
                 "  AND NOT EXISTS ( " +
                 "    SELECT 1 FROM \"qixiao-apaas\".\"t_apaas_auth_role_assign_rel\" bl " +
                 "    WHERE bl.rel_id = ? AND bl.field_id = 'BLACK_LIST' AND bl.biz_id = r.id " +
                 "  )";
-        Integer count = jdbcTemplate.queryForObject(sql, Integer.class, userId, userId);
-        return count != null && count > 0;
+        List<String> codes = jdbcTemplate.queryForList(sql, String.class, userId, userId);
+        if (codes != null && !codes.isEmpty()) {
+            log.info("角色判定 userId={} 查库兜底命中管理员角色 code={}", userId, codes);
+            return true;
+        }
+        return false;
     }
 
     /**

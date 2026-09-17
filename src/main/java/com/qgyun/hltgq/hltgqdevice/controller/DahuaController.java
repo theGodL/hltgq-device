@@ -13,6 +13,7 @@ import com.qgyun.hltgq.hltgqdevice.service.DahuaPtzService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaRecordService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaVideoService;
 import com.qgyun.hltgq.hltgqdevice.service.PtzCommandDispatcher;
+import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import com.qgyun.hltgq.hltgqdevice.videoalert.AlertQueryService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
@@ -59,6 +60,9 @@ public class DahuaController {
     @Resource
     private AlertQueryService alertQueryService;
 
+    @Resource
+    private StationStatusSyncService stationSyncService;
+
     // ==================== 设备树 ====================
 
     /**
@@ -78,6 +82,41 @@ public class DahuaController {
         } catch (Exception e) {
             log.error("设备树查询接口异常：", e);
             return ApiResponse.fail("设备树查询失败：" + e.getMessage());
+        }
+    }
+
+    // ==================== 通道信息 ====================
+
+    /**
+     * 查询单个通道的设备信息（名称/摄像头类型/在线状态/关联站点ID）
+     * <p>
+     * 前端调用：GET /api/dahua/channel-info?channelId=xxx
+     * 供弹窗页仅携带 channelId 时自动补全（cameraType 决定云台条显隐预判）；
+     * 数据源：站点同步设备树遍历结果的内存缓存（未命中时实时遍历兜底），siteId 实时查站点表。
+     *
+     * @param channelId 通道ID（设备编码$通道序，必填）
+     * @return {channelId, siteId, name, cameraType, online}
+     */
+    @GetMapping("/channel-info")
+    public ApiResponse<Map<String, Object>> getChannelInfo(@RequestParam String channelId) {
+        try {
+            if (channelId == null || channelId.trim().isEmpty()) {
+                return ApiResponse.fail("通道ID不能为空");
+            }
+            StationStatusSyncService.VideoChannel channel = stationSyncService.findChannel(channelId);
+            if (channel == null) {
+                return ApiResponse.fail("未找到该通道信息");
+            }
+            Map<String, Object> data = new HashMap<>();
+            data.put("channelId", channel.getDevicecode());
+            data.put("siteId", stationSyncService.findSiteId(channel.getDevicecode()));
+            data.put("name", channel.getName());
+            data.put("cameraType", channel.getCameraType() == null ? 1 : channel.getCameraType());
+            data.put("online", channel.isOnline());
+            return ApiResponse.success(data);
+        } catch (Exception e) {
+            log.error("查询通道信息接口异常：", e);
+            return ApiResponse.fail("查询通道信息失败：" + e.getMessage());
         }
     }
 
@@ -374,7 +413,7 @@ public class DahuaController {
         Map<String, Object> data = new HashMap<>();
         try {
             UserContext user = sessionContextService.resolveCurrentUser(request);
-            // 平台超管（superAdmin）或绑定 hltgq_default_admin 角色的用户均视为系统管理员
+            // 平台超管（superAdmin）或绑定管理员角色（hltgq_default_admin / administra）的用户均视为系统管理员
             boolean isAdmin = rolePermissionService.isAdmin(user);
             data.put("userId", user.getUserId());
             data.put("isAdmin", isAdmin);

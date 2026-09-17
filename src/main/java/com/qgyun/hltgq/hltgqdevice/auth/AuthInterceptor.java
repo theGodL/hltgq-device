@@ -116,7 +116,7 @@ public class AuthInterceptor implements HandlerInterceptor {
         }
         String userId = user == null ? null : user.getUserId();
         try {
-            // 平台超管（superAdmin）或绑定 hltgq_default_admin 角色的用户均可操作
+            // 平台超管（superAdmin）或绑定管理员角色（hltgq_default_admin / administra）的用户均可操作
             if (rolePermissionService.isAdmin(user)) {
                 return true;
             }

@@ -80,6 +80,13 @@ public class StationStatusSyncService {
     private final AtomicBoolean syncRunning = new AtomicBoolean(false);
 
     /**
+     * 通道信息内存缓存：devicecode → VideoChannel。
+     * 设备树整轮遍历成功后整体替换（volatile 写不可变 Map，读侧无锁、读到的必为完整快照），
+     * 供 /channel-info 接口 O(1) 查询通道名/cameraType/在线状态（弹窗页只传 channelId 的自动补全场景）。
+     */
+    private volatile Map<String, VideoChannel> channelCache = Collections.emptyMap();
+
+    /**
      * 启动时立即同步一次站点与视频设备（异步执行，不阻塞启动）：
      * 部署后无需等整点即可完成站点入库/状态对齐与设备联动（数据库/ICC 不可达时内部容错跳过）。
      * 依赖注入保证 DeviceTableService 已完成列元数据加载与历史迁移（依赖 bean 初始化先于本 bean）。
@@ -117,6 +124,11 @@ public class StationStatusSyncService {
             collectChannels("001", null, channels, 0, traversalFailed);
             log.info("[站点同步] ICC设备树遍历完成，共{}个视频通道，遍历失败={}",
                     channels.size(), traversalFailed.get());
+
+            // 遍历完整时整体刷新通道信息缓存（不完整保留旧快照，防部分通道"消失"）
+            if (!traversalFailed.get()) {
+                refreshChannelCache(channels);
+            }
 
             // 2. 加载站点表现有数据：devicecode → zebpsu + 全部站点名称（失败返回null，代表数据库不可达）
             ExistingStations existing = loadExistingStations();
@@ -194,7 +206,75 @@ public class StationStatusSyncService {
             log.warn("[视频告警] ICC设备树遍历存在失败节点，通道数据不完整，返回null");
             return null;
         }
+        // 遍历完整时整体刷新通道信息缓存（/channel-info 查询用）
+        refreshChannelCache(channels);
         return channels;
+    }
+
+    /**
+     * 整体刷新通道信息缓存（设备树整轮遍历成功后调用；volatile 替换不可变 Map，读侧无锁）。
+     * 同轮重复通道（多组织共享设备）先到先得，与站点同步 processedCodes 去重语义一致。
+     */
+    private void refreshChannelCache(List<VideoChannel> channels) {
+        Map<String, VideoChannel> snapshot = new HashMap<>();
+        for (VideoChannel ch : channels) {
+            snapshot.putIfAbsent(ch.devicecode, ch);
+        }
+        channelCache = Collections.unmodifiableMap(snapshot);
+    }
+
+    /**
+     * 按通道编码查询通道信息（名称/摄像头类型/在线状态），供弹窗页仅传 channelId 时自动补全
+     * （cameraType 决定云台条显隐预判）。
+     * 优先内存缓存（整点同步与告警轮巡遍历后刷新）；未命中（如启动后首轮同步完成前）
+     * 实时递归遍历一次兜底；仍找不到返回 null。
+     */
+    public VideoChannel findChannel(String channelId) {
+        if (channelId == null || channelId.trim().isEmpty()) {
+            return null;
+        }
+        String key = channelId.trim();
+        VideoChannel cached = channelCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
+        log.info("[通道查询] 缓存未命中，实时遍历设备树：channelId={}", key);
+        List<VideoChannel> channels = new ArrayList<>();
+        AtomicBoolean failed = new AtomicBoolean(false);
+        collectChannels("001", null, channels, 0, failed);
+        if (failed.get()) {
+            log.warn("[通道查询] 实时遍历存在失败节点，结果可能不完整：channelId={}", key);
+        }
+        for (VideoChannel ch : channels) {
+            if (key.equals(ch.devicecode)) {
+                return ch;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 按通道编码查询视频站点 ID（站点表主键 id），供 /channel-info 响应引用（弹窗宿主关联站点用）。
+     * 单条索引查询实时查库（毫秒级），无需缓存；站点表存在与视频通道同 devicecode 的其他类型站点
+     * （闸门/水质等，参见 loadExistingStations 注释），限定 epjutj 含 #5# 视频站点。
+     *
+     * @param devicecode 通道编码（= 站点表 devicecode）
+     * @return 站点 ID；无对应站点或数据库不可达时返回 null
+     */
+    public String findSiteId(String devicecode) {
+        if (devicecode == null || devicecode.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            List<String> ids = jdbcTemplate.queryForList(
+                    "SELECT id FROM " + STATION_TABLE +
+                            " WHERE devicecode = ? AND epjutj LIKE '%#5#%' LIMIT 1",
+                    String.class, devicecode.trim());
+            return (ids == null || ids.isEmpty()) ? null : ids.get(0);
+        } catch (Exception e) {
+            log.error("[通道查询] 站点ID查询失败: devicecode={}", devicecode, e);
+            return null;
+        }
     }
 
     /**
@@ -255,7 +335,7 @@ public class StationStatusSyncService {
                 // 若用 checkStat==1 || isOnline==1 会把所有设备误判为在线（实测离线设备checkStat=1,isOnline=0）
                 boolean online = Integer.valueOf(1).equals(node.getIsOnline());
                 // 通道位置=管理所-通道名（NVR/位置节点层级不进入位置）
-                out.add(new VideoChannel(code, name, currentOrg, online));
+                out.add(new VideoChannel(code, name, currentOrg, online, node.getCameraType()));
             } else if (Boolean.TRUE.equals(node.getIsParent())
                     && node.getId() != null && !node.getId().trim().isEmpty()) {
                 // 有子节点的组织/设备：继续递归（id为空时跳过，防止误查根节点001）
@@ -581,12 +661,15 @@ public class StationStatusSyncService {
         private final String orgName;
         /** 是否在线 → zebpsu */
         private final boolean online;
+        /** 摄像头类型：1=枪机 2=球机 3=半球 4=云台（弹窗页云台条显隐预判） */
+        private final Integer cameraType;
 
-        VideoChannel(String devicecode, String name, String orgName, boolean online) {
+        VideoChannel(String devicecode, String name, String orgName, boolean online, Integer cameraType) {
             this.devicecode = devicecode;
             this.name = name;
             this.orgName = orgName;
             this.online = online;
+            this.cameraType = cameraType;
         }
 
         public String getDevicecode() {
@@ -603,6 +686,10 @@ public class StationStatusSyncService {
 
         public boolean isOnline() {
             return online;
+        }
+
+        public Integer getCameraType() {
+            return cameraType;
         }
     }
 }
