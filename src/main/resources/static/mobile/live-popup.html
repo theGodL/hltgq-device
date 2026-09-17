@@ -7,17 +7,21 @@
 <!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265)，与PC端一致 -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 <style>
-/* ===== 弹窗嵌入版监控页（供宿主弹窗以 iframe 引入，自适应容器宽高）=====
+/* ===== 轻量实时监控页（页面跳转集成：前端从列表/地图页整页跳入，自适应视口宽高）=====
    与 mobile/live.html 同源同风格，差异三点：
-   1. 无导航栏（返回/回放由宿主弹窗承担），视频区直接置顶撑满；
-   2. 不做顶部安全区处理（iframe 内 env() 恒为 0，且 iframe 不可能延伸到宿主状态栏后，
-      顶部遮挡由宿主页面负责；若在此处补偿反而可能误顶出一条空白）；
-   3. 云台按钮同时支持触摸与鼠标按压（弹窗可能嵌在 PC 页面）。
+   1. 导航栏仅「返回 + 标题」（无回放按钮，不做回放入口），返回按钮与 live.html 完全同款；
+   2. 参数极简接入：仅传 channelId，缺失参数自动调 /channel-info 补全（live.html 由跳转方传齐）；
+   3. 云台按钮同时支持触摸与鼠标按压（页面跳转场景可能从 PC 端进入）。
    视觉规范同现有页面：浅灰白底，视频区纯黑，主色紫蓝 #7B6CFF */
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { height: 100%; background: #F5F6FA; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+/* 顶部安全区变量：env 优先（旧 iOS constant 兼容）；JS 检测 env 失灵（部分 webview 沉浸式下返回 0）时改写为兜底值 */
+:root {
+  --sat: constant(safe-area-inset-top, 0px); /* 旧 iOS 兼容 */
+  --sat: env(safe-area-inset-top, 0px);
+}
 body {
-  /* 左右/底部安全区：iframe 内恒为 0 无影响；独立直开（调试）时兜底 */
+  /* 安全区：顶部由 .nav-bar 吸收（背景延伸至状态栏后），左右/底部由 body 承担 */
   padding-left: constant(safe-area-inset-left, 0px);   /* 旧 iOS 兼容 */
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: constant(safe-area-inset-right, 0px);
@@ -27,7 +31,7 @@ body {
   display: flex; flex-direction: column; overflow: hidden;
 }
 
-/* 视频区：撑满剩余空间（无导航栏，直接置顶） */
+/* 视频区：撑满剩余空间（导航栏下方自动撑满） */
 .video-area {
   width: 100%; flex: 1; min-height: 0; background: #000000; position: relative;
   display: flex; align-items: center; justify-content: center;
@@ -59,6 +63,29 @@ body {
   color: #FFF; font-size: 13px; text-align: center; padding: 6px 12px; display: none;
 }
 
+/* 导航栏：标题居中，左侧返回（与 live.html 同款；轻量页无回放入口） */
+.nav-bar {
+  /* 顶部安全区：背景延伸至状态栏/刘海后方，内容区保持 44px 且避开安全区 */
+  padding-top: var(--sat);
+  height: calc(44px + var(--sat));
+  background: #FFFFFF; display: flex; align-items: center; justify-content: center;
+  position: relative; flex-shrink: 0;
+}
+.nav-bar .back {
+  position: absolute; left: 16px;
+  /* 垂直居中于内容区（安全区之下），不受 nav-bar 顶部 padding 影响 */
+  top: var(--sat);
+  bottom: 0; margin-top: auto; margin-bottom: auto;
+  display: flex; align-items: center; gap: 3px;
+  height: 30px; padding: 0 12px;
+  border: none; border-radius: 9999px;
+  background: #F2F3F5; color: #333333;
+  font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: background 0.15s ease;
+}
+.nav-bar .back:active { background: #E5E6E8; }
+.nav-title { font-size: 17px; font-weight: 600; color: #1F1F1F; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 /* AI 检测状态栏（视频区下方，控制条上方） */
 .ai-bar {
   height: 44px; margin: 10px 16px 0; background: #F6FFED; border-radius: 8px;
@@ -74,7 +101,6 @@ body {
   display: flex; align-items: center; justify-content: center; gap: 12px;
   padding: 12px 16px 4px; background: #FFFFFF; flex-shrink: 0;
 }
-.ptz-bar.disabled { opacity: 0.45; pointer-events: none; }
 .ptz-btn {
   width: 46px; height: 46px; border-radius: 10px; border: 1px solid #E5E6EB;
   background: #F5F6FA; font-size: 18px; color: #8C8C8C; cursor: pointer; padding: 0;
@@ -88,9 +114,6 @@ body {
   background: #F5F6FA; font-size: 15px; color: #FF4D4F; cursor: pointer; padding: 0;
   display: flex; align-items: center; justify-content: center; margin-left: 4px;
 }
-/* 云台权限/能力提示 */
-.ptz-tip { text-align: center; font-size: 12px; color: #999; padding: 6px 0 10px; background: #FFFFFF; display: none; flex-shrink: 0; }
-.ptz-tip.locked { color: #FF4D4F; display: block; }
 
 /* toast */
 .toast {
@@ -99,8 +122,31 @@ body {
   border-radius: 8px; z-index: 99; display: none; max-width: 80%;
 }
 </style>
+<script>
+/* 顶部安全区兜底（与 live.html 同款）：部分 webview/浏览器沉浸式全屏下页面延伸到状态栏后，
+   但 env(safe-area-inset-top) 返回 0（内核未上报挖孔/刘海安全区），导致导航栏被状态栏
+   或前置摄像头遮挡。探测到该情况时按平台常识值补偿（iOS 44px / Android 32px）；env 正常时不做任何事。 */
+(function () {
+  try {
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;padding-top:env(safe-area-inset-top,0px);';
+    document.documentElement.appendChild(d);
+    var envTop = parseFloat(getComputedStyle(d).paddingTop) || 0;
+    d.parentNode.removeChild(d);
+    if (envTop > 0) return;                                /* env 生效，CSS 已处理 */
+    var ua = navigator.userAgent;
+    if (!/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return;
+    if (window.innerHeight < screen.height - 60) return;   /* 视口未顶到屏幕顶（普通浏览器），无遮挡风险 */
+    document.documentElement.style.setProperty('--sat', /iPhone|iPad|iPod/i.test(ua) ? '44px' : '32px');
+  } catch (e) { /* 探测失败则保持 CSS env 原值 */ }
+})();
+</script>
 </head>
 <body>
+<div class="nav-bar">
+  <button class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>返回</button>
+  <span class="nav-title" id="navTitle">实时监控</span>
+</div>
 
 <div class="video-area" id="videoArea">
   <div class="video-placeholder" id="videoPlaceholder">
@@ -114,15 +160,14 @@ body {
 
 <div class="ai-bar" id="aiBar"><span class="bulb">💡</span><span id="aiText">当前画面未检测到异常</span></div>
 
-<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止），无权限时整体隐藏；无云台能力时置灰（与 PC 端一致） -->
-<div class="ptz-bar disabled" id="ptzBar" style="display:none">
+<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止）；没有控制权限的不展示——非管理员或设备不支持云台时整体隐藏 -->
+<div class="ptz-bar" id="ptzBar" style="display:none">
   <button class="ptz-btn" data-dir="left">◀</button>
   <button class="ptz-btn" data-dir="up">▲</button>
   <button class="ptz-btn" data-dir="down">▼</button>
   <button class="ptz-btn" data-dir="right">▶</button>
   <button class="ptz-stop" id="ptzCenter">■</button>
 </div>
-<div class="ptz-tip" id="ptzTip"></div>
 
 <div class="toast" id="toast"></div>
 
@@ -132,6 +177,8 @@ body {
 // 浏览器侧所有绝对路径需动态补前缀；直连部署（无前缀）自动不补，两种部署方式通用
 const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
 const API_BASE = APP_BASE + '/api/dahua';
+/** 页面跳转/静态资源绝对路径补前缀 */
+function appUrl(path) { return APP_BASE + path; }
 /** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
 function proxyUrl(path) {
   if (!path) return path;
@@ -292,35 +339,15 @@ function destroyPlayer() {
 
 // ==================== 云台控制（与 PC 端同一权限语义：仅系统管理员） ====================
 /**
- * 更新云台控制条状态（与 PC 端同一策略，三态）：
- * ① 无云台操作权限（非系统管理员）→ 整个云台条隐藏（不展示任何提示，与 PC 端一致）；
- * ② 有权限但设备不支持云台（固定枪机）→ 显示但灰显并提示；
- * ③ 正常 → 启用。
- * 初始 HTML 为隐藏态，权限查询返回后才可能显示（非管理员全程不可见）。
+ * 更新云台控制条状态：没有控制权限的不展示——
+ * ① 非系统管理员（无云台操作权限）→ 整体隐藏；
+ * ② 设备不支持云台（固定枪机）→ 同样整体隐藏，不展示灰显条与提示；
+ * 管理员 + 云台设备 → 启用。
+ * 初始 HTML 为隐藏态，权限/通道查询返回后才可能显示。
  */
 function updatePtzState() {
   const bar = document.getElementById('ptzBar');
-  const tip = document.getElementById('ptzTip');
-  if (!userIsAdmin) {
-    // 无云台操作权限（仅系统管理员）：与 PC 端一致——整个云台条直接隐藏
-    bar.style.display = 'none';
-    tip.classList.remove('locked');
-    tip.style.display = 'none';
-    return;
-  }
-  bar.style.display = '';
-  if (!hasPtz) {
-    // 有权限但通道不支持云台（固定枪机）：显示但灰显（与 PC 端一致）
-    bar.classList.add('disabled');
-    tip.textContent = '当前设备不支持云台控制';
-    tip.classList.add('locked');
-    tip.style.display = '';
-    return;
-  }
-  bar.classList.remove('disabled');
-  tip.textContent = '';
-  tip.classList.remove('locked');
-  tip.style.display = '';
+  bar.style.display = (userIsAdmin && hasPtz) ? '' : 'none';
 }
 
 /**
@@ -401,7 +428,7 @@ async function ptzStop() {
 }
 
 /**
- * 按压绑定：触摸 + 鼠标双支持（本页面被弹窗嵌入，宿主可能是 PC 页面）。
+ * 按压绑定：触摸 + 鼠标双支持（页面跳转场景可能从 PC 端进入，需支持鼠标按压）。
  * 触屏浏览器 touchstart preventDefault 会阻止后续模拟鼠标事件，天然防重；
  * 再加 500ms 时间戳保险，防个别 webview 双触发。
  */
@@ -421,7 +448,7 @@ function bindPtzButton(btn) {
     pressUp();
   }, { passive: false });
   btn.addEventListener('touchcancel', () => pressUp());
-  // 鼠标：PC 弹窗场景
+  // 鼠标：PC 端跳转进入的场景
   btn.addEventListener('mousedown', (e) => {
     if (lastTouchTs > 0 && e.timeStamp - lastTouchTs < 500) return;  // 触摸后模拟鼠标事件防重（lastTouchTs>0 防页面刚加载时误判）
     e.preventDefault();          // 防文本选择/拖拽
@@ -472,7 +499,7 @@ async function loadCurrentUserPermission() {
 }
 
 /**
- * 通道信息自动补全：宿主未传齐 name/cameraType/siteId（如仅传 channelId 或只带部分）时，
+ * 通道信息自动补全：URL 未传齐 name/cameraType/siteId（如仅传 channelId 或只带部分）时，
  * 调 /channel-info 取权威设备信息——cameraType 决定云台条显隐预判，name 兜底 title，
  * siteId 兜底站点上下文（站点表主键，供后续站点数据展示用）。
  * 三个可选参数都携带时才跳过查询（零额外请求）；带不全时查询补齐缺失项。
@@ -485,6 +512,7 @@ async function loadChannelInfo() {
       if (!params.get('name') && json.data.name) {
         channelName = json.data.name;
         document.title = channelName;
+        document.getElementById('navTitle').textContent = channelName;
       }
       if (!params.get('siteId') && json.data.siteId) {
         siteId = json.data.siteId;
@@ -503,7 +531,9 @@ async function loadChannelInfo() {
 }
 
 function init() {
+  document.getElementById('navTitle').textContent = channelName;
   document.title = channelName;
+  // 导航栏返回按钮为行内 onclick（任意时刻可点，缺参页也可返回），无需 JS 绑定
   if (!channelId) {
     showVideoError('缺少 channelId 参数');
     return;
@@ -562,7 +592,7 @@ function init() {
     destroyPlayer();
   });
 
-  updatePtzState();          // 初始按无权限隐藏/无云台能力灰显
+  updatePtzState();          // 初始按无权限/无云台能力全部隐藏
   loadCurrentUserPermission();
   loadChannelInfo();
   loadAiStatus();

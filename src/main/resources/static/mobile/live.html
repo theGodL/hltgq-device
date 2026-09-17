@@ -98,7 +98,6 @@ body {
   display: flex; align-items: center; justify-content: center; gap: 12px;
   padding: 12px 16px 4px; background: #FFFFFF; flex-shrink: 0;
 }
-.ptz-bar.disabled { opacity: 0.45; pointer-events: none; }
 .ptz-btn {
   width: 46px; height: 46px; border-radius: 10px; border: 1px solid #E5E6EB;
   background: #F5F6FA; font-size: 18px; color: #8C8C8C; cursor: pointer; padding: 0;
@@ -112,9 +111,6 @@ body {
   background: #F5F6FA; font-size: 15px; color: #FF4D4F; cursor: pointer; padding: 0;
   display: flex; align-items: center; justify-content: center; margin-left: 4px;
 }
-/* 云台权限提示 */
-.ptz-tip { text-align: center; font-size: 12px; color: #999; padding: 6px 0 10px; background: #FFFFFF; display: none; flex-shrink: 0; }
-.ptz-tip.locked { color: #FF4D4F; display: block; }
 
 /* AI 检测状态栏（视频区下方，控制条上方） */
 .ai-bar {
@@ -172,16 +168,14 @@ body {
 
 <div class="ai-bar" id="aiBar"><span class="bulb">💡</span><span id="aiText">当前画面未检测到异常</span></div>
 
-<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止），无权限时整体隐藏；无云台能力时置灰（与 PC 端一致） -->
-<div class="ptz-bar disabled" id="ptzBar" style="display:none">
+<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止）；没有控制权限的不展示——非管理员或设备不支持云台时整体隐藏 -->
+<div class="ptz-bar" id="ptzBar" style="display:none">
   <button class="ptz-btn" data-dir="left">◀</button>
   <button class="ptz-btn" data-dir="up">▲</button>
   <button class="ptz-btn" data-dir="down">▼</button>
   <button class="ptz-btn" data-dir="right">▶</button>
   <button class="ptz-stop" id="ptzCenter">■</button>
 </div>
-<div class="ptz-tip" id="ptzTip"></div>
-
 <div class="toast" id="toast"></div>
 
 <script>
@@ -351,35 +345,15 @@ function destroyPlayer() {
 
 // ==================== 云台控制（与 PC 端同一权限语义：仅系统管理员） ====================
 /**
- * 更新云台控制条状态（与 PC 端同一策略，三态）：
- * ① 无云台操作权限（非系统管理员）→ 整个云台条隐藏（不展示任何提示，与 PC 端一致）；
- * ② 有权限但设备不支持云台（固定枪机）→ 显示但灰显并提示；
- * ③ 正常 → 启用。
- * 初始 HTML 为隐藏态，权限查询返回后才可能显示（非管理员全程不可见）。
+ * 更新云台控制条状态：没有控制权限的不展示——
+ * ① 非系统管理员（无云台操作权限）→ 整体隐藏；
+ * ② 设备不支持云台（固定枪机）→ 同样整体隐藏，不展示灰显条与提示；
+ * 管理员 + 云台设备 → 启用。
+ * 初始 HTML 为隐藏态，权限/通道查询返回后才可能显示。
  */
 function updatePtzState() {
   const bar = document.getElementById('ptzBar');
-  const tip = document.getElementById('ptzTip');
-  if (!userIsAdmin) {
-    // 无云台操作权限（仅系统管理员）：与 PC 端一致——整个云台条直接隐藏
-    bar.style.display = 'none';
-    tip.classList.remove('locked');
-    tip.style.display = 'none';
-    return;
-  }
-  bar.style.display = '';
-  if (!hasPtz) {
-    // 有权限但通道不支持云台（固定枪机）：显示但灰显（与 PC 端一致）
-    bar.classList.add('disabled');
-    tip.textContent = '当前设备不支持云台控制';
-    tip.classList.add('locked');
-    tip.style.display = '';
-    return;
-  }
-  bar.classList.remove('disabled');
-  tip.textContent = '';
-  tip.classList.remove('locked');
-  tip.style.display = '';
+  bar.style.display = (userIsAdmin && hasPtz) ? '' : 'none';
 }
 
 /** 发送方向命令（按压持续：START + 1秒心跳维持，与 PC 端官方模式一致） */
@@ -575,7 +549,7 @@ function init() {
     destroyPlayer();
   });
 
-  updatePtzState();          // 初始按无权限隐藏/无云台能力灰显
+  updatePtzState();          // 初始按无权限/无云台能力全部隐藏
   loadCurrentUserPermission();
   loadAiStatus();
   // ★ 进入页面立即加载视频（静音自动播放；被浏览器拦截时显示播放按钮兜底）
