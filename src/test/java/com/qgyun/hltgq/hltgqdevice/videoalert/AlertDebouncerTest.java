@@ -2,6 +2,7 @@ package com.qgyun.hltgq.hltgqdevice.videoalert;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -10,6 +11,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -17,7 +19,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * 防抖状态机单测：连续异常N轮告警、连续正常N轮恢复、单轮抖动不告警、
  * 正常通道未出现在映射中仍正确走恢复判定（历史告警通道不丢恢复）、
- * 未完成检测的通道计数保持不变（超时/检测异常≠恢复，不误关告警）。
+ * 未完成检测的通道计数保持不变（超时/检测异常≠恢复，不误关告警）、
+ * 时段豁免跳过判定（夜间误报治理）、恢复后抑制窗口挂起/补发/解除（防循环放大）。
  */
 class AlertDebouncerTest {
 
@@ -163,6 +166,105 @@ class AlertDebouncerTest {
         List<AlertDebouncer.FaultEvent> events = debouncer.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), null);
         assertEquals(1, events.size());
         assertEquals(AlertDebouncer.FaultEvent.Type.NEW_ALERT, events.get(0).getType());
+    }
+
+    // ==================== 时段豁免（夜间误报治理） ====================
+
+    /** 豁免故障在豁免时段内跳过判定：连续异常不告警；非豁免故障同时段内照常告警 */
+    @Test
+    void exemptFaultsSkipDebounceDuringWindow() {
+        Set<VideoFaultType> exempt = EnumSet.of(VideoFaultType.GRAYSCALE);
+        // 豁免故障连续异常2轮：跳过判定，不告警、无计数
+        assertTrue(debouncer.acceptRound(abnormal(VideoFaultType.GRAYSCALE), inspected(CHANNEL), exempt).isEmpty());
+        assertTrue(debouncer.acceptRound(abnormal(VideoFaultType.GRAYSCALE), inspected(CHANNEL), exempt).isEmpty());
+        assertTrue(debouncer.activeFaults(CHANNEL).isEmpty());
+        // 非豁免故障（取流异常）在豁免时段内照常判定：2轮异常正常告警
+        assertTrue(debouncer.acceptRound(abnormal(VideoFaultType.STREAM_ERROR), inspected(CHANNEL), exempt).isEmpty());
+        List<AlertDebouncer.FaultEvent> events =
+                debouncer.acceptRound(abnormal(VideoFaultType.STREAM_ERROR), inspected(CHANNEL), exempt);
+        assertEquals(1, events.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.NEW_ALERT, events.get(0).getType());
+        assertEquals(VideoFaultType.STREAM_ERROR, events.get(0).getFault());
+    }
+
+    /** 已告警的豁免故障在豁免时段内不误关警（计数保持），时段结束后恢复正常恢复 */
+    @Test
+    void exemptFaultKeepsAlertStateDuringWindow() {
+        // 无豁免：正常告警黑白图像
+        debouncer.acceptRound(abnormal(VideoFaultType.GRAYSCALE), inspected(CHANNEL));
+        List<AlertDebouncer.FaultEvent> events =
+                debouncer.acceptRound(abnormal(VideoFaultType.GRAYSCALE), inspected(CHANNEL));
+        assertEquals(1, events.size());
+        // 豁免生效：正常2轮不触发恢复（跳过判定，告警状态保持）
+        Set<VideoFaultType> exempt = EnumSet.of(VideoFaultType.GRAYSCALE);
+        assertTrue(debouncer.acceptRound(normal(), inspected(CHANNEL), exempt).isEmpty());
+        assertTrue(debouncer.acceptRound(normal(), inspected(CHANNEL), exempt).isEmpty());
+        assertEquals(EnumSet.of(VideoFaultType.GRAYSCALE), debouncer.activeFaults(CHANNEL));
+        // 白天（无豁免）：正常2轮正常走恢复判定
+        assertTrue(debouncer.acceptRound(normal(), inspected(CHANNEL)).isEmpty());
+        List<AlertDebouncer.FaultEvent> rec = debouncer.acceptRound(normal(), inspected(CHANNEL));
+        assertEquals(1, rec.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.RECOVERED, rec.get(0).getType());
+    }
+
+    // ==================== 恢复后抑制窗口（防循环放大） ====================
+
+    /** 恢复关警后窗口内同类故障再异常：挂起不告警；窗口过期仍异常则补发告警 */
+    @Test
+    void suppressWindowDefersRepeatedAlert() {
+        AlertDebouncer d = new AlertDebouncer(2, 2, 60_000L);
+        // 开警
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        assertEquals(1, d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL)).size());
+        // 关警（抑制窗口开始）
+        d.acceptRound(normal(), inspected(CHANNEL));
+        List<AlertDebouncer.FaultEvent> rec = d.acceptRound(normal(), inspected(CHANNEL));
+        assertEquals(1, rec.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.RECOVERED, rec.get(0).getType());
+        // 窗口内再异常2轮：第2轮达到告警条件但被抑制挂起，不告警
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        assertTrue(d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL)).isEmpty());
+        // 挂起中持续异常、窗口未过：仍不告警
+        assertTrue(d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL)).isEmpty());
+        // 窗口过期后故障仍异常：补发告警
+        expireSuppressWindow(d, VideoFaultType.SIGNAL_LOSS);
+        List<AlertDebouncer.FaultEvent> replay = d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        assertEquals(1, replay.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.NEW_ALERT, replay.get(0).getType());
+    }
+
+    /** 挂起中的故障恢复正常：正常走恢复判定并解除挂起，之后（窗口过期）故障再临正常告警 */
+    @Test
+    void suppressedPendingClearedOnRecovery() {
+        AlertDebouncer d = new AlertDebouncer(2, 2, 60_000L);
+        // 开警→关警
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        d.acceptRound(normal(), inspected(CHANNEL));
+        d.acceptRound(normal(), inspected(CHANNEL));
+        // 窗口内再异常2轮：挂起
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        assertTrue(d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL)).isEmpty());
+        // 挂起中恢复正常2轮：第2轮触发 RECOVERED（挂起解除，无残留）
+        assertTrue(d.acceptRound(normal(), inspected(CHANNEL)).isEmpty());
+        List<AlertDebouncer.FaultEvent> rec = d.acceptRound(normal(), inspected(CHANNEL));
+        assertEquals(1, rec.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.RECOVERED, rec.get(0).getType());
+        assertTrue(d.activeFaults(CHANNEL).isEmpty());
+        // 窗口过期后故障再异常：正常走防抖新增（不误走补发分支）
+        expireSuppressWindow(d, VideoFaultType.SIGNAL_LOSS);
+        d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        List<AlertDebouncer.FaultEvent> again = d.acceptRound(abnormal(VideoFaultType.SIGNAL_LOSS), inspected(CHANNEL));
+        assertEquals(1, again.size());
+        assertEquals(AlertDebouncer.FaultEvent.Type.NEW_ALERT, again.get(0).getType());
+    }
+
+    /** 拨回抑制窗口起点（模拟窗口已过期），避免 sleep 拖慢/抖动用例 */
+    @SuppressWarnings("unchecked")
+    private static void expireSuppressWindow(AlertDebouncer d, VideoFaultType fault) {
+        ConcurrentMap<String, Long> map =
+                (ConcurrentMap<String, Long>) ReflectionTestUtils.getField(d, "lastRecoveredAt");
+        map.put(CHANNEL + "|" + fault.name(), System.currentTimeMillis() - 3_600_000L);
     }
 
     private Map<String, Set<VideoFaultType>> abnormal(VideoFaultType... faults) {

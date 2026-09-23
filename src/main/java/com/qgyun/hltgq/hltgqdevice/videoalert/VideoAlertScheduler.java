@@ -9,7 +9,12 @@ import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
+import java.time.Instant;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -59,6 +64,22 @@ public class VideoAlertScheduler {
     @Value("${video-alert.recover-threshold:2}")
     private int recoverThreshold;
 
+    /** 告警抑制期（分钟，0=不启用）：恢复关警后同类故障窗口内不再重复告警（防循环放大），配置项 video-alert.suppress-minutes */
+    @Value("${video-alert.suppress-minutes:360}")
+    private int suppressMinutes;
+
+    /** 夜间误报豁免开关（黑白/过暗/偏色为红外夜视物理现象，非故障），配置项 video-alert.night-exempt.enabled */
+    @Value("${video-alert.night-exempt.enabled:true}")
+    private boolean nightExemptEnabled;
+
+    /** 夜间豁免时段（HH:mm-HH:mm，支持跨天如 18:30-07:30），配置项 video-alert.night-exempt.window */
+    @Value("${video-alert.night-exempt.window:18:30-07:30}")
+    private String nightExemptWindow;
+
+    /** 夜间豁免故障类别（逗号分隔的枚举名），配置项 video-alert.night-exempt.faults */
+    @Value("${video-alert.night-exempt.faults:GRAYSCALE,TOO_DARK,COLOR_CAST}")
+    private String nightExemptFaultsConfig;
+
     /** 单路检测时长上限（秒，含流探测+抽帧+分析），配置项 video-alert.stream-seconds */
     @Value("${video-alert.stream-seconds:15}")
     private int streamSeconds;
@@ -84,6 +105,13 @@ public class VideoAlertScheduler {
     /** 防抖状态机（阈值来自配置，@PostConstruct 构建后不再变更） */
     private volatile AlertDebouncer debouncer;
 
+    /** 夜间豁免时段起点/终点（当日分钟数；start>end=跨天；-1=未启用/解析失败） */
+    private int nightExemptStartMinutes = -1;
+    private int nightExemptEndMinutes = -1;
+
+    /** 夜间豁免故障类别（解析自配置，空=不豁免） */
+    private final Set<VideoFaultType> nightExemptFaults = EnumSet.noneOf(VideoFaultType.class);
+
     /** 轮巡互斥锁：同一时刻只允许一轮 */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
@@ -92,9 +120,84 @@ public class VideoAlertScheduler {
 
     @PostConstruct
     public void init() {
-        debouncer = new AlertDebouncer(detectThreshold, recoverThreshold);
-        log.info("[视频告警] 轮巡调度初始化: enabled={}, 并发{}路, 告警阈值{}轮, 恢复阈值{}轮, 单路超时{}s",
-                enabled, parallel, detectThreshold, recoverThreshold, streamSeconds);
+        debouncer = new AlertDebouncer(detectThreshold, recoverThreshold, suppressMinutes * 60000L);
+        initNightExempt();
+        log.info("[视频告警] 轮巡调度初始化: enabled={}, 并发{}路, 告警阈值{}轮, 恢复阈值{}轮, 单路超时{}s, "
+                        + "告警抑制{}分钟, 夜间豁免{}",
+                enabled, parallel, detectThreshold, recoverThreshold, streamSeconds, suppressMinutes,
+                nightExemptFaults.isEmpty() ? "未启用" : nightExemptFaults + " " + nightExemptWindow);
+    }
+
+    /** 解析夜间豁免配置（时段+故障类别）：解析失败按未启用处理（宁可照常告警，不静默丢警） */
+    private void initNightExempt() {
+        nightExemptFaults.clear();
+        nightExemptStartMinutes = -1;
+        nightExemptEndMinutes = -1;
+        if (!nightExemptEnabled) {
+            return;
+        }
+        if (nightExemptFaultsConfig != null) {
+            for (String name : nightExemptFaultsConfig.split(",")) {
+                if (name.trim().isEmpty()) {
+                    continue;
+                }
+                try {
+                    nightExemptFaults.add(VideoFaultType.valueOf(name.trim()));
+                } catch (IllegalArgumentException e) {
+                    log.warn("[视频告警] 夜间豁免故障名不存在(忽略): {}", name.trim());
+                }
+            }
+        }
+        String[] range = nightExemptWindow == null ? new String[0] : nightExemptWindow.split("-");
+        if (range.length == 2) {
+            nightExemptStartMinutes = parseHourMinute(range[0]);
+            nightExemptEndMinutes = parseHourMinute(range[1]);
+        }
+        if (nightExemptFaults.isEmpty() || nightExemptStartMinutes < 0 || nightExemptEndMinutes < 0) {
+            log.warn("[视频告警] 夜间豁免配置无效，已禁用: window={}, faults={}",
+                    nightExemptWindow, nightExemptFaultsConfig);
+            nightExemptFaults.clear();
+            nightExemptStartMinutes = -1;
+            nightExemptEndMinutes = -1;
+        }
+    }
+
+    /** 解析 HH:mm → 当日分钟数（非法返回 -1） */
+    private static int parseHourMinute(String hm) {
+        String[] parts = hm == null ? new String[0] : hm.trim().split(":");
+        if (parts.length != 2) {
+            return -1;
+        }
+        try {
+            int h = Integer.parseInt(parts[0].trim());
+            int m = Integer.parseInt(parts[1].trim());
+            return (h >= 0 && h <= 23 && m >= 0 && m <= 59) ? h * 60 + m : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * 当前时刻的豁免故障集（未启用/不在时段返回空集）；使用轮巡开始时刻判定，整轮保持一致。
+     */
+    private Set<VideoFaultType> currentNightExemptFaults(long epochMillis) {
+        if (nightExemptFaults.isEmpty()
+                || !inTimeWindow(nightExemptStartMinutes, nightExemptEndMinutes, epochMillis)) {
+            return Collections.emptySet();
+        }
+        return nightExemptFaults;
+    }
+
+    /** 分钟数时段判断（包内可见供单测）：start>end 表示跨天；任一端为负→false（未启用） */
+    static boolean inTimeWindow(int startMinutes, int endMinutes, long epochMillis) {
+        if (startMinutes < 0 || endMinutes < 0) {
+            return false;
+        }
+        LocalTime t = Instant.ofEpochMilli(epochMillis).atZone(ZoneId.systemDefault()).toLocalTime();
+        int m = t.getHour() * 60 + t.getMinute();
+        return startMinutes <= endMinutes
+                ? (m >= startMinutes && m < endMinutes)
+                : (m >= startMinutes || m < endMinutes);
     }
 
     /**
@@ -281,7 +384,15 @@ public class VideoAlertScheduler {
         }
 
         // ============ 防抖判定 → 告警新增/恢复 ============
-        List<AlertDebouncer.FaultEvent> events = debouncer.acceptRound(abnormalByChannel, inspectedChannels);
+        // 夜间豁免：红外夜视黑白/无补光过暗/偏色跳过判定（不新增不恢复），白天照常；
+        // 巡检留痕已在上方按原始检测落库，统计口径不受影响
+        Set<VideoFaultType> exemptFaults = currentNightExemptFaults(snap.startTime);
+        if (!exemptFaults.isEmpty()) {
+            log.info("[视频告警] 夜间豁免生效（{}）：{} 本轮跳过防抖判定（留痕照常）",
+                    nightExemptWindow, exemptFaults);
+        }
+        List<AlertDebouncer.FaultEvent> events =
+                debouncer.acceptRound(abnormalByChannel, inspectedChannels, exemptFaults);
         for (AlertDebouncer.FaultEvent ev : events) {
             if (ev.getType() == AlertDebouncer.FaultEvent.Type.NEW_ALERT) {
                 if (alertService.reportFault(ev.getChannelId(), ev.getFault())) {
