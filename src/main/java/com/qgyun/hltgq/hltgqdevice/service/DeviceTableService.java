@@ -10,6 +10,7 @@ import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -336,36 +337,125 @@ public class DeviceTableService {
     }
 
     /**
-     * 站点消失联动：按站点ID批量将设备标注离线（#2#），分批500防止参数超限。
-     * 设备表无 status 列时自动跳过（动态列适配）。
+     * 按通道 devicecode 查视频设备（不创建）：返回设备ID与已挂站点ID（site），
+     * 供站点同步做四态判定（设备不存在/已挂兜底站/已挂迁移行/已挂业务站）。
+     * type LIKE '%#5#%' 限定视频设备（排除同 code 的其他类型设备行）。
      *
+     * @return 设备引用（id/site，site 为 null=悬空）；无视频设备或数据库不可达时返回 null
+     */
+    public VideoDeviceRef findVideoDeviceByCode(String code) {
+        if (code == null || code.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            String sql = "SELECT id, site FROM " + DEVICE_TABLE +
+                    " WHERE code = ? AND type LIKE '%" + DEVICE_TYPE_VIDEO + "%' LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, code.trim());
+            if (rows == null || rows.isEmpty()) {
+                return null;
+            }
+            Map<String, Object> row = rows.get(0);
+            String id = row.get("id") == null ? null : String.valueOf(row.get("id")).trim();
+            if (id == null || id.isEmpty()) {
+                return null;
+            }
+            String site = row.get("site") == null ? null : String.valueOf(row.get("site")).trim();
+            return new VideoDeviceRef(id, (site == null || site.isEmpty()) ? null : site);
+        } catch (Exception e) {
+            log.warn("[视频设备] 查询设备失败, code={}: {}", code, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 视频设备引用（id + 已挂站点ID site），findVideoDeviceByCode 返回；site 为 null 表示悬空 */
+    public static class VideoDeviceRef {
+        private final String id;
+        private final String site;
+
+        public VideoDeviceRef(String id, String site) {
+            this.id = id;
+            this.site = site;
+        }
+
+        public String getId() {
+            return id;
+        }
+
+        public String getSite() {
+            return site;
+        }
+    }
+
+    /**
+     * 改挂设备到目标站点（site 变化才写库）：兜底站改挂业务站 / 悬空指向修复用。
+     * 按设备ID精确更新，不覆盖其他字段。
+     *
+     * @return true-实际改挂（行有变化）；false-参数缺失/无变化/数据库不可达
+     */
+    public boolean updateDeviceSite(String deviceId, String siteId) {
+        if (deviceId == null || deviceId.trim().isEmpty() || siteId == null || siteId.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            String sql = "UPDATE " + DEVICE_TABLE +
+                    " SET site = ?, updated_at = ?, updated_by = 'SYSTEM' " +
+                    " WHERE id = ? AND site IS DISTINCT FROM ?";
+            return jdbcTemplate.update(sql, siteId.trim(),
+                    new Timestamp(System.currentTimeMillis()), deviceId.trim(), siteId.trim()) > 0;
+        } catch (Exception e) {
+            log.warn("[视频设备] 设备改挂站点失败, id={}, site={}: {}", deviceId, siteId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 通道消失联动：将设备表中 code 不在本轮设备树遍历结果的视频设备批量标注离线（#2#），
+     * 分批500防止参数超限；seenCodes 为空 = 本轮无任何通道（全部视频设备标离线）。
+     * 仅限 code 非空、type 含 #5#、状态非离线的行；设备表无 status 列时自动跳过（动态列适配）。
+     *
+     * @param seenCodes 本轮遍历见到的全部通道 devicecode（去重）
      * @return 标注离线的设备行数
      */
-    public int markOfflineBySiteIds(List<String> siteIds) {
-        if (siteIds == null || siteIds.isEmpty()) {
-            return 0;
-        }
+    public int markOfflineByMissingCodes(Collection<String> seenCodes) {
         if (!deviceColumns.isEmpty() && !deviceColumns.contains("status")) {
             log.warn("[视频设备] 设备表无 status 列，跳过离线标注");
             return 0;
         }
         int total = 0;
         Timestamp now = new Timestamp(System.currentTimeMillis());
+        String baseWhere = " WHERE type LIKE '%" + DEVICE_TYPE_VIDEO + "%'" +
+                " AND COALESCE(code, '') <> '' AND status IS DISTINCT FROM ?";
         try {
-            for (int i = 0; i < siteIds.size(); i += 500) {
-                List<String> chunk = siteIds.subList(i, Math.min(i + 500, siteIds.size()));
+            if (seenCodes == null || seenCodes.isEmpty()) {
+                String sql = "UPDATE " + DEVICE_TABLE +
+                        " SET status = ?, updated_at = ?, updated_by = 'SYSTEM'" + baseWhere;
+                int rows = jdbcTemplate.update(sql, DEVICE_STATUS_OFFLINE, now, DEVICE_STATUS_OFFLINE);
+                if (rows > 0) {
+                    log.info("[视频设备] ICC无视频通道，全部视频设备标注离线: {} 台", rows);
+                }
+                return rows;
+            }
+            List<String> codes = new ArrayList<>(seenCodes);
+            for (int i = 0; i < codes.size(); i += 500) {
+                List<String> chunk = codes.subList(i, Math.min(i + 500, codes.size()));
                 StringBuilder sql = new StringBuilder("UPDATE " + DEVICE_TABLE +
-                        " SET status = ?, updated_at = ?, updated_by = 'SYSTEM' WHERE site IN (");
+                        " SET status = ?, updated_at = ?, updated_by = 'SYSTEM'");
+                sql.append(baseWhere);
+                sql.append(" AND code NOT IN (");
                 for (int j = 0; j < chunk.size(); j++) {
                     sql.append(j == 0 ? "?" : ", ?");
                 }
-                sql.append(") AND status IS DISTINCT FROM ?");
+                sql.append(")");
                 List<Object> params = new ArrayList<>();
                 params.add(DEVICE_STATUS_OFFLINE);
                 params.add(now);
-                params.addAll(chunk);
                 params.add(DEVICE_STATUS_OFFLINE);
-                total += jdbcTemplate.update(sql.toString(), params.toArray());
+                params.addAll(chunk);
+                int rows = jdbcTemplate.update(sql.toString(), params.toArray());
+                if (rows > 0) {
+                    log.info("[视频设备] 消失通道联动设备标注离线: {} 台", rows);
+                }
+                total += rows;
             }
         } catch (Exception e) {
             log.warn("[视频设备] 设备批量标离线失败: {}", e.getMessage());
@@ -378,20 +468,23 @@ public class DeviceTableService {
     /**
      * 历史数据迁移：视频告警早期版本 device 塞的是站点ID（当时视频设备未入库），
      * 现按"每视频站点 1 台设备"补齐设备记录，并把历史告警/工单的 device 更新为设备ID。
+     * <p>范围收窄（站点-设备架构改造后）：仅处理旧同步产出的纯 #5# 行
+     * （epjutj='#5#' 且 devicecode 非空）——迁移后业务站 epjutj 带 #5# 后缀（如"#2#|#5#"）、
+     * 兜底站无 devicecode，均天然排除，防为业务站/兜底站误建伪视频设备。
      * <p>幂等：迁移后 device=设备ID，再跑时 UPDATE 条件（device=站点ID）不再命中；
      * 仅处理 device=站点ID 的历史行，未来新数据（device=设备ID）不受影响。
      * <p>历史设备字段回填（仅空值写入，不覆盖人工编辑）：
-     * 运行状态按站点 zebpsu 对齐（变化才写库）、安装位置 wlcvig 空值回填（值取站点 mivbcz，
-     * 在树站点由同步轮持续修正为"管理所级组织-位置节点"格式）。
+     * 安装位置 wlcvig 空值回填（值取站点 mivbcz，在树站点由同步轮持续修正为设备树层级值）。
+     * 运行状态不按站点 zebpsu 对齐：旧行 zebpsu 迁移时统一置 #2#，对齐会把在线设备误标离线，
+     * 设备状态一律由站点同步轮按设备树维护。
      * 入库日期 tm / 启用日期 ptlink 无真实数据源，不回填（留空人工维护，宁缺毋滥）。
      */
     private void migrateLegacyDeviceRefs() {
-        int stations = 0, alertMigrated = 0, orderMigrated = 0, statusAligned = 0,
-                locationBackfilled = 0;
+        int stations = 0, alertMigrated = 0, orderMigrated = 0, locationBackfilled = 0;
         Timestamp now = new Timestamp(System.currentTimeMillis());
         try {
-            String sql = "SELECT id, devicecode, zzkaec, mivbcz, zebpsu FROM " + STATION_TABLE +
-                    " WHERE epjutj LIKE '%#5#%'";
+            String sql = "SELECT id, devicecode, zzkaec, mivbcz FROM " + STATION_TABLE +
+                    " WHERE epjutj = '" + DEVICE_TYPE_VIDEO + "' AND devicecode IS NOT NULL AND devicecode <> ''";
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
             if (rows == null || rows.isEmpty()) {
                 return;
@@ -412,20 +505,14 @@ public class DeviceTableService {
                         : String.valueOf(row.get("devicecode")).trim();
                 String location = row.get("mivbcz") == null ? null
                         : String.valueOf(row.get("mivbcz")).trim();
-                String stationStatus = row.get("zebpsu") == null ? null
-                        : String.valueOf(row.get("zebpsu")).trim();
                 String deviceId = lookupOrCreateDevice(deviceName, siteId, DEVICE_TYPE_VIDEO,
-                        deviceCode, stationStatus, location);
+                        deviceCode, null, location);
                 if (deviceId == null) {
                     log.warn("[视频设备] 迁移: 设备创建失败, site={}, name={}", siteId, deviceName);
                     continue;
                 }
-                // 历史设备字段回填：运行状态按站点 zebpsu 对齐（IS DISTINCT FROM 变化才写），
-                // 安装位置空值回填（不覆盖人工编辑值）——
-                // 同步轮覆盖不到的消失站点设备也能对齐
-                if (stationStatus != null && !stationStatus.isEmpty()) {
-                    statusAligned += updateDeviceStatus(deviceCode, stationStatus);
-                }
+                // 安装位置空值回填（不覆盖人工编辑值）——同步轮覆盖不到的消失站点设备也能对齐；
+                // 运行状态不对齐（旧行 zebpsu=#2# 会误标在线设备离线，状态由同步轮按设备树维护）
                 locationBackfilled += backfillLocation(deviceCode, location);
                 stations++;
                 // 告警表：device=站点ID 的历史行 → 设备ID（幂等）
@@ -455,9 +542,9 @@ public class DeviceTableService {
                     }
                 }
             }
-            log.info("[视频设备] 历史数据迁移完成: 视频站点{}个, 设备状态对齐{}台, 安装位置回填{}台, " +
+            log.info("[视频设备] 历史数据迁移完成: 视频站点{}个, 安装位置回填{}台, " +
                             "告警device更新{}行, 工单device更新{}行",
-                    stations, statusAligned, locationBackfilled, alertMigrated, orderMigrated);
+                    stations, locationBackfilled, alertMigrated, orderMigrated);
         } catch (Exception e) {
             log.error("[视频设备] 历史数据迁移失败", e);
         }

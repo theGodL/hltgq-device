@@ -32,8 +32,8 @@ import java.util.concurrent.ConcurrentMap;
  * <p>处理规则：
  * <ul>
  *   <li>仅处理 alarm.msg：业务/状态/感知类事件直接忽略；</li>
- *   <li>nodeCode（通道编码）→ 站点表 devicecode + epjutj LIKE '%#5#%' 限定
- *       （防同 devicecode 的闸门/水质站点误命中，2026-09-05 线上教训），未匹配=非视频子系统事件，丢弃；</li>
+ *   <li>nodeCode（通道编码）→ 设备表 code → site → 站点，type 含 #5# 限定
+ *       （防同 devicecode 的闸门/水质设备误命中，2026-09-05 线上教训），未匹配=非视频子系统事件，丢弃；</li>
  *   <li>alarmStat=1（发生）→ 新增告警（content="{站点}-视频智能事件 {事件名}！"，前缀与图像故障隔离防撞）；
  *       alarmStat=2（消失）→ 按 content 关闭告警并联动工单；</li>
  *   <li>事件名透传大华 alarmTypeName（官方文档无静态 alarmType 码表，名称由平台动态下发），
@@ -52,6 +52,9 @@ public class VideoEventService {
 
     /** 站点信息表 */
     private static final String STATION_TABLE = SCHEMA + "t_auto_hltgq_5nw74_vnqqef";
+
+    /** 视频设备表（视频资产权威源：站点解析改走设备表 code → site） */
+    private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
 
     /** 事件大类/方法（仅处理报警消息） */
     private static final String CATEGORY_ALARM = "alarm";
@@ -153,17 +156,17 @@ public class VideoEventService {
             eventName = "智能事件" + String.valueOf(alarmType).trim();
         }
 
-        // nodeCode → 视频站点（epjutj 限定，非视频子系统事件自然丢弃）
+        // nodeCode → 视频站点（设备表 code 解析，type 含 #5# 限定，非视频子系统事件自然丢弃）
         StationRef station = resolveStation(nodeCode);
         if (station == null) {
             log.debug("[智能事件] nodeCode={} 未匹配到视频站点，丢弃", nodeCode);
             return false;
         }
 
-        // 站点 → 视频设备（code 匹配，查不到自动兜底创建，设备状态由站点同步维护）
+        // 站点 → 视频设备（code 匹配，查不到自动兜底创建；状态/位置由站点同步轮按设备树维护，此处不写）
         String deviceId = deviceTableService.lookupOrCreateDevice(
                 deviceTableService.deviceNameOf(station.name), station.id,
-                DeviceTableService.DEVICE_TYPE_VIDEO, nodeCode, null, station.location);
+                DeviceTableService.DEVICE_TYPE_VIDEO, nodeCode, null, null);
         if (deviceId == null) {
             log.warn("[智能事件] 设备解析失败，丢弃: nodeCode={}", nodeCode);
             return false;
@@ -292,29 +295,28 @@ public class VideoEventService {
     }
 
     /**
-     * nodeCode → 视频站点（id + 名称 + 位置）。
-     * epjutj LIKE '%#5#%' 限定：站点表存在与视频通道同 devicecode 的闸门/水质站点
-     * （2026-09-05 线上发现 1000230$1$0$11/1000328$1$0$0 重复），不限定会误命中非视频站点。
+     * nodeCode → 视频站点（id + 名称）：设备表解析（视频资产权威源）——
+     * 设备 code → site → 站点行；type 含 #5# 限定（设备表存在与视频通道同 code 的其他类型设备，
+     * 2026-09-05 线上发现 1000230$1$0$11/1000328$1$0$0 重复，不限定会误命中非视频设备）。
      */
     private StationRef resolveStation(String nodeCode) {
         try {
-            String sql = "SELECT id, zzkaec, mivbcz FROM " + STATION_TABLE +
-                    " WHERE devicecode = ? AND epjutj LIKE '%#5#%'";
+            String sql = "SELECT s.id, s.zzkaec FROM " + DEVICE_TABLE + " d" +
+                    " JOIN " + STATION_TABLE + " s ON s.id = d.site" +
+                    " WHERE d.code = ? AND d.type LIKE '%" + DeviceTableService.DEVICE_TYPE_VIDEO + "%'";
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, nodeCode);
             if (rows.isEmpty()) {
                 return null;
             }
             Map<String, Object> row = rows.get(0);
             Object id = row.get("id");
-            Object name = row.get("zzkaec");
             if (id == null || String.valueOf(id).trim().isEmpty()) {
                 return null;
             }
-            Object location = row.get("mivbcz");
+            Object name = row.get("zzkaec");
             return new StationRef(String.valueOf(id).trim(),
                     name == null || String.valueOf(name).trim().isEmpty()
-                            ? nodeCode : String.valueOf(name).trim(),
-                    location == null ? null : String.valueOf(location).trim());
+                            ? nodeCode : String.valueOf(name).trim());
         } catch (Exception e) {
             log.warn("[智能事件] 站点解析失败, nodeCode={}: {}", nodeCode, e.getMessage());
             return null;
@@ -347,16 +349,14 @@ public class VideoEventService {
         return (s == null || s.trim().isEmpty()) ? null : s.trim();
     }
 
-    /** 视频站点快照（不可变） */
+    /** 视频站点快照（不可变，经设备表 code → site 解析） */
     private static class StationRef {
         final String id;
         final String name;
-        final String location;
 
-        StationRef(String id, String name, String location) {
+        StationRef(String id, String name) {
             this.id = id;
             this.name = name;
-            this.location = location;
         }
     }
 }

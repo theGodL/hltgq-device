@@ -50,6 +50,9 @@ public class VideoAlertService {
     /** 站点信息表 */
     private static final String STATION_TABLE = SCHEMA + "t_auto_hltgq_5nw74_vnqqef";
 
+    /** 视频设备表（视频资产权威源：站点解析改走设备表 code → site） */
+    private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
+
     /** 处理状态：#1#未确认(新增默认) #4#已关闭(恢复) */
     private static final String STATUS_UNCONFIRMED = "#1#";
     private static final String STATUS_CLOSED = "#4#";
@@ -147,7 +150,7 @@ public class VideoAlertService {
      * device 存设备表视频设备 ID（type=#5#，查不到自动兜底创建），
      * 同一未关闭告警（site+device+content）不重复新增，新增成功自动联动生成工单。
      *
-     * @param devicecode 通道设备编码（匹配站点表 devicecode）
+     * @param devicecode 通道设备编码（设备表 code 匹配）
      * @param fault      故障类型
      * @return true-新增成功，false-站点/设备缺失、已有未关闭同内容告警、入库失败
      */
@@ -354,8 +357,9 @@ public class VideoAlertService {
     // ======================== 站点 / 设备解析 ========================
 
     /**
-     * devicecode → 站点信息（id + 名称 + 位置），本地缓存 TTL 过期刷新
-     * （站点名可能被人工编辑，过期后重查；查询失败兜底返回旧值可重查）。
+     * devicecode → 站点信息（id + 名称）：设备表解析（视频资产权威源）——
+     * 设备 code → site → 站点行（type 含 #5# 限定，防同 code 其他类型设备串行）。
+     * 本地缓存 TTL 过期刷新（站点名可能被人工编辑，过期后重查；查询失败兜底返回旧值可重查）。
      */
     private SiteInfo resolveSite(String devicecode) {
         if (devicecode == null || devicecode.trim().isEmpty()) {
@@ -367,21 +371,21 @@ public class VideoAlertService {
             return cached;
         }
         try {
-            String sql = "SELECT id, zzkaec, mivbcz FROM " + STATION_TABLE + " WHERE devicecode = ?";
+            String sql = "SELECT s.id, s.zzkaec FROM " + DEVICE_TABLE + " d" +
+                    " JOIN " + STATION_TABLE + " s ON s.id = d.site" +
+                    " WHERE d.code = ? AND d.type LIKE '%" + DeviceTableService.DEVICE_TYPE_VIDEO + "%'";
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, code);
             if (rows.isEmpty()) {
                 return null;
             }
             Map<String, Object> row = rows.get(0);
             Object id = row.get("id");
-            Object name = row.get("zzkaec");
             if (id == null || String.valueOf(id).trim().isEmpty()) {
                 return null;
             }
-            Object location = row.get("mivbcz");
+            Object name = row.get("zzkaec");
             SiteInfo info = new SiteInfo(String.valueOf(id).trim(),
-                    name == null ? code : String.valueOf(name).trim(),
-                    location == null ? null : String.valueOf(location).trim());
+                    name == null ? code : String.valueOf(name).trim());
             siteCache.put(code, info);
             return info;
         } catch (Exception e) {
@@ -401,28 +405,24 @@ public class VideoAlertService {
     private static class SiteInfo {
         final String id;
         final String name;
-        /** 站点位置（mivbcz，站点表组织名），可为 null */
-        final String location;
         final long cachedAt = System.currentTimeMillis();
 
-        SiteInfo(String id, String name, String location) {
+        SiteInfo(String id, String name) {
             this.id = id;
             this.name = name;
-            this.location = location;
         }
     }
 
     /**
      * devicecode → 设备表视频设备ID（type=#5#）：设备名 = 站点名 + 后缀 + "#"，
-     * 查不到自动兜底创建（设备状态留空，由站点同步维护）；设备表不可达返回 null。
+     * 查不到自动兜底创建（设备状态/位置留空，由站点同步轮按设备树维护——架构改造后
+     * 站点 mivbcz 不再维护，安装位置以设备表 wlcvig 为准）；设备表不可达返回 null。
      */
     private String resolveOrCreateDevice(String devicecode, SiteInfo site) {
         try {
             String deviceName = deviceTableService.deviceNameOf(site.name);
-            // 安装位置：站点位置 mivbcz（已是"管理所-通道名"完整位置），直接使用不再拼站点名
-            // （历史教训：再拼站点名会产出"集岭管理所-大门外-大门外-视频"重复；mivbcz为空时留空，宁缺毋滥）
             return deviceTableService.lookupOrCreateDevice(deviceName, site.id,
-                    DeviceTableService.DEVICE_TYPE_VIDEO, devicecode, null, site.location);
+                    DeviceTableService.DEVICE_TYPE_VIDEO, devicecode, null, null);
         } catch (Exception e) {
             log.warn("[视频告警] 设备解析失败, devicecode={}: {}", devicecode, e.getMessage());
             return null;

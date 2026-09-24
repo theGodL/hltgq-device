@@ -3,6 +3,7 @@ package com.qgyun.hltgq.hltgqdevice.videoalert;
 import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.invocation.Invocation;
 import org.mockito.invocation.InvocationOnMock;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -24,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -64,17 +66,16 @@ class VideoAlertServiceTest {
         ReflectionTestUtils.setField(service, "workOrderService", workOrderService);
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
-        // 站点预置，避免测试重复模拟查询（mivbcz=站点位置"管理所-通道名"完整值，供设备安装位置直取）
+        // 站点预置（站点解析走设备表 JOIN，返回 id/zzkaec 两列），避免测试重复模拟查询
         Map<String, Object> row = new HashMap<>();
         row.put("id", SITE_ID);
         row.put("zzkaec", SITE_NAME);
-        row.put("mivbcz", ORG_NAME);
         when(jdbcTemplate.queryForList(anyString(), eq(DEVICECODE)))
                 .thenReturn(Arrays.asList(row));
-        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status 传 null、位置=mivbcz直取不拼接）
+        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status/位置传 null，由站点同步轮维护）
         when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                nullable(String.class), anyString())).thenReturn(DEVICE_ID);
+                nullable(String.class), nullable(String.class))).thenReturn(DEVICE_ID);
         updateInvocations.clear();
         doAnswer(inv -> {
             updateInvocations.add(inv);
@@ -129,10 +130,10 @@ class VideoAlertServiceTest {
             }
         }
         assertTrue(codeChecked, "告警编号 code 应存在于插入参数中");
-        // 兜底查/建设备：type=#5# 视频、code=通道devicecode、status 留空、位置=mivbcz 直取（不再拼站点名）
+        // 兜底查/建设备：type=#5# 视频、code=通道devicecode、status/位置留空（均由站点同步轮按设备树维护）
         verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
-                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), nullable(String.class),
-                eq(ORG_NAME));
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), isNull(),
+                isNull());
         // 工单联动：alert=告警ID、site=站点ID、device=设备ID、title=content去"！"、content 与告警一致、qjulvf=#hxqm#设备故障抢修
         verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID), eq(TITLE), eq(CONTENT),
                 eq("#hxqm#"));
@@ -242,7 +243,7 @@ class VideoAlertServiceTest {
     @Test
     void reportFaultSkipsWhenDeviceMissing() {
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                nullable(String.class), anyString())).thenReturn(null);
+                nullable(String.class), nullable(String.class))).thenReturn(null);
         when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
                 .thenReturn(0);
 
@@ -255,7 +256,7 @@ class VideoAlertServiceTest {
     @Test
     void recoverFaultSkipsWhenDeviceMissing() {
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                nullable(String.class), anyString())).thenReturn(null);
+                nullable(String.class), nullable(String.class))).thenReturn(null);
 
         assertEquals(0, service.recoverFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         assertTrue(updateInvocations.isEmpty());
@@ -290,5 +291,21 @@ class VideoAlertServiceTest {
 
         assertFalse(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         verify(jdbcTemplate, times(2)).queryForList(anyString(), eq(DEVICECODE));
+    }
+
+    /** 站点解析走设备表 JOIN（视频资产权威源：d.code → d.site → 站点行；type 含 #5# 限定防串类型） */
+    @Test
+    void stationQueryJoinsDeviceTableWithVideoType() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(1);
+
+        service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS);
+
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(DEVICECODE));
+        String sql = sqlCaptor.getValue();
+        assertTrue(sql.contains("JOIN"), "站点解析应 JOIN 站点表：" + sql);
+        assertTrue(sql.contains("t_auto_hltgq_water_device"), "站点解析应走设备表：" + sql);
+        assertTrue(sql.contains("type LIKE '%#5#%'"), "必须限定视频设备类型：" + sql);
     }
 }

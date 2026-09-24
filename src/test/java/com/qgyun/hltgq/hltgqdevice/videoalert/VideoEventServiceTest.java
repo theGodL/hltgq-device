@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -31,7 +32,7 @@ import static org.mockito.Mockito.when;
 
 /**
  * IVSS 智能事件处理服务单测：alarm.msg 过滤、alarmStat=1 落告警（级别映射）/2 关警、
- * 非视频 nodeCode 丢弃（站点查询带 epjutj 限定）、重复 uuid 幂等、
+ * 非视频 nodeCode 丢弃（站点解析走设备表，type 含 #5# 限定）、重复 uuid 幂等、
  * alarmTypeName 缺失兜底、事件订阅开关关闭时轮询兜底直接跳过。
  */
 class VideoEventServiceTest {
@@ -61,17 +62,16 @@ class VideoEventServiceTest {
         ReflectionTestUtils.setField(service, "alertService", alertService);
         ReflectionTestUtils.setField(service, "authService", authService);
         ReflectionTestUtils.setField(service, "dahuaConfig", dahuaConfig);
-        // 站点预置：nodeCode 匹配视频站点（mivbcz=站点位置）
+        // 站点预置（站点解析走设备表 JOIN，返回 id/zzkaec 两列）
         Map<String, Object> row = new HashMap<>();
         row.put("id", SITE_ID);
         row.put("zzkaec", SITE_NAME);
-        row.put("mivbcz", "库上防汛办");
         when(jdbcTemplate.queryForList(anyString(), eq(NODE_CODE)))
                 .thenReturn(Arrays.asList(row));
-        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID
+        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status/位置传 null，由站点同步轮维护）
         when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                nullable(String.class), anyString())).thenReturn(DEVICE_ID);
+                nullable(String.class), nullable(String.class))).thenReturn(DEVICE_ID);
     }
 
     /** 事件JSON构造：通用事件格式（category/method/uuid/info） */
@@ -105,9 +105,10 @@ class VideoEventServiceTest {
 
         String content = SITE_NAME + "-视频智能事件 区域入侵！";
         verify(alertService).reportEventAlert(SITE_ID, DEVICE_ID, content, "#4#");
+        // 设备解析：status/位置留空（由站点同步轮按设备树维护）
         verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
-                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(NODE_CODE), nullable(String.class),
-                eq("库上防汛办"));
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(NODE_CODE), isNull(),
+                isNull());
     }
 
     /** alarmStat=2（消失）：按 content 关闭告警并联动工单 */
@@ -150,15 +151,17 @@ class VideoEventServiceTest {
         verify(alertService, never()).closeEventAlert(any(), any(), any());
     }
 
-    /** 站点解析带 epjutj 限定（防同 devicecode 的闸门/水质站点误命中，2026-09-05 线上教训） */
+    /** 站点解析走设备表（type 含 #5# 限定，防同 devicecode 的闸门/水质设备误命中，2026-09-05 线上教训） */
     @Test
-    void stationQueryLimitsToVideoStations() {
+    void stationQueryLimitsToVideoDevices() {
         service.handleEvent(eventJson("uuid-sql", NODE_CODE, "区域入侵", null, 1, "1", "alarm", "alarm.msg"));
 
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
         verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(NODE_CODE));
-        assertTrue(sqlCaptor.getValue().contains("epjutj LIKE '%#5#%'"),
-                "站点查询 SQL 应带 epjutj 视频类型限定: " + sqlCaptor.getValue());
+        String sql = sqlCaptor.getValue();
+        assertTrue(sql.contains("t_auto_hltgq_water_device"), "站点解析应走设备表: " + sql);
+        assertTrue(sql.contains("type LIKE '%#5#%'"),
+                "站点查询 SQL 应带视频类型限定: " + sql);
     }
 
     /** 重复 uuid（平台重推）：跳过，仅处理一次 */

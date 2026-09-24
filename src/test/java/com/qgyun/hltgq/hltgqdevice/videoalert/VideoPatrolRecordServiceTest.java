@@ -130,7 +130,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void todayStatsAggregatesOnlyCompletedWindows() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         Map<String, Object> rowOk = new HashMap<>();
         rowOk.put("result", "ok");
@@ -162,7 +162,8 @@ class VideoPatrolRecordServiceTest {
         assertEquals(1, queryInvocations.size());
         String sql = ((Invocation) queryInvocations.get(0)).getRawArguments()[0].toString();
         assertTrue(sql.contains("GROUP BY result"));
-        assertTrue(sql.contains("epjutj LIKE '%#5#%'"));
+        assertTrue(sql.contains("SELECT code FROM"), "参与通道应取设备表 code：" + sql);
+        assertTrue(sql.contains("type LIKE '%#5#%'"), "参与通道应限定视频设备类型：" + sql);
         Object[] args = (Object[]) ((Invocation) queryInvocations.get(0)).getRawArguments()[1];
         assertEquals(new Timestamp(dayStart), args[0]);
         assertEquals(new Timestamp(dayStart + windows * 1800000L), args[1]);
@@ -172,7 +173,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void todayStatsZeroChannelsNoDivisionByZero() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(0L);
         doAnswer(inv -> {
             queryInvocations.add(inv);
@@ -193,7 +194,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void todayStatsQueryFailureDegradesGracefully() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         doThrow(new RuntimeException("db down")).when(jdbcTemplate).queryForList(
                 argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
@@ -228,7 +229,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void rangeStatsMultiDayAggregatesRange() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         Map<String, Object> rowOk = new HashMap<>();
         rowOk.put("result", "ok");
@@ -267,7 +268,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void rangeStatsEndTodayCutsOffUnfinishedWindow() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         doAnswer(inv -> {
             queryInvocations.add(inv);
@@ -291,7 +292,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void rangeStatsFutureEndDateZeroContribution() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         doAnswer(inv -> {
             queryInvocations.add(inv);
@@ -316,7 +317,7 @@ class VideoPatrolRecordServiceTest {
     @Test
     void rangeStatsQueryFailureDegradesGracefully() {
         when(jdbcTemplate.queryForObject(
-                argThat(sql -> sql.contains("t_auto_hltgq_5nw74_vnqqef")), eq(Long.class)))
+                argThat(sql -> sql.contains("t_auto_hltgq_water_device")), eq(Long.class)))
                 .thenReturn(15L);
         doThrow(new RuntimeException("db down")).when(jdbcTemplate).queryForList(
                 argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),

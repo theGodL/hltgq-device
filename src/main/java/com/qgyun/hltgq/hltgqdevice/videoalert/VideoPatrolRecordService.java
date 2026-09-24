@@ -28,7 +28,8 @@ import java.util.Set;
  *   <li>同轮同通道幂等（UNIQUE(round_time, channel_code) + ON CONFLICT DO NOTHING，重跑防重）。</li>
  * </ul>
  * <p>统计口径与 hltgq-mq collect-stats 同构（「已结束完整窗」规则）：只统计当日已结束的完整
- * 巡检窗（进行中窗不计）；参与通道 = 站点表视频站点（epjutj 含 #5#，devicecode 去重），与站点同步口径一致。
+ * 巡检窗（进行中窗不计）；参与通道 = 设备表视频设备（type 含 #5#，code 去重），
+ * 与站点同步/设备表口径一致（架构改造后不再经站点表解析）。
  */
 @Slf4j
 @Service
@@ -37,9 +38,9 @@ public class VideoPatrolRecordService {
     /** 人大金仓 schema（带双引号，因为含连字符），与 hltgq-mq 一致 */
     private static final String SCHEMA = "\"qixiao-apaas\".";
 
-    /** 巡检留痕表 / 站点信息表 */
+    /** 巡检留痕表 / 视频设备表（参与通道口径改走设备表：type 含 #5#，code 去重） */
     private static final String PATROL_TABLE = SCHEMA + "t_auto_hltgq_water_video_patrol";
-    private static final String STATION_TABLE = SCHEMA + "t_auto_hltgq_5nw74_vnqqef";
+    private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
 
     /** 巡检留痕结果三态 */
     private static final String RESULT_OK = "ok";
@@ -132,7 +133,7 @@ public class VideoPatrolRecordService {
     /**
      * 当日视频采集统计（统计大屏「视频数据」行，与 mq collect-stats 行同构）：
      * <ul>
-     *   <li>expected 应采 = 参与通道数（站点表视频站点）× 当日已结束完整窗数（进行中窗不计）；</li>
+     *   <li>expected 应采 = 参与通道数（设备表视频设备）× 当日已结束完整窗数（进行中窗不计）；</li>
      *   <li>collected 实采 = 已结束窗内留痕行数（ok/fail/error 均算）；</li>
      *   <li>success 成功 = result=ok 行数；failed 失败 = fail+error 行数；</li>
      *   <li>successRate/failRate = success/failed ÷ expected × 100（保留 1 位小数，expected=0 时 0.0）。</li>
@@ -160,8 +161,8 @@ public class VideoPatrolRecordService {
             Timestamp cutoff = new Timestamp(dayStartMs + finishedWindows * (windowMinutes * 60000L));
             String sql = "SELECT result, COUNT(*) AS cnt FROM " + PATROL_TABLE
                     + " WHERE round_time >= ? AND round_time < ? AND channel_code IN ("
-                    + "SELECT devicecode FROM " + STATION_TABLE
-                    + " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> '')"
+                    + "SELECT code FROM " + DEVICE_TABLE
+                    + " WHERE type LIKE '%#5#%' AND COALESCE(code, '') <> '')"
                     + " GROUP BY result";
             long[] sums = sumByResult(jdbcTemplate.queryForList(sql, dayStart, cutoff));
             collected = sums[0];
@@ -212,8 +213,8 @@ public class VideoPatrolRecordService {
             expected = channelCount * windows;
             String sql = "SELECT result, COUNT(*) AS cnt FROM " + PATROL_TABLE
                     + " WHERE round_time >= ? AND round_time < ? AND channel_code IN ("
-                    + "SELECT devicecode FROM " + STATION_TABLE
-                    + " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> '')"
+                    + "SELECT code FROM " + DEVICE_TABLE
+                    + " WHERE type LIKE '%#5#%' AND COALESCE(code, '') <> '')"
                     + " GROUP BY result";
             long[] sums = sumByResult(
                     jdbcTemplate.queryForList(sql, new Timestamp(startMs), new Timestamp(cutoffMs)));
@@ -292,11 +293,11 @@ public class VideoPatrolRecordService {
         return new long[]{collected, success, failed};
     }
 
-    /** 参与统计的视频通道数 = 站点表视频站点数（epjutj 含 #5#，按 devicecode 去重），与站点同步口径一致 */
+    /** 参与统计的视频通道数 = 设备表视频设备数（type 含 #5#，按 code 去重），与站点同步/设备表口径一致 */
     private int countPatrolChannels() {
-        String sql = "SELECT COUNT(*) FROM (SELECT devicecode FROM " + STATION_TABLE
-                + " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> ''"
-                + " GROUP BY devicecode) t";
+        String sql = "SELECT COUNT(*) FROM (SELECT code FROM " + DEVICE_TABLE
+                + " WHERE type LIKE '%#5#%' AND COALESCE(code, '') <> ''"
+                + " GROUP BY code) t";
         Long n = jdbcTemplate.queryForObject(sql, Long.class);
         return n == null ? 0 : n.intValue();
     }

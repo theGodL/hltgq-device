@@ -226,17 +226,30 @@ class DeviceTableServiceTest {
         assertNotNull(id);
     }
 
-    /** 批量标离线：按站点ID分批 UPDATE 设备 status=#2#，仅状态非离线行 */
+    /** 消失通道标离线：code 不在本轮通道集合的设备 UPDATE status=#2#，分批 NOT IN，仅状态非离线行 */
     @Test
-    void markOfflineBySiteIdsUpdatesDevices() {
+    void markOfflineByMissingCodesUpdatesOthers() {
         when(jdbcTemplate.update(anyString(), any(Object.class))).thenReturn(2);
 
-        int rows = service.markOfflineBySiteIds(Arrays.asList("s1", "s2", "s3"));
+        int rows = service.markOfflineByMissingCodes(Arrays.asList("c1", "c2", "c3"));
 
         assertEquals(2, rows);
         verify(jdbcTemplate).update(
-                argThat(sqlContains("t_auto_hltgq_water_device", "site IN (?, ?, ?)",
-                        "status IS DISTINCT FROM")),
+                argThat(sqlContains("t_auto_hltgq_water_device", "code NOT IN (?, ?, ?)",
+                        "status IS DISTINCT FROM", "COALESCE(code, '') <> ''")),
+                any(Object.class));
+    }
+
+    /** 本轮无任何通道（空集合）：全部视频设备标离线（不带 NOT IN 排除条件） */
+    @Test
+    void markOfflineByMissingCodesEmptySetMarksAll() {
+        when(jdbcTemplate.update(anyString(), any(Object.class))).thenReturn(3);
+
+        int rows = service.markOfflineByMissingCodes(Collections.emptySet());
+
+        assertEquals(3, rows);
+        verify(jdbcTemplate).update(
+                argThat(s -> s.contains("SET status = ?") && !s.contains("NOT IN")),
                 any(Object.class));
     }
 
@@ -246,7 +259,7 @@ class DeviceTableServiceTest {
         ReflectionTestUtils.setField(service, "deviceColumns",
                 new HashSet<>(Arrays.asList("id", "name", "site")));
 
-        int rows = service.markOfflineBySiteIds(Arrays.asList("s1"));
+        int rows = service.markOfflineByMissingCodes(Arrays.asList("c1"));
 
         assertEquals(0, rows);
         verify(jdbcTemplate, never()).update(anyString(), any(Object.class));
@@ -255,6 +268,8 @@ class DeviceTableServiceTest {
     /**
      * 启动迁移：为历史视频站点补建设备，并把告警/工单中 device=站点ID 的历史行
      * 更新为设备ID（UPDATE 条件 device=站点ID → 幂等，迁移后不再命中）。
+     * 迁移范围收窄为纯#5#行（epjutj='#5#' 且 devicecode 非空——业务站带 #5# 后缀、
+     * 兜底站无 devicecode，均天然排除）；不按站点状态对齐（状态由站点同步轮按设备树维护）。
      */
     @Test
     void migrateLegacyDeviceRefsUpdatesAlertAndWorkOrder() {
@@ -265,15 +280,14 @@ class DeviceTableServiceTest {
         when(jdbcTemplate.queryForList(argThat(sqlContains("information_schema", "t_auto_hltgq_water_work_order")),
                 eq(String.class)))
                 .thenReturn(Collections.singletonList("device"));
-        // 历史视频站点（mivbcz=站点位置/组织名，zebpsu=站点状态）
+        // 历史视频站点（纯#5#行：mivbcz=站点位置/组织名；迁移范围仅此类行）
         Map<String, Object> station = new HashMap<>();
         station.put("id", SITE_ID);
         station.put("devicecode", DEVICECODE);
         station.put("zzkaec", SITE_NAME);
         station.put("mivbcz", ORG_NAME);
-        station.put("zebpsu", "#1#");
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz, zebpsu",
-                "t_auto_hltgq_5nw74_vnqqef"))))
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz",
+                "epjutj = '#5#'", "devicecode IS NOT NULL"))))
                 .thenReturn(Collections.singletonList(station));
         // 设备查找：按 code 未命中 → 按 name 兜底未命中 → 创建
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
@@ -285,8 +299,8 @@ class DeviceTableServiceTest {
 
         service.init();
 
-        // 5 次 UPDATE：INSERT 设备 + 状态对齐 + 安装位置回填 + UPDATE 告警 + UPDATE 工单
-        assertEquals(5, updateInvocations.size());
+        // 4 次 UPDATE：INSERT 设备 + 安装位置回填 + UPDATE 告警 + UPDATE 工单（不再状态对齐）
+        assertEquals(4, updateInvocations.size());
         String insertSql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
         Object[] insertArgs = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
         assertTrue(insertSql.contains("INSERT INTO"));
@@ -296,35 +310,30 @@ class DeviceTableServiceTest {
         // 安装位置：与站点位置 mivbcz 同源直取（不拼接站点名）
         assertTrue(insertSql.contains("wlcvig"));
         assertTrue(Arrays.asList(insertArgs).contains(ORG_NAME));
-        // 创建即带站点状态（zebpsu 传入 createDevice）
-        assertTrue(insertSql.contains("status"));
-        assertTrue(Arrays.asList(insertArgs).contains("#1#"));
-
-        // 状态对齐 UPDATE：SET status = ?（变化才写库），按 code 精确匹配
-        String statusSql = (String) ((Invocation) updateInvocations.get(1)).getRawArguments()[0];
-        Object[] statusArgs = (Object[]) ((Invocation) updateInvocations.get(1)).getRawArguments()[1];
-        assertTrue(statusSql.contains("SET status = ?"));
-        assertEquals(DEVICECODE, statusArgs[2]);
+        // 不写状态：旧行 zebpsu 迁移时统一置 #2#，按站点状态对齐会把在线设备误标离线，
+        // 设备状态一律由站点同步轮按设备树维护
+        assertFalse(insertSql.contains("status"));
+        assertFalse(Arrays.asList(insertArgs).contains("#1#"));
 
         // 安装位置回填 UPDATE：SET wlcvig = ?（仅空值写入，值取站点 mivbcz），按 code 精确匹配
-        String locSql = (String) ((Invocation) updateInvocations.get(2)).getRawArguments()[0];
-        Object[] locArgs = (Object[]) ((Invocation) updateInvocations.get(2)).getRawArguments()[1];
+        String locSql = (String) ((Invocation) updateInvocations.get(1)).getRawArguments()[0];
+        Object[] locArgs = (Object[]) ((Invocation) updateInvocations.get(1)).getRawArguments()[1];
         assertTrue(locSql.contains("SET wlcvig = ?"));
         assertTrue(locSql.contains("wlcvig IS NULL OR wlcvig = ''"));
         assertEquals(ORG_NAME, locArgs[0]);
         assertEquals(DEVICECODE, locArgs[2]);
 
         // 告警 UPDATE：参数序 (deviceId, now, siteId, siteId)，条件 site=站点ID AND device=站点ID（幂等）
-        String alertSql = (String) ((Invocation) updateInvocations.get(3)).getRawArguments()[0];
-        Object[] alertArgs = (Object[]) ((Invocation) updateInvocations.get(3)).getRawArguments()[1];
+        String alertSql = (String) ((Invocation) updateInvocations.get(2)).getRawArguments()[0];
+        Object[] alertArgs = (Object[]) ((Invocation) updateInvocations.get(2)).getRawArguments()[1];
         assertTrue(alertSql.contains("t_auto_hltgq_water_alert"));
         assertEquals(deviceId, alertArgs[0]);
         assertEquals(SITE_ID, alertArgs[2]);
         assertEquals(SITE_ID, alertArgs[3]);
 
         // 工单 UPDATE：同告警条件
-        String orderSql = (String) ((Invocation) updateInvocations.get(4)).getRawArguments()[0];
-        Object[] orderArgs = (Object[]) ((Invocation) updateInvocations.get(4)).getRawArguments()[1];
+        String orderSql = (String) ((Invocation) updateInvocations.get(3)).getRawArguments()[0];
+        Object[] orderArgs = (Object[]) ((Invocation) updateInvocations.get(3)).getRawArguments()[1];
         assertTrue(orderSql.contains("t_auto_hltgq_water_work_order"));
         assertEquals(deviceId, orderArgs[0]);
         assertEquals(SITE_ID, orderArgs[2]);
@@ -345,9 +354,8 @@ class DeviceTableServiceTest {
         station.put("devicecode", DEVICECODE);
         station.put("zzkaec", SITE_NAME);
         station.put("mivbcz", ORG_NAME);
-        station.put("zebpsu", "#1#");
-        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz, zebpsu",
-                "t_auto_hltgq_5nw74_vnqqef"))))
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id, devicecode, zzkaec, mivbcz",
+                "epjutj = '#5#'", "devicecode IS NOT NULL"))))
                 .thenReturn(Collections.singletonList(station));
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
                 eq(String.class), eq(DEVICECODE)))
@@ -358,9 +366,9 @@ class DeviceTableServiceTest {
 
         service.init();
 
-        // 4 次 UPDATE：INSERT 设备 + 状态对齐 + 安装位置回填 + 告警（工单跳过）
-        assertEquals(4, updateInvocations.size());
-        String lastSql = (String) ((Invocation) updateInvocations.get(3)).getRawArguments()[0];
+        // 3 次 UPDATE：INSERT 设备 + 安装位置回填 + 告警（工单跳过）
+        assertEquals(3, updateInvocations.size());
+        String lastSql = (String) ((Invocation) updateInvocations.get(2)).getRawArguments()[0];
         assertTrue(lastSql.contains("t_auto_hltgq_water_alert"));
         assertFalse(lastSql.contains("work_order"));
     }

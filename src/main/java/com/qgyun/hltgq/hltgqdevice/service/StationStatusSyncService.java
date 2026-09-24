@@ -20,22 +20,23 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 视频站点状态同步定时任务
+ * 视频通道 → 设备/站点归属同步定时任务（站点-设备数据架构改造后：设备表为视频资产权威源）
  * <p>
- * 每小时整点执行（如1:00、2:00）：递归遍历大华ICC设备树，收集全部视频通道的
- * 在线/离线状态，按 devicecode 匹配站点信息表 {@code t_auto_hltgq_5nw74_vnqqef}：
+ * 每小时整点执行（如1:00、2:00）：递归遍历大华ICC设备树收集全部视频通道，以设备表
+ * {@code t_auto_hltgq_water_device}（code=通道devicecode、type含#5#）为准分四态处理：
  * <ul>
- *   <li>已存在站点：状态（zebpsu，{@code #1#}在线/{@code #2#}离线）变化时更新；</li>
- *   <li>新视频站点：自动新增，必填 id/devicecode/zebpsu/zzkaec/mivbcz/epjutj，
- *       类型默认 {@code #5#} 视频站点，位置取"管理所级组织-通道名"（如"集岭管理所-大门外"），
- *       坐标暂无来源留空；新增名称与站点表已有 zzkaec 重名时追加"-视频"后缀（如"夏家湖渡槽-视频"）；</li>
- *   <li>ICC设备树中已消失的视频站点：标注离线（{@code #2#}）。
- *       仅在整轮遍历无任何失败节点时执行，防止某子树查询失败被误判为通道消失。</li>
+ *   <li>设备不存在（新通道）：先按NVR名/组织名解析业务站——命中则站点 epjutj 追加
+ *       {@code |#5#} 后建设备挂靠；未命中则查找/新建兜底站（epjutj=#5#、无devicecode，
+ *       名称重名追加"-视频"后缀）并记"待挂靠"日志；</li>
+ *   <li>设备已挂兜底站：每轮重试业务站匹配，命中即改挂（兜底站行保留不删，退场由人工处置）；</li>
+ *   <li>设备已挂旧迁移行（epjutj=#5# 含 devicecode，待迁移脚本换指）：本轮跳过不动；</li>
+ *   <li>设备已挂业务站：站点 epjutj 未含 #5# 时追加，设备状态/位置按设备树同步。</li>
  * </ul>
- * ID生成、系统字段（corp_code/created_at等）与hltgq-mq站点写入规则一致。
- * <p>同时联动视频设备表 {@code t_auto_hltgq_water_device}（{@link DeviceTableService}）：
- * 每个视频站点对应 1 台设备（type=#5# 视频），新增站点自动创建设备，
- * 设备运行状态随通道在线/离线同步，站点消失时联动设备标离线。
+ * 站点表仅写入三类内容：业务站 epjutj 追加 {@code |#5#}、兜底站新建、系统字段
+ * （updated_at/updated_by）——不再写 zebpsu/mivbcz/ahieto/devicecode（D1 决策：状态位置归设备表）。
+ * <p>通道消失：仅联动设备表标离线（站点表旧行保留不动，退役行由迁移/对账侧处理）。
+ * 仅在整轮遍历无任何失败节点时执行，防止某子树查询失败被误判为通道消失。
+ * <p>ID生成、系统字段（corp_code/created_at等）与hltgq-mq站点写入规则一致。
  * <p>应用启动时立即异步同步一次（不等整点），与整点定时任务共用互斥锁，
  * 同一时刻只允许一轮执行（防启动轮与整点轮并发导致重复建站/建设备）。
  *
@@ -48,10 +49,13 @@ public class StationStatusSyncService {
     /** 站点信息表全限定名（人大金仓schema带双引号，因含连字符，与hltgq-mq一致） */
     private static final String STATION_TABLE = "\"qixiao-apaas\".t_auto_hltgq_5nw74_vnqqef";
 
-    /** 视频站点类型（epjutj） */
+    /** 视频设备表全限定名（视频资产权威源：code=通道devicecode → site=归属站点） */
+    private static final String DEVICE_TABLE = "\"qixiao-apaas\".t_auto_hltgq_water_device";
+
+    /** 视频类型（站点 epjutj 追加后缀 / 设备 type，两端同码值 #5#） */
     private static final String VIDEO_TYPE = "#5#";
 
-    /** 站点在线/离线状态值（zebpsu） */
+    /** 设备在线/离线状态值（设备表 status，{@code #1#}在线/{@code #2#}离线） */
     private static final String STATUS_ONLINE = "#1#";
     private static final String STATUS_OFFLINE = "#2#";
 
@@ -144,77 +148,141 @@ public class StationStatusSyncService {
                 refreshChannelCache(channels);
             }
 
-            // 2. 加载站点表现有数据：devicecode → zebpsu + 全部站点名称（失败返回null，代表数据库不可达）
+            // 2. 加载站点表快照：siteById（设备已挂站点判定）+ 全表名称（兜底站去重）+ 业务站名索引（匹配）
             ExistingStations existing = loadExistingStations();
             if (existing == null) {
-                log.warn("[站点同步] 站点表加载失败（数据库不可达？），本轮跳过状态比对与离线标注");
+                log.warn("[站点同步] 站点表加载失败（数据库不可达？），本轮跳过比对与离线标注");
                 return;
             }
-            Map<String, String> existingStatus = existing.status;
 
-            // 3. 逐通道比对：状态变化则更新，新通道则新增，位置随设备树层级持续同步
-            // processedCodes：同一轮遍历中重复出现的通道（多组织共享设备）只处理一次，防止重复插入
-            int inserted = 0, updated = 0, unchanged = 0, locationUpdated = 0, parentLinked = 0;
+            // 3. 逐通道同步（设备表为权威源：code → 设备 → 站点，判定新通道/兜底站/迁移行/业务站四态）
+            // processedCodes：同一轮遍历中重复出现的通道（多组织共享设备）只处理一次；
+            // 同时作为"本轮可见通道"全集，供消失设备离线标注
+            RoundStats stats = new RoundStats();
             Set<String> processedCodes = new HashSet<>();
             for (VideoChannel ch : channels) {
                 if (!processedCodes.add(ch.devicecode)) continue;
-                String target = ch.online ? STATUS_ONLINE : STATUS_OFFLINE;
-                String location = channelLocation(ch);
-                // 用containsKey区分"站点不存在(新增)"与"存在但zebpsu为NULL(更新)"，
-                // 否则NULL状态站点会被误判为新增导致重复插入
-                boolean exists = existingStatus.containsKey(ch.devicecode);
-                String siteId;
-                String stationName;
-                if (!exists) {
-                    // 新站点名称与站点表已有站点重名时追加"-视频"后缀（如"夏家湖渡槽-视频"），
-                    // existing.names 由 uniqueStationName 登记本轮已用名称，防同轮多个同名新站点撞名
-                    stationName = uniqueStationName(ch.name, existing.names);
-                    // 上级站点（ahieto）：按NVR名/组织名匹配档案行，唯一命中才挂（规则见 resolveParentId）
-                    siteId = insertStation(ch, stationName, target, location, resolveParentId(ch, existing));
-                    if (siteId != null) inserted++;
-                } else {
-                    siteId = existing.codeToId.get(ch.devicecode);
-                    stationName = existing.codeToName.get(ch.devicecode);
-                    if (!target.equals(existingStatus.get(ch.devicecode))) {
-                        if (updateStationStatus(ch.devicecode, target)) updated++;
-                    } else {
-                        unchanged++;
-                    }
-                    // 位置同步：mivbcz 与设备树层级计算值不一致时更新（IS DISTINCT FROM 变化才写）
-                    if (updateStationLocation(ch.devicecode, location)) locationUpdated++;
-                    // 上级补挂：存量站点 ahieto 为空（同步建档时未匹配到管理单位）时持续尝试，
-                    // 唯一命中才写、仅写空值（幂等，不覆盖人工挂接成果）
-                    if (existing.codeToParent.get(ch.devicecode) == null) {
-                        String parentId = resolveParentId(ch, existing);
-                        if (parentId != null && updateStationParent(ch.devicecode, parentId)) {
-                            existing.codeToParent.put(ch.devicecode, parentId);
-                            parentLinked++;
-                        }
-                    }
-                }
-                // 视频设备联动：站点新增/已有均同步设备（查/建 + 在线状态与安装位置同步）
-                if (siteId != null && stationName != null) {
-                    syncDevice(ch, siteId, stationName, target);
+                try {
+                    syncChannel(ch, existing, stats);
+                } catch (Exception e) {
+                    log.error("[站点同步] 通道处理失败: devicecode={}", ch.devicecode, e);
                 }
             }
 
-            // 4. ICC设备树中已消失的视频站点 → 标注离线。
+            // 4. 消失通道 → 设备表视频设备标注离线。
             // 仅在整轮遍历无失败时执行：子树查询失败会导致其通道"看起来消失"，
-            // 此时标离线会误伤，故失败即跳过（下轮重试）。
+            // 此时标离线会误伤，故失败即跳过（下轮重试）；站点表旧行不动（退役行处理见迁移/对账）。
             if (!traversalFailed.get()) {
-                int offlineMarked = markMissingStationsOffline(processedCodes);
-                log.info("[站点同步] 完成，耗时{}ms：新增{}个，状态更新{}个，无变化{}个，位置更新{}个，上级补挂{}个，消失标离线{}个",
-                        System.currentTimeMillis() - start, inserted, updated, unchanged,
-                        locationUpdated, parentLinked, offlineMarked);
+                stats.offlineMarked = deviceTableService.markOfflineByMissingCodes(processedCodes);
+                log.info("[站点同步] 完成，耗时{}ms：{}", System.currentTimeMillis() - start, stats.describe());
             } else {
-                log.warn("[站点同步] 完成但遍历存在失败节点（新增{}个，状态更新{}个，无变化{}个，位置更新{}个，上级补挂{}个），本轮跳过消失站点离线标注",
-                        inserted, updated, unchanged, locationUpdated, parentLinked);
+                log.warn("[站点同步] 完成但遍历存在失败节点，本轮跳过设备离线标注：{}", stats.describe());
             }
         } catch (Exception e) {
             log.error("[站点同步] 视频站点状态同步失败：", e);
         } finally {
             syncRunning.set(false);
         }
+    }
+
+    /**
+     * 单通道同步：设备表为权威源的四态判定（新通道 / 兜底站 / 迁移行 / 业务站）。
+     * <ul>
+     *   <li><b>设备不存在</b>（新通道）：解析业务站，命中先追加站点 #5# 类型再建设备挂靠；
+     *       未命中则查找/新建兜底站着落并记"待挂靠"日志（下轮由兜底站分支持续重试匹配）；</li>
+     *   <li><b>设备已挂兜底站</b>：每轮重试业务站匹配，命中即改挂（兜底站行保留不删）；</li>
+     *   <li><b>设备已挂旧迁移行</b>（纯#5#含devicecode）：跳过不动，待迁移脚本换指后自然转入业务站分支；</li>
+     *   <li><b>设备已挂业务站</b>：epjutj 未含 #5# 时追加，设备状态/位置持续同步。</li>
+     * </ul>
+     * 设备 site 悬空（指向不存在的站点行）时按"业务站优先、兜底站其次"重挂靠。
+     * 全部路径均不写站点 zebpsu/mivbcz/ahieto（D1：站点状态位置归设备表）。
+     */
+    private void syncChannel(VideoChannel ch, ExistingStations existing, RoundStats stats) {
+        String target = ch.online ? STATUS_ONLINE : STATUS_OFFLINE;
+        String location = channelLocation(ch);
+        DeviceTableService.VideoDeviceRef device = deviceTableService.findVideoDeviceByCode(ch.devicecode);
+        if (device == null) {
+            // 新通道：业务站优先（命中先补 #5# 再建设备，保持"设备所指站点含 #5#"不变量），未命中落兜底站
+            String siteId = resolveBusinessSite(ch, existing);
+            String stationName;
+            if (siteId != null) {
+                SiteRow hit = existing.siteById.get(siteId);
+                stationName = hit != null ? hit.name : str(ch.name);
+                if (appendVideoType(siteId)) {
+                    stats.videoTypeAppended++;
+                }
+                log.info("[站点同步] 新通道挂靠业务站: devicecode={}, 站点={}({})", ch.devicecode, siteId, stationName);
+            } else {
+                siteId = resolveOrCreateFallbackStation(ch, existing, stats);
+                if (siteId == null) {
+                    log.warn("[站点同步] 兜底站解析失败，跳过: devicecode={}", ch.devicecode);
+                    return;
+                }
+                SiteRow fallback = existing.siteById.get(siteId);
+                stationName = fallback != null ? fallback.name : str(ch.name);
+                log.info("[站点同步] 新通道挂靠兜底站（待挂靠）: devicecode={}, 兜底站={}", ch.devicecode, stationName);
+            }
+            String deviceId = deviceTableService.lookupOrCreateDevice(
+                    deviceTableService.deviceNameOf(stationName), siteId,
+                    DeviceTableService.DEVICE_TYPE_VIDEO, ch.devicecode, target, location);
+            if (deviceId == null) {
+                log.warn("[站点同步] 视频设备创建失败: devicecode={}, 站点={}", ch.devicecode, siteId);
+                return;
+            }
+            stats.deviceCreated++;
+            syncDeviceState(ch, target, location, stats);
+            return;
+        }
+        SiteRow site = device.getSite() == null ? null : existing.siteById.get(device.getSite());
+        if (site == null) {
+            // 设备 site 悬空（站点行不存在/为空）：业务站优先、兜底站其次重挂靠
+            String targetSiteId = resolveBusinessSite(ch, existing);
+            if (targetSiteId != null) {
+                if (appendVideoType(targetSiteId)) {
+                    stats.videoTypeAppended++;
+                }
+                log.info("[站点同步] 设备悬空指向修复→业务站: devicecode={}, site={}", ch.devicecode, targetSiteId);
+            } else {
+                targetSiteId = resolveOrCreateFallbackStation(ch, existing, stats);
+                if (targetSiteId != null) {
+                    log.info("[站点同步] 设备悬空指向修复→兜底站（待挂靠）: devicecode={}, site={}",
+                            ch.devicecode, targetSiteId);
+                }
+            }
+            if (targetSiteId != null && deviceTableService.updateDeviceSite(device.getId(), targetSiteId)) {
+                stats.reattached++;
+            }
+            syncDeviceState(ch, target, location, stats);
+            return;
+        }
+        if (site.isLegacyRow()) {
+            // 旧迁移行（纯#5#含devicecode）：迁移脚本换指前跳过不动（设备状态待迁移后恢复同步）
+            stats.legacySkipped++;
+            return;
+        }
+        if (site.isFallback()) {
+            // 兜底站：每轮重试业务站匹配，命中即改挂（兜底站行保留，退场人工处置）
+            String businessSiteId = resolveBusinessSite(ch, existing);
+            if (businessSiteId != null) {
+                if (appendVideoType(businessSiteId)) {
+                    stats.videoTypeAppended++;
+                }
+                if (deviceTableService.updateDeviceSite(device.getId(), businessSiteId)) {
+                    stats.reattached++;
+                    log.info("[站点同步] 兜底站改挂业务站: devicecode={}, {} → {}",
+                            ch.devicecode, site.id, businessSiteId);
+                } else {
+                    log.warn("[站点同步] 兜底站改挂失败（下轮重试）: devicecode={}", ch.devicecode);
+                }
+            }
+            syncDeviceState(ch, target, location, stats);
+            return;
+        }
+        // 业务站：epjutj 未含 #5# 时追加（先追加后同步设备，保持不变量）；设备状态/位置持续同步
+        if (!site.hasVideoType() && appendVideoType(site.id)) {
+            stats.videoTypeAppended++;
+        }
+        syncDeviceState(ch, target, location, stats);
     }
 
     /**
@@ -278,12 +346,12 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 按通道编码查询视频站点 ID（站点表主键 id），供 /channel-info 响应引用（弹窗宿主关联站点用）。
-     * 单条索引查询实时查库（毫秒级），无需缓存；站点表存在与视频通道同 devicecode 的其他类型站点
-     * （闸门/水质等，参见 loadExistingStations 注释），限定 epjutj 含 #5# 视频站点。
+     * 按通道编码查询视频资产的归属站点 ID（设备表 code → site 解析），
+     * 供 /channel-info 响应引用（弹窗宿主关联站点用）。单条索引查询实时查库（毫秒级），无需缓存；
+     * 设备表 type 含 #5# 限定视频设备（排除同 code 的其他类型设备，参见 loadExistingStations 注释）。
      *
-     * @param devicecode 通道编码（= 站点表 devicecode）
-     * @return 站点 ID；无对应站点或数据库不可达时返回 null
+     * @param devicecode 通道编码（= 设备表 code）
+     * @return 归属站点 ID（业务站/兜底站）；无对应设备或数据库不可达时返回 null
      */
     public String findSiteId(String devicecode) {
         if (devicecode == null || devicecode.trim().isEmpty()) {
@@ -291,8 +359,8 @@ public class StationStatusSyncService {
         }
         try {
             List<String> ids = jdbcTemplate.queryForList(
-                    "SELECT id FROM " + STATION_TABLE +
-                            " WHERE devicecode = ? AND epjutj LIKE '%#5#%' LIMIT 1",
+                    "SELECT site FROM " + DEVICE_TABLE +
+                            " WHERE code = ? AND type LIKE '%" + VIDEO_TYPE + "%' LIMIT 1",
                     String.class, devicecode.trim());
             return (ids == null || ids.isEmpty()) ? null : ids.get(0);
         } catch (Exception e) {
@@ -315,7 +383,7 @@ public class StationStatusSyncService {
      * @param parentId 父节点ID（组织/设备）
      * @param orgName  管理所级组织名称（遍历路径上第一个org节点名，null=尚未遇到org）
      * @param nvrName  最近一层非org父节点名（NVR/位置节点名，null=尚未遇到；org不覆盖它），
-     *                 供站点上级匹配（resolveParentId）使用
+     *                 供业务站匹配（resolveBusinessSite）使用
      * @param out      收集结果
      * @param depth    当前递归深度
      * @param failed   任一节点查询失败即置true（遍历不完整，禁止离线标注）
@@ -375,11 +443,13 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 加载站点表现有数据（单次全表查询，视频/非视频行分流）：
+     * 加载站点表快照（单次全表查询）：
      * <ul>
-     *   <li>视频行（epjutj含#5#）：devicecode → id/zebpsu/zzkaec/mivbcz/ahieto 映射 + 名称集合；</li>
-     *   <li>非视频行（闸站#3#/#1#|#4#、管理所#2#、片区#7#、组织行）：zzkaec → 站点ID候选（上级匹配用）；</li>
-     *   <li>视频行名 → 已挂ahieto（上级匹配"跟随同名视频行归属"用，重名歧义不收录）。</li>
+     *   <li>siteById：站点ID → 行信息（名称/类型/devicecode），供设备已挂站点三态判定
+     *       （业务站/兜底站/迁移行，见 {@link SiteRow}）；</li>
+     *   <li>names：全表站点名称（zzkaec），兜底站新建重名时追加"-视频"后缀；</li>
+     *   <li>idsByName：业务站（非纯#5#行，含迁移后追加#5#的）名称 → 站点ID候选（业务站匹配用）；</li>
+     *   <li>videoParentByName：纯#5#行名 → 已挂ahieto（"跟随同名视频行归属"用，重名歧义置null禁用）。</li>
      * </ul>
      *
      * @return 站点数据快照；数据库不可达时返回null
@@ -387,49 +457,36 @@ public class StationStatusSyncService {
     private ExistingStations loadExistingStations() {
         ExistingStations snapshot = new ExistingStations();
         try {
-            // 全表加载：视频行用于状态/位置/上级比对，非视频行作为上级匹配候选。
-            // 视频行判定必须在内存中按epjutj分流：站点表存在与视频通道同devicecode的其他类型站点
-            // （闸门#3#/水质#6#等，2026-09-05线上发现1000230$1$0$11/1000328$1$0$0重复），
-            // 不限定类型会导致codeToId/name映射到非视频行，进而把设备建错站点、状态/位置波及
+            // 全表加载：设备 site 指向的行做三态判定；业务站名作匹配候选；
+            // 纯#5#行仅参与"同名视频行归属跟随"，不进业务站候选
+            // （历史：站点表存在与视频通道同devicecode的其他类型站点——闸门#3#/水质#6#等，
+            //   2026-09-05线上发现1000230$1$0$11/1000328$1$0$0重复——按类型分流防挂错站点）
             List<Map<String, Object>> rows = jdbcTemplate.queryForList(
-                    "SELECT id, devicecode, zebpsu, zzkaec, mivbcz, epjutj, ahieto FROM " + STATION_TABLE);
+                    "SELECT id, devicecode, zzkaec, epjutj, ahieto FROM " + STATION_TABLE);
             for (Map<String, Object> row : rows) {
-                Object code = row.get("devicecode");
-                Object status = row.get("zebpsu");
-                Object name = row.get("zzkaec");
-                Object id = row.get("id");
-                Object location = row.get("mivbcz");
-                Object type = row.get("epjutj");
-                Object parent = row.get("ahieto");
-                String nameStr = str(name);
-                String idStr = str(id);
-                String typeStr = str(type);
-                if (typeStr != null && typeStr.contains(VIDEO_TYPE)) {
-                    // 视频行：状态/名称/位置/上级映射（仅此分支参与状态比对与设备联动）
-                    if (code != null && !String.valueOf(code).trim().isEmpty()) {
-                        String key = String.valueOf(code).trim();
-                        snapshot.status.put(key, status == null ? null : String.valueOf(status));
-                        if (idStr != null && !idStr.isEmpty()) {
-                            snapshot.codeToId.put(key, idStr);
-                        }
-                        if (nameStr != null && !nameStr.isEmpty()) {
-                            snapshot.codeToName.put(key, nameStr);
-                        }
-                        snapshot.codeToLocation.put(key,
-                                location == null ? null : String.valueOf(location).trim());
-                        snapshot.codeToParent.put(key, str(parent));
-                    }
+                String idStr = str(row.get("id"));
+                String nameStr = str(row.get("zzkaec"));
+                String typeStr = str(row.get("epjutj"));
+                String codeStr = str(row.get("devicecode"));
+                String parentStr = str(row.get("ahieto"));
+                if (nameStr != null && !nameStr.isEmpty()) {
+                    snapshot.names.add(nameStr);
+                }
+                if (idStr == null || idStr.isEmpty()) {
+                    continue;
+                }
+                snapshot.siteById.put(idStr, new SiteRow(idStr, nameStr, typeStr, codeStr));
+                if (VIDEO_TYPE.equals(typeStr)) {
+                    // 纯#5#行（旧迁移行或兜底站）：名称 → 已挂上级；同名行重复出现即歧义（置null禁用），防"跟随"挂错
                     if (nameStr != null && !nameStr.isEmpty()) {
-                        snapshot.names.add(nameStr);
-                        // 视频行名 → 已挂上级；同名行重复出现即歧义（置null禁用），防"跟随"挂错
                         if (snapshot.videoParentByName.containsKey(nameStr)) {
                             snapshot.videoParentByName.put(nameStr, null);
                         } else {
-                            snapshot.videoParentByName.put(nameStr, str(parent));
+                            snapshot.videoParentByName.put(nameStr, parentStr);
                         }
                     }
-                } else if (nameStr != null && !nameStr.isEmpty() && idStr != null && !idStr.isEmpty()) {
-                    // 非视频行：名称 → 站点ID候选（上级匹配时要求唯一命中）
+                } else if (nameStr != null && !nameStr.isEmpty()) {
+                    // 业务站：名称 → 站点ID候选（业务站匹配时要求唯一命中）
                     snapshot.idsByName.computeIfAbsent(nameStr, k -> new ArrayList<>()).add(idStr);
                 }
             }
@@ -441,25 +498,59 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 站点表现有数据快照（单次查询加载，供状态比对、新增站点名称去重与上级匹配）
+     * 站点表快照（单次查询加载，供设备已挂站点判定、兜底站去重与业务站匹配）
      */
     private static class ExistingStations {
-        /** devicecode → zebpsu（zebpsu可能为NULL） */
-        final Map<String, String> status = new HashMap<>();
-        /** devicecode → 站点ID（视频设备联动用） */
-        final Map<String, String> codeToId = new HashMap<>();
-        /** devicecode → zzkaec 站点名（视频设备联动用） */
-        final Map<String, String> codeToName = new HashMap<>();
-        /** devicecode → mivbcz 站点位置（位置同步比对用） */
-        final Map<String, String> codeToLocation = new HashMap<>();
-        /** devicecode → ahieto 上级（空=待补挂；仅视频行） */
-        final Map<String, String> codeToParent = new HashMap<>();
-        /** 全部视频站点名称（zzkaec），新增视频站点重名时追加"-视频"后缀 */
+        /** 站点ID → 行信息（名称/类型/devicecode，三态判定见 SiteRow） */
+        final Map<String, SiteRow> siteById = new HashMap<>();
+        /** 全表站点名称（zzkaec），兜底站新建重名时追加"-视频"后缀 */
         final Set<String> names = new HashSet<>();
-        /** 非视频行：zzkaec → 站点ID候选列表（上级匹配用，唯一命中才挂） */
+        /** 业务站（非纯#5#）名称 → 站点ID候选列表（业务站匹配用，唯一命中才挂） */
         final Map<String, List<String>> idsByName = new HashMap<>();
-        /** 视频行：zzkaec → 已挂ahieto（"跟随同名视频行归属"用；重名歧义时值为null，containsKey区分行不存在） */
+        /** 纯#5#行名 → 已挂ahieto（"跟随同名视频行归属"用；重名歧义时值为null，containsKey区分行不存在） */
         final Map<String, String> videoParentByName = new HashMap<>();
+    }
+
+    /**
+     * 站点行快照（设备 site 指向行的三态判定）：
+     * <ul>
+     *   <li>业务站：epjutj 非纯 #5#（闸站/管理所/片区，含迁移后追加 #5# 的）——正常挂靠目标；</li>
+     *   <li>兜底站：epjutj = #5# 且无 devicecode（同步轮自建，待挂靠）——每轮重试业务站匹配；</li>
+     *   <li>迁移行：epjutj = #5# 且有 devicecode（旧同步产出的待迁移行）——迁移换指前跳过不动。</li>
+     * </ul>
+     */
+    private static class SiteRow {
+        final String id;
+        final String name;
+        final String type;
+        final String devicecode;
+
+        SiteRow(String id, String name, String type, String devicecode) {
+            this.id = id;
+            this.name = name;
+            this.type = type;
+            this.devicecode = devicecode;
+        }
+
+        /** 纯 #5# 行（旧迁移行或兜底站） */
+        boolean isPureVideo() {
+            return VIDEO_TYPE.equals(type);
+        }
+
+        /** 兜底站：纯 #5# 且无 devicecode（旧迁移行均有 devicecode，以此区分） */
+        boolean isFallback() {
+            return isPureVideo() && (devicecode == null || devicecode.isEmpty());
+        }
+
+        /** 旧迁移行：纯 #5# 且有 devicecode（待迁移脚本换指） */
+        boolean isLegacyRow() {
+            return isPureVideo() && devicecode != null && !devicecode.isEmpty();
+        }
+
+        /** epjutj 是否已含 #5# 视频类型（业务站追加判定） */
+        boolean hasVideoType() {
+            return type != null && type.contains(VIDEO_TYPE);
+        }
     }
 
     /**
@@ -497,34 +588,104 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 新增视频站点（此前设备树中不存在的devicecode）
-     * <p>
-     * 必填：id、devicecode、zebpsu、zzkaec（站点名称，可能带"-视频"后缀）、
-     * mivbcz（站点位置，取"管理所级组织-通道名"，如"集岭管理所-大门外"）、
-     * epjutj（默认#5#视频站点）；ahieto（上级站点，按NVR/组织线索匹配档案行，未匹配为null）；
-     * 坐标bviiio_x/bviiio_y暂无来源留空；系统字段与hltgq-mq一致。
+     * 业务站 epjutj 追加视频类型（"|#5#"）：设备挂靠业务站前先追加，保证
+     * "视频设备所指站点含 #5#"不变量（站侧过滤/统计按类型判定）。
+     * COALESCE 守卫 + NOT LIKE 条件幂等：已含 #5# 的行不更新，重复执行不叠加。
      *
-     * @param location 站点位置（channelLocation 计算结果，非空）
-     * @param parentId 上级站点ID（resolveParentId 结果，无可靠匹配为null）
-     * @return 成功返回新站点ID（供视频设备联动），失败返回null
+     * @return true-实际追加（行有变化）；false-已含#5#/站点不存在/数据库不可达
      */
-    private String insertStation(VideoChannel ch, String name, String status, String location, String parentId) {
+    private boolean appendVideoType(String siteId) {
+        if (siteId == null || siteId.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            String sql = "UPDATE " + STATION_TABLE +
+                    " SET epjutj = CASE WHEN COALESCE(epjutj, '') = '' THEN '" + VIDEO_TYPE + "'" +
+                    " ELSE concat(epjutj, '|" + VIDEO_TYPE + "') END, " +
+                    " updated_at = ?, updated_by = 'SYSTEM'" +
+                    " WHERE id = ? AND COALESCE(epjutj, '') NOT LIKE '%" + VIDEO_TYPE + "%'";
+            int rows = jdbcTemplate.update(sql, new Timestamp(System.currentTimeMillis()), siteId.trim());
+            if (rows > 0) {
+                log.info("[站点同步] 业务站追加视频类型: site={}", siteId);
+            }
+            return rows > 0;
+        } catch (Exception e) {
+            log.error("[站点同步] 业务站追加视频类型失败: site={}", siteId, e);
+            return false;
+        }
+    }
+
+    /**
+     * 新建兜底站：新通道匹配不到业务站时的落位站（epjutj=#5#、不写 devicecode，
+     * 以此与旧迁移行（纯#5#有devicecode）区分）。仅写 id/corp_code/系统字段/名称/类型：
+     * 状态/位置归设备表（D1 决策，站点表不再维护 zebpsu/mivbcz/ahieto/devicecode）。
+     *
+     * @return 新站点ID；失败返回null
+     */
+    private String insertFallbackStation(String name) {
         try {
             String stationId = IdGenerator.generate();
             Timestamp now = new Timestamp(System.currentTimeMillis());
             String sql = "INSERT INTO " + STATION_TABLE +
-                    " (id, corp_code, created_at, created_by, updated_at, updated_by, " +
-                    "  devicecode, zebpsu, zzkaec, mivbcz, epjutj, ahieto) " +
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    " (id, corp_code, created_at, created_by, updated_at, updated_by, zzkaec, epjutj) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
             jdbcTemplate.update(sql, stationId, corpCode, now, "SYSTEM", now, "SYSTEM",
-                    ch.devicecode, status, name, location, VIDEO_TYPE, parentId);
-            log.info("[站点同步] 新增视频站点: devicecode={}, 名称={}, 位置={}, 状态={}, 上级={}",
-                    ch.devicecode, name, location, status, parentId);
+                    name, VIDEO_TYPE);
+            log.info("[站点同步] 新建兜底站: 名称={}, id={}", name, stationId);
             return stationId;
         } catch (Exception e) {
-            log.error("[站点同步] 新增视频站点失败: devicecode={}", ch.devicecode, e);
+            log.error("[站点同步] 新建兜底站失败: 名称={}", name, e);
             return null;
         }
+    }
+
+    /**
+     * 兜底站复用查找：按通道名候选（原名/原名+"-视频"）在兜底站中查已建行——
+     * 设备创建失败重试/同通道名多设备场景复用同一兜底站，防重复建站。
+     * 仅匹配纯#5#且无 devicecode 的行，业务站与旧迁移行天然排除。
+     *
+     * @return 兜底站ID；无匹配/查询失败返回null
+     */
+    private String findFallbackStationByName(String baseName) {
+        if (baseName == null || baseName.trim().isEmpty()) {
+            return null;
+        }
+        String name = baseName.trim();
+        try {
+            String sql = "SELECT id FROM " + STATION_TABLE +
+                    " WHERE epjutj = '" + VIDEO_TYPE + "' AND COALESCE(devicecode, '') = ''" +
+                    " AND (zzkaec = ? OR zzkaec = ?) LIMIT 1";
+            List<String> ids = jdbcTemplate.queryForList(sql, String.class, name, name + "-视频");
+            return (ids == null || ids.isEmpty()) ? null : ids.get(0);
+        } catch (Exception e) {
+            log.warn("[站点同步] 兜底站查找失败: 名称={}: {}", baseName, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * 兜底站解析（复用或新建）：新通道匹配不到业务站时调用。
+     * 新站名称经 uniqueStationName 与全表名称去重（重名追加"-视频"后缀），
+     * 并把新行登记进本轮快照（siteById），防同轮多通道重复建站、供设备命名取值。
+     *
+     * @return 兜底站ID；查找与新建均失败返回null
+     */
+    private String resolveOrCreateFallbackStation(VideoChannel ch, ExistingStations existing, RoundStats stats) {
+        String baseName = str(ch.name);
+        if (baseName == null || baseName.isEmpty()) {
+            baseName = ch.devicecode;
+        }
+        String reused = findFallbackStationByName(baseName);
+        if (reused != null) {
+            return reused;
+        }
+        String fallbackName = uniqueStationName(baseName, existing.names);
+        String siteId = insertFallbackStation(fallbackName);
+        if (siteId != null) {
+            existing.siteById.put(siteId, new SiteRow(siteId, fallbackName, VIDEO_TYPE, null));
+            stats.fallbackCreated++;
+        }
+        return siteId;
     }
 
     /**
@@ -537,43 +698,22 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 更新已有站点位置（mivbcz变化时）：
-     * ICC设备树层级为位置权威数据源，站点位置随设备树调整持续同步（变化才写库）。
-     */
-    private boolean updateStationLocation(String devicecode, String location) {
-        try {
-            String sql = "UPDATE " + STATION_TABLE +
-                    " SET mivbcz = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE devicecode = ? AND epjutj LIKE '%#5#%' AND mivbcz IS DISTINCT FROM ?";
-            int rows = jdbcTemplate.update(sql, location,
-                    new Timestamp(System.currentTimeMillis()), devicecode, location);
-            if (rows > 0) {
-                log.info("[站点同步] 站点位置更新: devicecode={}, mivbcz={}", devicecode, location);
-            }
-            return rows > 0;
-        } catch (Exception e) {
-            log.error("[站点同步] 站点位置更新失败: devicecode={}", devicecode, e);
-            return false;
-        }
-    }
-
-    /**
-     * 解析视频站点的上级站点ID（ahieto），供新增站点写入与存量站点补挂。
+     * 解析通道的业务站ID（设备挂靠目标），供新通道挂靠与兜底站改挂。
      * <p>匹配依据来自设备树收集线索与档案表（2026-09-22 人工裁决的归档规则），候选按精确度递减，
      * 逐级尝试、每级唯一命中才采用（"找不到就往上找"）：
      * <ol>
-     *   <li>NVR名（最近一层非org父节点名，如"郝大屋泄洪闸上游"）精确匹配档案非视频行
+     *   <li>NVR名（最近一层非org父节点名，如"郝大屋泄洪闸上游"）精确匹配业务站
      *       （闸站#3#/#1#|#4#、管理所#2#、片区#7#、组织行）；</li>
      *   <li>去掉"上游/下游"后缀再匹配（如"郝大屋泄洪闸上游" → 档案"郝大屋泄洪闸"）；</li>
      *   <li>人工别名（PARENT_NAME_ALIASES，如"二号渡槽" → 档案"2#渡槽"）；</li>
-     *   <li>同名视频行（#5#）已挂上级时跟随（如"段垅节制闸上游" → 同名视频行"段垅节制闸" → "毕岭管理所"）；</li>
+     *   <li>同名纯#5#行（旧视频行）已挂上级时跟随（如"段垅节制闸上游" → 同名行"段垅节制闸" → "毕岭管理所"）；</li>
      *   <li>所属组织名兜底（orgName，如"毕岭管理所"；县org对应档案#7#行"望江"等）。</li>
      * </ol>
-     * 全程唯一命中才返回，未命中返回null（留待人工归类，后续轮次自动重试）。
+     * 全程唯一命中才返回，未命中返回null（落兜底站，后续轮次自动重试）。
      *
-     * @return 上级站点ID；无可靠匹配返回null
+     * @return 业务站ID；无可靠匹配返回null
      */
-    private String resolveParentId(VideoChannel ch, ExistingStations index) {
+    private String resolveBusinessSite(VideoChannel ch, ExistingStations index) {
         // 候选名：NVR名 → 去"上游/下游"后缀 → 人工别名 → 所属组织名（兜底"往上找"）
         List<String> candidates = new ArrayList<>();
         String nvrName = str(ch.nvrName);
@@ -611,27 +751,6 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 补挂已有站点的上级（ahieto）：仅当仍为空时写入（ahieto IS NULL 条件幂等，
-     * 人工已挂/已补挂的行不受影响；限定视频站点类型防波及同devicecode的闸门/水质行）。
-     */
-    private boolean updateStationParent(String devicecode, String parentId) {
-        try {
-            String sql = "UPDATE " + STATION_TABLE +
-                    " SET ahieto = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE devicecode = ? AND epjutj LIKE '%#5#%' AND ahieto IS NULL";
-            int rows = jdbcTemplate.update(sql, parentId,
-                    new Timestamp(System.currentTimeMillis()), devicecode);
-            if (rows > 0) {
-                log.info("[站点同步] 站点上级补挂: devicecode={}, ahieto={}", devicecode, parentId);
-            }
-            return rows > 0;
-        } catch (Exception e) {
-            log.error("[站点同步] 站点上级补挂失败: devicecode={}", devicecode, e);
-            return false;
-        }
-    }
-
-    /**
      * 去掉名称末尾的"上游/下游"方位后缀（如"郝大屋泄洪闸上游" → "郝大屋泄洪闸"）：
      * 设备树NVR/位置节点名常带方位后缀，档案行名不带（上级匹配用）
      */
@@ -649,135 +768,51 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 视频设备联动：每个视频站点对应 1 台设备（type=#5# 视频），查不到自动创建
-     * （防站点同步与设备入库脱节），设备运行状态与安装位置随站点持续同步。
-     * 设备匹配键为通道 devicecode（code 唯一），设备名仅展示——
-     * 历史教训：按 name 匹配时僵尸站点与树内站点重名，状态/位置更新会波及同名僵尸设备。
+     * 视频设备状态/位置同步（仅设备表写入，站点表不再联动）：
+     * 状态随通道在线/离线（updateDeviceStatus 内 IS DISTINCT FROM 变化才写），
+     * 安装位置随设备树层级（updateDeviceLocation 同源守卫）；均按通道 devicecode 精确匹配——
+     * 历史教训：按 name 匹配会波及同名僵尸节点设备，故一律以 code 为键。
      */
-    private void syncDevice(VideoChannel ch, String siteId, String stationName, String status) {
-        String deviceName = deviceTableService.deviceNameOf(stationName);
-        // 安装位置与站点位置同源：管理所级组织-通道名（如"集岭管理所-大门外"）
-        String location = channelLocation(ch);
-        String deviceId = deviceTableService.lookupOrCreateDevice(deviceName, siteId,
-                DeviceTableService.DEVICE_TYPE_VIDEO, ch.devicecode, status, location);
-        if (deviceId == null) {
-            log.warn("[站点同步] 视频设备创建失败, devicecode={}, 设备名={}", ch.devicecode, deviceName);
-            return;
+    private void syncDeviceState(VideoChannel ch, String status, String location, RoundStats stats) {
+        if (deviceTableService.updateDeviceStatus(ch.devicecode, status) > 0) {
+            stats.statusUpdated++;
+        } else {
+            stats.unchanged++;
         }
-        // 状态变化才更新（SQL 内 status IS DISTINCT FROM 条件，无变化不写库）；按 devicecode 精确匹配
-        deviceTableService.updateDeviceStatus(ch.devicecode, status);
-        // 安装位置持续同步（wlcvig 变化才写库，无变化不写）；按 devicecode 精确匹配
-        deviceTableService.updateDeviceLocation(ch.devicecode, location);
-    }
-
-    /**
-     * 更新已有站点状态（zebpsu变化时）
-     */
-    private boolean updateStationStatus(String devicecode, String status) {
-        try {
-            String sql = "UPDATE " + STATION_TABLE +
-                    " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM' " +
-                    " WHERE devicecode = ? AND epjutj LIKE '%#5#%'";
-            int rows = jdbcTemplate.update(sql, status,
-                    new Timestamp(System.currentTimeMillis()), devicecode);
-            if (rows > 0) {
-                log.info("[站点同步] 站点状态更新: devicecode={}, zebpsu={}", devicecode, status);
-            }
-            return rows > 0;
-        } catch (Exception e) {
-            log.error("[站点同步] 站点状态更新失败: devicecode={}", devicecode, e);
-            return false;
+        if (deviceTableService.updateDeviceLocation(ch.devicecode, location) > 0) {
+            stats.locationUpdated++;
         }
     }
 
     /**
-     * 将ICC设备树中已消失的视频站点标注离线。
-     * <p>
-     * 目标行：epjutj含#5#（视频类型）且devicecode不在本轮遍历结果中、当前状态非离线的站点。
-     * 仅在整轮遍历无失败节点时由调用方执行（失败会误伤缺失子树，见syncVideoStationStatus）。
-     * devicecode数量较大时分批NOT IN，避免超出数据库参数上限。
-     *
-     * @param seenCodes 本轮遍历见到的全部devicecode（去重）
-     * @return 标注离线的行数
+     * 单轮同步计数器（仅用于收尾日志，便于运维核对）
      */
-    private int markMissingStationsOffline(Set<String> seenCodes) {
-        int total = 0;
-        Timestamp now = new Timestamp(System.currentTimeMillis());
-        // 本轮将标注离线的站点ID（供视频设备表联动标离线）
-        List<String> offlineSiteIds = new ArrayList<>();
-        try {
-            // 公共条件：视频类型站点、有devicecode、当前状态非离线
-            String baseWhere = " WHERE epjutj LIKE '%#5#%' AND devicecode IS NOT NULL AND devicecode <> ''" +
-                    " AND zebpsu IS DISTINCT FROM ?";
-            if (seenCodes.isEmpty()) {
-                // ICC已无任何视频通道（遍历成功但结果为空）：全部视频站点标离线
-                offlineSiteIds.addAll(queryOfflineStationIds(baseWhere, Collections.emptyList()));
-                String sql = "UPDATE " + STATION_TABLE + " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'"
-                        + baseWhere;
-                int rows = jdbcTemplate.update(sql, STATUS_OFFLINE, now, STATUS_OFFLINE);
-                if (rows > 0) {
-                    log.info("[站点同步] ICC无视频通道，全部视频站点标注离线: {} 个", rows);
-                }
-                total = rows;
-            } else {
-                // 分批NOT IN（每批500个），超出部分分多轮UPDATE
-                List<String> codeList = new ArrayList<>(seenCodes);
-                for (int i = 0; i < codeList.size(); i += 500) {
-                    List<String> chunk = codeList.subList(i, Math.min(i + 500, codeList.size()));
-                    offlineSiteIds.addAll(queryOfflineStationIds(baseWhere, chunk));
-                    StringBuilder sql = new StringBuilder("UPDATE " + STATION_TABLE +
-                            " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'");
-                    sql.append(baseWhere);
-                    sql.append(" AND devicecode NOT IN (");
-                    for (int j = 0; j < chunk.size(); j++) {
-                        sql.append(j == 0 ? "?" : ", ?");
-                    }
-                    sql.append(")");
-                    List<Object> params = new ArrayList<>();
-                    params.add(STATUS_OFFLINE);
-                    params.add(now);
-                    params.add(STATUS_OFFLINE);
-                    params.addAll(chunk);
-                    int rows = jdbcTemplate.update(sql.toString(), params.toArray());
-                    if (rows > 0) {
-                        log.info("[站点同步] ICC中已消失的视频站点标注离线: {} 个", rows);
-                    }
-                    total += rows;
-                }
-            }
-        } catch (Exception e) {
-            log.error("[站点同步] 消失站点离线标注失败：", e);
-        }
-        // 联动视频设备表：消失站点对应的设备标注离线（#2#）
-        if (!offlineSiteIds.isEmpty()) {
-            int devices = deviceTableService.markOfflineBySiteIds(offlineSiteIds);
-            if (devices > 0) {
-                log.info("[站点同步] 消失站点联动视频设备标离线: {} 台", devices);
-            }
-        }
-        return total;
-    }
+    private static class RoundStats {
+        /** 新设备挂靠台数（新建或按名兜底挂接，含业务站/兜底站） */
+        int deviceCreated;
+        /** 设备状态更新台数 */
+        int statusUpdated;
+        /** 设备状态无变化台数 */
+        int unchanged;
+        /** 设备安装位置更新台数 */
+        int locationUpdated;
+        /** 兜底站/悬空指向改挂台数 */
+        int reattached;
+        /** 新建兜底站数 */
+        int fallbackCreated;
+        /** 旧迁移行跳过台数（待迁移脚本换指） */
+        int legacySkipped;
+        /** 业务站追加 #5# 站数 */
+        int videoTypeAppended;
+        /** 消失通道联动标离线设备台数 */
+        int offlineMarked;
 
-    /**
-     * 查询本轮将标注离线的视频站点ID（与站点UPDATE同条件），供设备表联动标离线
-     *
-     * @param baseWhere  公共WHERE（含 zebpsu IS DISTINCT FROM ? 占位）
-     * @param notInCodes devicecode 排除清单（空=不排除）
-     */
-    private List<String> queryOfflineStationIds(String baseWhere, List<String> notInCodes) {
-        StringBuilder sql = new StringBuilder("SELECT id FROM " + STATION_TABLE);
-        sql.append(baseWhere);
-        if (notInCodes != null && !notInCodes.isEmpty()) {
-            sql.append(" AND devicecode NOT IN (");
-            for (int j = 0; j < notInCodes.size(); j++) {
-                sql.append(j == 0 ? "?" : ", ?");
-            }
-            sql.append(")");
+        String describe() {
+            return "新设备" + deviceCreated + "台，状态更新" + statusUpdated + "台，状态无变化" + unchanged
+                    + "台，位置更新" + locationUpdated + "台，兜底改挂" + reattached + "台，新建兜底站"
+                    + fallbackCreated + "个，类型追加" + videoTypeAppended + "站，迁移行跳过"
+                    + legacySkipped + "台，消失标离线" + offlineMarked + "台";
         }
-        List<Object> params = new ArrayList<>();
-        params.add(STATUS_OFFLINE);
-        params.addAll(notInCodes);
-        return jdbcTemplate.queryForList(sql.toString(), String.class, params.toArray());
     }
 
     /**
@@ -811,9 +846,9 @@ public class StationStatusSyncService {
         private final String name;
         /** 管理所级组织名称 → 站点位置mivbcz前半（如"集岭管理所"），未遍历到org时为null */
         private final String orgName;
-        /** 最近一层非org父节点名（NVR/位置节点名，如"郝大屋泄洪闸上游"）→ 站点上级匹配线索（resolveParentId），直挂org时为null */
+        /** 最近一层非org父节点名（NVR/位置节点名，如"郝大屋泄洪闸上游"）→ 业务站匹配线索（resolveBusinessSite），直挂org时为null */
         private final String nvrName;
-        /** 是否在线 → zebpsu */
+        /** 是否在线 → 设备表status */
         private final boolean online;
         /** 摄像头类型：1=枪机 2=球机 3=半球 4=云台（弹窗页云台条显隐预判） */
         private final Integer cameraType;

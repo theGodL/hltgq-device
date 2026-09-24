@@ -5,14 +5,18 @@ import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
 import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
+import org.mockito.invocation.Invocation;
 import org.mockito.invocation.InvocationOnMock;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -25,22 +29,26 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * 视频站点状态同步单测：启动异步首轮同步、轮巡互斥（上一轮未结束跳过）、
- * 新通道新增站点并联动视频设备。
+ * 视频站点同步单测（站点-设备架构改造后：设备表为视频资产权威源的四态同步）。
+ * 覆盖：启动异步首轮、轮巡互斥、遍历失败跳过离线标注、新通道挂靠业务站/兜底站
+ * （名称去重/复用）、旧迁移行跳过、兜底站改挂、悬空指向修复、业务站类型追加、
+ * 位置口径（管理所-通道名）、消失通道离线标注、通道缓存与查询、站点ID查询。
  */
 class StationStatusSyncServiceTest {
 
     private static final String DEVICECODE = "1000231$1$0$10";
     private static final String CHANNEL_NAME = "渠首电站上游";
     private static final String DEVICE_NAME = CHANNEL_NAME + "摄像机#";
-    /** 设备树层级：001→管理所org→位置节点/NVR→通道，位置应取"管理所-通道名" */
+    /** 设备树层级：001→管理所org→位置节点org→通道，位置应取"管理所-通道名" */
     private static final String ORG_ID = "001001";
     private static final String ORG_NAME = "渠首管理所";
     private static final String LOC_NODE_ID = "1000230";
@@ -62,6 +70,7 @@ class StationStatusSyncServiceTest {
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
         ReflectionTestUtils.setField(service, "jdbcTemplate", jdbcTemplate);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
+        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
     }
 
     /** 在线通道节点（cameraType=球机，供通道信息缓存用例断言） */
@@ -97,7 +106,7 @@ class StationStatusSyncServiceTest {
 
     /**
      * 管理所下的硬盘录像机（NVR）mock（001→管理所org→NVR非org→通道）：
-     * NVR 名（如"集岭管理所硬盘录像机"）不进入位置，通道位置取"管理所-通道名"。
+     * NVR 名（如"渠首硬盘录像机"）不进入位置，通道位置取"管理所-通道名"。
      */
     private void mockNvrTree() {
         when(deviceService.getDeviceTreeWithStatus(anyString())).thenAnswer(inv -> {
@@ -136,7 +145,7 @@ class StationStatusSyncServiceTest {
     }
 
     /**
-     * 参数化三层设备树 mock（001→org→dev(NVR名)→通道）：上级匹配用例用，
+     * 参数化三层设备树 mock（001→org→dev(NVR名)→通道）：业务站匹配用例用，
      * NVR名即 dev 节点名（如"孟垅直灌涵"），org 名进入 orgName（组织兜底用）。
      */
     private void mockNvrTreeWithChannel(String orgName, String nvrName,
@@ -161,7 +170,7 @@ class StationStatusSyncServiceTest {
         });
     }
 
-    /** 捕获站点表全部写库调用（update SQL + varargs），供 INSERT/UPDATE 断言 */
+    /** 捕获站点表全部写库调用（appendVideoType UPDATE / 兜底站 INSERT + varargs），并返回 1 行（追加成功语义） */
     private List<InvocationOnMock> captureAllUpdates() {
         List<InvocationOnMock> updateInvocations = new ArrayList<>();
         doAnswer(inv -> {
@@ -171,18 +180,40 @@ class StationStatusSyncServiceTest {
         return updateInvocations;
     }
 
-    /** 取第1次写库（新站点 INSERT）的 varargs 参数数组 */
-    private Object[] insertArgs(List<InvocationOnMock> updateInvocations) {
-        return (Object[]) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[1];
+    private static String sqlOf(InvocationOnMock inv) {
+        return String.valueOf(((Invocation) inv).getRawArguments()[0]);
     }
 
-    /** 非视频站点行（上级匹配候选） */
-    private Map<String, Object> nonVideoRow(String id, String name, String type) {
-        Map<String, Object> row = new java.util.HashMap<>();
+    private static Object[] argsOf(InvocationOnMock inv) {
+        return (Object[]) ((Invocation) inv).getRawArguments()[1];
+    }
+
+    /** 在捕获的写库调用中查找 SQL 同时包含全部子串的首条（找不到返回 null） */
+    private static InvocationOnMock findUpdate(List<InvocationOnMock> updates, String... subs) {
+        for (InvocationOnMock inv : updates) {
+            String sql = sqlOf(inv);
+            boolean all = true;
+            for (String sub : subs) {
+                if (!sql.contains(sub)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) {
+                return inv;
+            }
+        }
+        return null;
+    }
+
+    /** 站点表行（加载快照用：id/zzkaec/epjutj/devicecode/ahieto 五键） */
+    private Map<String, Object> stationRow(String id, String name, String type, String devicecode, String ahieto) {
+        Map<String, Object> row = new HashMap<>();
         row.put("id", id);
         row.put("zzkaec", name);
         row.put("epjutj", type);
+        row.put("devicecode", devicecode);
+        row.put("ahieto", ahieto);
         return row;
     }
 
@@ -208,7 +239,7 @@ class StationStatusSyncServiceTest {
         verify(deviceService, times(1)).getDeviceTreeWithStatus(anyString());
     }
 
-    /** 轮巡互斥：上一轮未结束时本轮直接跳过（防启动轮与整点轮并发重复建站） */
+    /** 轮巡互斥：上一轮未结束时本轮直接跳过（防启动轮与整点轮并发重复同步） */
     @Test
     void syncSkipsWhenPreviousRoundRunning() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);
@@ -232,124 +263,32 @@ class StationStatusSyncServiceTest {
         verify(deviceService, times(1)).getDeviceTreeWithStatus(anyString());
     }
 
-    /** 新通道：新增站点（INSERT，位置=管理所-位置节点）+ 联动查/建设备（位置同源）+ 状态/位置同步 */
+    /**
+     * 遍历存在失败节点：本轮跳过"消失通道标离线"（防子树查询失败被误判为通道消失），
+     * 站点/设备同步仍照常收尾（本用例树为空仅验证离线标注被跳过）。
+     */
     @Test
-    void newChannelInsertsStationAndSyncsDevice() {
-        mockThreeLevelTree();
-        // 站点表加载：空（新通道 → 新增站点）
+    void traversalFailureSkipsOfflineMarking() {
+        when(deviceService.getDeviceTreeWithStatus(anyString()))
+                .thenReturn(DahuaDeviceService.DeviceTreeResult.fail());
         when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
-        // 捕获站点 INSERT 调用
-        List<InvocationOnMock> updateInvocations = new ArrayList<>();
-        doAnswer(inv -> {
-            updateInvocations.add(inv);
-            return 1;
-        }).when(jdbcTemplate).update(anyString(), ArgumentMatchers.<Object>any());
-        // 设备联动预置
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyString())).thenReturn("device-001");
-        when(deviceTableService.updateDeviceStatus(anyString(), anyString())).thenReturn(0);
-        when(deviceTableService.updateDeviceLocation(anyString(), anyString())).thenReturn(0);
 
         service.syncVideoStationStatus();
 
-        // 站点写库共 2 次：INSERT（新站点）+ 消失标注 UPDATE（无消失站点也执行，返回0行）
-        assertEquals(2, updateInvocations.size());
-        String insertSql = (String) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[0];
-        Object[] args = (Object[]) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[1];
-        assertTrue(insertSql.contains("INSERT INTO"));
-        assertTrue(insertSql.contains("t_auto_hltgq_5nw74_vnqqef"));
-        List<Object> vals = Arrays.asList(args);
-        assertTrue(vals.contains(DEVICECODE), "站点 devicecode 应入库");
-        assertTrue(vals.contains("#1#"), "在线站点 zebpsu=#1#");
-        assertTrue(vals.contains("#5#"), "视频站点 epjutj=#5#");
-        assertTrue(vals.contains(LOCATION), "站点位置 mivbcz=管理所-通道名（最内层org/命名后缀不进入位置）");
-        assertNotNull(vals.get(0), "站点 id 应生成");
-        // 第 2 次：消失站点离线标注（NOT IN 排除本轮见到的通道）
-        String offlineSql = (String) ((org.mockito.invocation.Invocation) updateInvocations.get(1))
-                .getRawArguments()[0];
-        assertTrue(offlineSql.contains("SET zebpsu = ?"));
-        assertTrue(offlineSql.contains("devicecode NOT IN"));
-        // 设备联动：查/建（type=#5#）+ 状态同步 + 安装位置同步（与站点位置同源，按 devicecode 精确匹配）
-        verify(deviceTableService).lookupOrCreateDevice(anyString(), anyString(),
-                org.mockito.ArgumentMatchers.eq(DeviceTableService.DEVICE_TYPE_VIDEO),
-                org.mockito.ArgumentMatchers.eq(DEVICECODE), anyString(), anyString());
-        verify(deviceTableService).updateDeviceStatus(org.mockito.ArgumentMatchers.eq(DEVICECODE),
-                org.mockito.ArgumentMatchers.eq("#1#"));
-        verify(deviceTableService).updateDeviceLocation(org.mockito.ArgumentMatchers.eq(DEVICECODE),
-                org.mockito.ArgumentMatchers.eq(LOCATION));
-    }
-
-    /** 已存在站点：状态无变化时不写库，位置与设备树层级不一致时更新 mivbcz 并联动设备安装位置 */
-    @Test
-    void existingStationLocationSyncsFromTree() {
-        mockThreeLevelTree();
-        // 站点表加载：已存在站点（devicecode 命中），zebpsu 已在线、mivbcz 为旧值"渠首电站上游"（历史错值）
-        Map<String, Object> row = new java.util.HashMap<>();
-        row.put("id", "site-001");
-        row.put("devicecode", DEVICECODE);
-        row.put("zzkaec", CHANNEL_NAME);
-        row.put("zebpsu", "#1#");
-        row.put("mivbcz", CHANNEL_NAME);
-        row.put("epjutj", "#5#");
-        when(jdbcTemplate.queryForList(anyString()))
-                .thenReturn(Collections.singletonList(row));
-        // 捕获写库调用（位置UPDATE/消失标注UPDATE；单matcher匹配任意长度varargs）
-        List<InvocationOnMock> updateInvocations = new ArrayList<>();
-        doAnswer(inv -> {
-            updateInvocations.add(inv);
-            return 1;
-        }).when(jdbcTemplate).update(anyString(), ArgumentMatchers.<Object>any());
-        // 设备联动预置
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyString())).thenReturn("device-001");
-        when(deviceTableService.updateDeviceStatus(anyString(), anyString())).thenReturn(0);
-        when(deviceTableService.updateDeviceLocation(anyString(), anyString())).thenReturn(0);
-
-        service.syncVideoStationStatus();
-
-        // 状态无变化 → 状态UPDATE不执行；位置变化 → mivbcz UPDATE + 消失标注 UPDATE 共 2 次
-        assertEquals(2, updateInvocations.size());
-        String locSql = (String) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[0];
-        Object[] args = (Object[]) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[1];
-        assertTrue(locSql.contains("SET mivbcz = ?"), "应执行站点位置 UPDATE");
-        assertTrue(locSql.contains("epjutj"), "位置 UPDATE 必须限定视频站点，防波及同devicecode的闸门/水质站点");
-        assertTrue(Arrays.asList(args).contains(LOCATION), "位置应更新为管理所-通道名");
-        // 状态同步调用但无变化（updateDeviceStatus 由 SQL 条件保证，此处仅验证设备位置联动参数，按 devicecode 精确匹配）
-        verify(deviceTableService).updateDeviceLocation(org.mockito.ArgumentMatchers.eq(DEVICECODE),
-                org.mockito.ArgumentMatchers.eq(LOCATION));
+        verify(deviceTableService, never()).markOfflineByMissingCodes(any());
     }
 
     /**
-     * 已有站点状态变化：状态 UPDATE 必须限定视频站点（epjutj含#5#）——
-     * 历史教训：站点表存在与视频通道同devicecode的闸门/水质站点，不限定类型会把它们的
-     * zebpsu/mivbcz 一并改写（2026-09-05 线上发现 1000328$1$0$0 共 5 个不同类型站点重复）。
+     * 新通道挂靠业务站（组织名兜底匹配）：设备表中无该 code → 解析业务站（唯一命中）→
+     * 站点 epjutj 追加 #5#（追加先于建设备，保持"设备所指站点含 #5#"不变量）→
+     * 建设备挂靠该站 → 设备状态/位置同步 → 本轮通道参与消失标注。
      */
     @Test
-    void statusUpdateLimitsToVideoStations() {
+    void newChannelLinksBusinessStationByOrgName() {
         mockThreeLevelTree();
-        // 站点表加载：已存在站点，zebpsu=#2#（与树上#1#不一致 → 触发状态更新），mivbcz 与树上一致（不触发位置更新）
-        Map<String, Object> row = new java.util.HashMap<>();
-        row.put("id", "site-001");
-        row.put("devicecode", DEVICECODE);
-        row.put("zzkaec", CHANNEL_NAME);
-        row.put("zebpsu", "#2#");
-        row.put("mivbcz", LOCATION);
-        row.put("epjutj", "#5#");
-        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(row));
-        // 捕获全部 UPDATE（状态UPDATE/消失标注UPDATE；单matcher匹配任意长度varargs）
-        List<InvocationOnMock> updateInvocations = new ArrayList<>();
-        doAnswer(inv -> {
-            updateInvocations.add(inv);
-            return 1;
-        }).when(jdbcTemplate).update(anyString(), ArgumentMatchers.<Object>any());
-        // 设备联动预置
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("biz-001", ORG_NAME, "#2#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString())).thenReturn("device-001");
         when(deviceTableService.updateDeviceStatus(anyString(), anyString())).thenReturn(0);
@@ -357,163 +296,321 @@ class StationStatusSyncServiceTest {
 
         service.syncVideoStationStatus();
 
-        // 找到状态 UPDATE（SET zebpsu）并断言限定视频站点
-        boolean found = false;
-        for (InvocationOnMock inv : updateInvocations) {
-            String sql = (String) ((org.mockito.invocation.Invocation) inv).getRawArguments()[0];
-            if (sql.contains("SET zebpsu = ?")) {
-                found = true;
-                assertTrue(sql.contains("epjutj"), "状态 UPDATE 必须限定视频站点：" + sql);
-            }
-        }
-        assertTrue(found, "应执行站点状态 UPDATE");
+        // 仅 1 次站点表写库：业务站追加 #5#（幂等 SQL：CASE WHEN + concat + NOT LIKE）
+        assertEquals(1, updates.size());
+        String appendSql = sqlOf(updates.get(0));
+        assertTrue(appendSql.contains("SET epjutj = CASE WHEN"), "应追加视频类型：" + appendSql);
+        assertTrue(appendSql.contains("concat(epjutj, '|#5#')"), "追加须用 concat（金仓 || 返回布尔）：" + appendSql);
+        assertTrue(appendSql.contains("NOT LIKE '%#5#%'"), "追加须幂等（NOT LIKE 条件）：" + appendSql);
+        assertEquals("biz-001", argsOf(updates.get(0))[1], "追加目标为匹配到的业务站");
+        // 设备挂靠业务站 + 状态/位置按设备树同步
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("biz-001"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), eq("#1#"), eq(LOCATION));
+        verify(deviceTableService).updateDeviceStatus(eq(DEVICECODE), eq("#1#"));
+        verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
+        // 本轮见到的通道参与消失标注
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Collection<String>> seenCaptor = ArgumentCaptor.forClass(Collection.class);
+        verify(deviceTableService).markOfflineByMissingCodes(seenCaptor.capture());
+        assertTrue(seenCaptor.getValue().contains(DEVICECODE), "本轮通道应传给离线标注");
+    }
+
+    /**
+     * 新通道挂靠业务站（NVR名直达）：NVR名与业务站同名 → 设备挂靠该站。
+     * 场景取自 2026-09 实测：通道"孟垅直灌涵_1"挂 NVR"孟垅直灌涵"下，档案存在同名#3#行。
+     */
+    @Test
+    void newChannelLinksBusinessStationByNvrName() {
+        mockNvrTreeWithChannel("宿松", "孟垅直灌涵", "孟垅直灌涵_1", "1000329$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("parent-001", "孟垅直灌涵", "#3#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        assertEquals("parent-001", argsOf(updates.get(0))[1], "NVR名应命中同名业务站");
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-001"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000329$1$0$0"), eq("#1#"), eq("宿松-孟垅直灌涵_1"));
+    }
+
+    /**
+     * 新通道挂靠业务站（去方位后缀+人工别名）：NVR"荞麦岭泄洪闸上游"去"上游"后缀后档案仍无同名行，
+     * 经人工别名映射到"荞麦岭泄洪河"（#1#|#4#，2026-09-22业务确认"河/闸"同指一物）。
+     */
+    @Test
+    void newChannelLinksBusinessStationViaSuffixStripAndAlias() {
+        mockNvrTreeWithChannel("望江", "荞麦岭泄洪闸上游", "荞麦岭泄洪闸上游_1", "1000332$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("parent-river", "荞麦岭泄洪河", "#1#|#4#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        assertEquals("parent-river", argsOf(updates.get(0))[1], "别名应映射到荞麦岭泄洪河");
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-river"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000332$1$0$0"), eq("#1#"), anyString());
+    }
+
+    /**
+     * 新通道挂靠业务站（跟随同名纯#5#行的已挂上级）：NVR"段垅节制闸上游"在档案无闸站行，
+     * 但同名纯#5#行"段垅节制闸"已挂"毕岭管理所" → 跟随其上级（2026-09-22业务确认规则）。
+     */
+    @Test
+    void newChannelFollowsExistingVideoRowParent() {
+        mockNvrTreeWithChannel("太湖", "段垅节制闸上游", "段垅节制闸上游_1", "1000347$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("video-001", "段垅节制闸", "#5#", "1000218$1$0$6", "parent-biling")));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        assertEquals("parent-biling", argsOf(updates.get(0))[1], "应跟随同名视频行已挂的上级");
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-biling"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000347$1$0$0"), eq("#1#"), anyString());
+    }
+
+    /** 上级匹配歧义（同名多行）：不挂任何业务站，落兜底站（防误挂） */
+    @Test
+    void ambiguousBusinessNameFallsToFallback() {
+        mockThreeLevelTree();
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
+                stationRow("dup-1", ORG_NAME, "#2#", null, null),
+                stationRow("dup-2", ORG_NAME, "#3#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        // 歧义候选跳过 → 新建兜底站（INSERT），名称取通道名
+        InvocationOnMock insert = findUpdate(updates, "INSERT INTO");
+        assertNotNull(insert, "歧义时应落兜底站");
+        assertEquals(CHANNEL_NAME, argsOf(insert)[6], "兜底站名取通道名");
+        assertEquals("#5#", argsOf(insert)[7], "兜底站 epjutj=#5#");
+    }
+
+    /**
+     * 新通道无业务站匹配 → 新建兜底站（INSERT 仅 8 列：id/系统字段/名称/类型，
+     * 不写 devicecode/zebpsu/mivbcz——状态位置归设备表）→ 设备挂靠兜底站（待挂靠）。
+     */
+    @Test
+    void newChannelWithoutMatchCreatesFallbackStation() {
+        mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        assertEquals(1, updates.size());
+        InvocationOnMock insert = updates.get(0);
+        String insertSql = sqlOf(insert);
+        assertTrue(insertSql.contains("INSERT INTO"));
+        assertTrue(insertSql.contains("t_auto_hltgq_5nw74_vnqqef"));
+        assertTrue(insertSql.contains("(id, corp_code, created_at, created_by, updated_at, updated_by, zzkaec, epjutj)"),
+                "兜底站 INSERT 仅 8 列：" + insertSql);
+        Object[] args = argsOf(insert);
+        assertEquals(8, args.length);
+        String fallbackSiteId = String.valueOf(args[0]);
+        assertEquals("野站闸_1", args[6], "兜底站名=通道名（无重名不加后缀）");
+        assertEquals("#5#", args[7], "兜底站 epjutj=#5#");
+        assertFalse(Arrays.asList(args).contains("1000900$1$0$0"), "兜底站不写 devicecode");
+        assertFalse(insertSql.contains("devicecode"), "兜底站 SQL 不含 devicecode 列");
+        assertFalse(insertSql.contains("zebpsu"), "兜底站 SQL 不含 zebpsu（状态归设备表）");
+        assertFalse(insertSql.contains("mivbcz"), "兜底站 SQL 不含 mivbcz（位置归设备表）");
+        // 设备挂靠兜底站
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(fallbackSiteId),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000900$1$0$0"), eq("#1#"), eq("望江县-野站闸_1"));
+    }
+
+    /** 兜底站重名去重：通道名与已有站点重名 → 追加"-视频"后缀（与 uniqueStationName 规则一致） */
+    @Test
+    void fallbackStationNameDeduplicatedWithSuffix() {
+        mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("existing-1", "野站闸_1", "#2#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        InvocationOnMock insert = findUpdate(updates, "INSERT INTO");
+        assertNotNull(insert);
+        assertEquals("野站闸_1-视频", argsOf(insert)[6], "重名应追加-视频后缀");
+    }
+
+    /** 兜底站复用：同通道名兜底站已存在（设备创建失败重试/同名多设备场景）→ 复用不重复建站 */
+    @Test
+    void fallbackStationReusedWhenExists() {
+        mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), anyString(), anyString()))
+                .thenReturn(Collections.singletonList("fallback-001"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        service.syncVideoStationStatus();
+
+        assertNull(findUpdate(updates, "INSERT INTO"), "兜底站已存在不应重复建站");
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("fallback-001"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000900$1$0$0"), eq("#1#"), anyString());
+    }
+
+    /**
+     * 旧迁移行（纯#5#含devicecode）：迁移脚本换指前本轮跳过不动——
+     * 不追加类型、不改挂、不建/查设备、不同步状态（站点表与设备表均无写库）。
+     */
+    @Test
+    void legacyRowDeviceSkipped() {
+        mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("legacy-001", "野站闸_1", "#5#", "1000218$1$0$6", null)));
+        when(deviceTableService.findVideoDeviceByCode("1000900$1$0$0"))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-legacy", "legacy-001"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        assertEquals(0, updates.size(), "迁移行不应触发站点表写库");
+        verify(deviceTableService, never()).lookupOrCreateDevice(anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString());
+        verify(deviceTableService, never()).updateDeviceSite(anyString(), anyString());
+        verify(deviceTableService, never()).updateDeviceStatus(anyString(), anyString());
+        verify(deviceTableService, never()).updateDeviceLocation(anyString(), anyString());
+    }
+
+    /**
+     * 兜底站设备改挂业务站（每轮重试）：设备已挂兜底站 → 本轮业务站匹配命中（去后缀）→
+     * 业务站追加 #5# + 设备改挂 + 状态/位置照常同步。
+     */
+    @Test
+    void fallbackDeviceReattachesToBusinessOnRetry() {
+        mockNvrTreeWithChannel("望江县", "段垅节制闸上游", "段垅节制闸上游_1", "1000347$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
+                stationRow("fb-001", "段垅节制闸上游_1", "#5#", null, null),
+                stationRow("biz-002", "段垅节制闸", "#3#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode("1000347$1$0$0"))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "fb-001"));
+        when(deviceTableService.updateDeviceSite(anyString(), anyString())).thenReturn(true);
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        // 业务站追加 #5#
+        InvocationOnMock append = findUpdate(updates, "SET epjutj = CASE WHEN");
+        assertNotNull(append, "改挂前应先追加业务站 #5#");
+        assertEquals("biz-002", argsOf(append)[1]);
+        // 设备从兜底站改挂业务站
+        verify(deviceTableService).updateDeviceSite(eq("dev-1"), eq("biz-002"));
+        // 状态/位置照常同步
+        verify(deviceTableService).updateDeviceStatus(eq("1000347$1$0$0"), eq("#1#"));
+        verify(deviceTableService).updateDeviceLocation(eq("1000347$1$0$0"), eq("望江县-段垅节制闸上游_1"));
+    }
+
+    /** 兜底站设备重试未命中：保持挂靠（不改挂、不追加），状态/位置照常同步（下轮继续重试） */
+    @Test
+    void fallbackDeviceStaysWhenNoBusinessMatch() {
+        mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("fb-001", "野站闸_1", "#5#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode("1000900$1$0$0"))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "fb-001"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        assertEquals(0, updates.size(), "未命中业务站不应有站点表写库");
+        verify(deviceTableService, never()).updateDeviceSite(anyString(), anyString());
+        verify(deviceTableService).updateDeviceStatus(eq("1000900$1$0$0"), eq("#1#"));
+    }
+
+    /** 设备 site 悬空（指向不存在的站点行）：按业务站优先重挂靠 + 追加类型 */
+    @Test
+    void danglingDeviceSiteRepaired() {
+        mockThreeLevelTree();
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("biz-009", ORG_NAME, "#2#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "missing-site"));
+        when(deviceTableService.updateDeviceSite(anyString(), anyString())).thenReturn(true);
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        InvocationOnMock append = findUpdate(updates, "SET epjutj = CASE WHEN");
+        assertNotNull(append, "重挂业务站前应先追加 #5#");
+        assertEquals("biz-009", argsOf(append)[1]);
+        verify(deviceTableService).updateDeviceSite(eq("dev-1"), eq("biz-009"));
+    }
+
+    /** 业务站设备：站点 epjutj 未含 #5# 时追加（先追加后同步状态），状态/位置同步 */
+    @Test
+    void businessStationAppendsVideoTypeWhenMissing() {
+        mockThreeLevelTree();
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("biz-004", ORG_NAME, "#2#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "biz-004"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        InvocationOnMock append = findUpdate(updates, "SET epjutj = CASE WHEN");
+        assertNotNull(append, "未含 #5# 的业务站应追加");
+        assertEquals("biz-004", argsOf(append)[1]);
+        verify(deviceTableService).updateDeviceStatus(eq(DEVICECODE), eq("#1#"));
+        verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
+    }
+
+    /** 业务站设备：站点 epjutj 已含 #5#（如"#2#|#5#"）→ 不重复追加，仅同步状态/位置 */
+    @Test
+    void businessStationWithVideoTypeSkipsAppend() {
+        mockThreeLevelTree();
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("biz-005", ORG_NAME, "#2#|#5#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "biz-005"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        assertEquals(0, updates.size(), "已含 #5# 不应重复追加");
+        verify(deviceTableService).updateDeviceStatus(eq(DEVICECODE), eq("#1#"));
+        verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
     }
 
     /** NVR 下的新通道：位置取"管理所-通道名"，NVR 名不进入位置（历史教训：16个通道全写成NVR名无法区分） */
     @Test
     void nvrChannelLocationUsesChannelNameNotNvrName() {
         mockNvrTree();
-        // 站点表加载：空（新通道 → 新增站点）
         when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
-        // 捕获站点 INSERT 调用
-        List<InvocationOnMock> updateInvocations = new ArrayList<>();
-        doAnswer(inv -> {
-            updateInvocations.add(inv);
-            return 1;
-        }).when(jdbcTemplate).update(anyString(), ArgumentMatchers.<Object>any());
-        // 设备联动预置
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
+        List<InvocationOnMock> updates = captureAllUpdates();
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString())).thenReturn("device-001");
-        when(deviceTableService.updateDeviceStatus(anyString(), anyString())).thenReturn(0);
         when(deviceTableService.updateDeviceLocation(anyString(), anyString())).thenReturn(0);
 
         service.syncVideoStationStatus();
 
-        // 第 1 次写库：站点 INSERT
-        Object[] args = (Object[]) ((org.mockito.invocation.Invocation) updateInvocations.get(0))
-                .getRawArguments()[1];
-        List<Object> vals = Arrays.asList(args);
-        assertTrue(vals.contains(LOCATION), "NVR通道位置应为管理所-通道名：" + LOCATION);
-        assertFalse(vals.contains(NVR_NAME), "NVR名不应进入站点位置");
-        assertFalse(vals.contains(ORG_NAME + "-" + NVR_NAME), "位置不应为管理所-NVR名");
-        // 设备安装位置同源：管理所-通道名，按 devicecode 精确匹配
-        verify(deviceTableService).updateDeviceLocation(org.mockito.ArgumentMatchers.eq(DEVICECODE),
-                org.mockito.ArgumentMatchers.eq(LOCATION));
-    }
-
-    // ==================== 站点上级匹配（ahieto 自动挂接） ====================
-
-    /**
-     * 新通道上级匹配（同名直达）：NVR名与档案非视频行同名 → INSERT 的 ahieto 写为该行ID。
-     * 场景取自 2026-09 实测：通道"孟垅直灌涵_1"挂 NVR"孟垅直灌涵"下，档案存在同名#3#行。
-     */
-    @Test
-    void newStationLinksParentByName() {
-        mockNvrTreeWithChannel("宿松", "孟垅直灌涵", "孟垅直灌涵_1", "1000329$1$0$0");
-        when(jdbcTemplate.queryForList(anyString()))
-                .thenReturn(Collections.singletonList(nonVideoRow("parent-001", "孟垅直灌涵", "#3#")));
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        List<InvocationOnMock> writes = captureAllUpdates();
-
-        service.syncVideoStationStatus();
-
-        Object[] args = insertArgs(writes);
-        assertEquals("parent-001", args[args.length - 1], "上级应匹配同名档案行");
-    }
-
-    /**
-     * 新通道上级匹配（去方位后缀+人工别名）：NVR"荞麦岭泄洪闸上游"去"上游"后缀后档案仍无同名行，
-     * 经人工别名映射到"荞麦岭泄洪河"（#1#|#4#，2026-09-22业务确认"河/闸"同指一物）。
-     */
-    @Test
-    void newStationLinksParentViaSuffixStripAndAlias() {
-        mockNvrTreeWithChannel("望江", "荞麦岭泄洪闸上游", "荞麦岭泄洪闸上游_1", "1000332$1$0$0");
-        when(jdbcTemplate.queryForList(anyString()))
-                .thenReturn(Collections.singletonList(
-                        nonVideoRow("parent-river", "荞麦岭泄洪河", "#1#|#4#")));
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        List<InvocationOnMock> writes = captureAllUpdates();
-
-        service.syncVideoStationStatus();
-
-        Object[] args = insertArgs(writes);
-        assertEquals("parent-river", args[args.length - 1], "别名应映射到荞麦岭泄洪河");
-    }
-
-    /**
-     * 新通道上级匹配（跟随同名视频行）：NVR"段垅节制闸上游"在档案无闸站行，
-     * 但同名视频行"段垅节制闸"已挂"毕岭管理所" → 跟随其上级（2026-09-22业务确认规则）。
-     */
-    @Test
-    void newStationFollowsExistingVideoParent() {
-        mockNvrTreeWithChannel("太湖", "段垅节制闸上游", "段垅节制闸上游_1", "1000347$1$0$0");
-        Map<String, Object> videoRow = new java.util.HashMap<>();
-        videoRow.put("id", "video-001");
-        videoRow.put("devicecode", "1000218$1$0$6");
-        videoRow.put("zzkaec", "段垅节制闸");
-        videoRow.put("zebpsu", "#1#");
-        videoRow.put("epjutj", "#5#");
-        videoRow.put("ahieto", "parent-biling");
-        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(videoRow));
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        List<InvocationOnMock> writes = captureAllUpdates();
-
-        service.syncVideoStationStatus();
-
-        Object[] args = insertArgs(writes);
-        assertEquals("parent-biling", args[args.length - 1], "应跟随同名视频行已挂的上级");
-    }
-
-    /**
-     * 存量站点上级补挂：ahieto 为空时按组织名兜底匹配（NVR"毕岭管理所硬盘录像机"→组织"毕岭管理所"）；
-     * 补挂 UPDATE 必须限定 ahieto IS NULL（幂等，不覆盖人工挂接）与视频站点类型。
-     */
-    @Test
-    void existingStationBackfillsParentId() {
-        mockNvrTreeWithChannel("毕岭管理所", "毕岭管理所硬盘录像机", "毕岭管理所院内", "1000218$1$0$4");
-        Map<String, Object> videoRow = new java.util.HashMap<>();
-        videoRow.put("id", "site-001");
-        videoRow.put("devicecode", "1000218$1$0$4");
-        videoRow.put("zzkaec", "毕岭管理所院内");
-        videoRow.put("zebpsu", "#1#");
-        videoRow.put("mivbcz", "old-location");
-        videoRow.put("epjutj", "#5#");
-        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
-                videoRow, nonVideoRow("org-biling", "毕岭管理所", "#2#")));
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        List<InvocationOnMock> writes = captureAllUpdates();
-
-        service.syncVideoStationStatus();
-
-        boolean found = false;
-        for (InvocationOnMock inv : writes) {
-            String sql = (String) ((org.mockito.invocation.Invocation) inv).getRawArguments()[0];
-            if (sql.contains("SET ahieto = ?")) {
-                found = true;
-                assertTrue(sql.contains("ahieto IS NULL"), "补挂必须限定空上级（不覆盖人工挂接）：" + sql);
-                assertTrue(sql.contains("epjutj"), "补挂必须限定视频站点类型：" + sql);
-                Object[] args = (Object[]) ((org.mockito.invocation.Invocation) inv).getRawArguments()[1];
-                assertTrue(Arrays.asList(args).contains("org-biling"), "应补挂到组织行ID");
-            }
-        }
-        assertTrue(found, "应执行上级补挂 UPDATE");
-    }
-
-    /** 上级匹配歧义（同名多行）：不挂任何上级，防误挂（INSERT 的 ahieto=null） */
-    @Test
-    void ambiguousParentNameNotLinked() {
-        mockNvrTreeWithChannel("望江", "歧义闸", "歧义闸_1", "1000900$1$0$0");
-        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
-                nonVideoRow("dup-1", "歧义闸", "#3#"),
-                nonVideoRow("dup-2", "歧义闸", "#1#|#4#")));
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
-        List<InvocationOnMock> writes = captureAllUpdates();
-
-        service.syncVideoStationStatus();
-
-        Object[] args = insertArgs(writes);
-        assertNull(args[args.length - 1], "同名歧义时不应挂上级");
+        // 兜底站名=通道名；NVR 名不进入名称/位置
+        InvocationOnMock insert = findUpdate(updates, "INSERT INTO");
+        assertNotNull(insert);
+        Object[] args = argsOf(insert);
+        assertTrue(Arrays.asList(args).contains(CHANNEL_NAME), "兜底站名应为通道名");
+        assertFalse(Arrays.asList(args).contains(NVR_NAME), "NVR名不应进入站点名称");
+        assertFalse(Arrays.asList(args).contains(ORG_NAME + "-" + NVR_NAME), "位置不应为管理所-NVR名");
+        // 设备安装位置=管理所-通道名（设备表 wlcvig，站点同步轮维护）
+        verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), eq("#1#"), eq(LOCATION));
     }
 
     // ==================== 通道信息缓存与查询（/channel-info 支撑） ====================
@@ -564,29 +661,29 @@ class StationStatusSyncServiceTest {
 
     // ==================== 站点ID查询（/channel-info 响应含 siteId） ====================
 
-    /** findSiteId：按 devicecode 实时查站点表，SQL 必须限定视频站点类型（防命中同 devicecode 的闸门/水质站点） */
+    /** findSiteId：按通道 devicecode 查设备表 site，SQL 必须限定视频设备类型（防命中同 code 的其他类型设备） */
     @Test
-    void findSiteIdQueriesVideoStationOnly() {
-        when(jdbcTemplate.queryForList(anyString(), org.mockito.ArgumentMatchers.eq(String.class), anyString()))
+    void findSiteIdQueriesVideoDeviceOnly() {
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), anyString()))
                 .thenReturn(Collections.singletonList("site-001"));
 
-        assertEquals("site-001", service.findSiteId(DEVICECODE), "应返回站点表主键 id");
+        assertEquals("site-001", service.findSiteId(DEVICECODE), "应返回设备表 site 列");
 
-        org.mockito.ArgumentCaptor<String> sqlCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
-        verify(jdbcTemplate).queryForList(sqlCaptor.capture(),
-                org.mockito.ArgumentMatchers.eq(String.class),
-                org.mockito.ArgumentMatchers.eq(DEVICECODE));
-        assertTrue(sqlCaptor.getValue().contains("epjutj LIKE '%#5#%'"),
-                "站点ID查询必须限定视频站点类型，实际 SQL：" + sqlCaptor.getValue());
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(String.class), eq(DEVICECODE));
+        assertTrue(sqlCaptor.getValue().contains("t_auto_hltgq_water_device"),
+                "站点ID查询应走设备表（视频资产权威源），实际 SQL：" + sqlCaptor.getValue());
+        assertTrue(sqlCaptor.getValue().contains("type LIKE '%#5#%'"),
+                "站点ID查询必须限定视频设备类型，实际 SQL：" + sqlCaptor.getValue());
     }
 
-    /** findSiteId：无对应站点返回 null（不阻断接口，响应中 siteId 可为空）；空白入参直接返回 null（不查库） */
+    /** findSiteId：无对应设备返回 null（不阻断接口，响应中 siteId 可为空）；空白入参直接返回 null（不查库） */
     @Test
     void findSiteIdReturnsNullWhenAbsent() {
-        when(jdbcTemplate.queryForList(anyString(), org.mockito.ArgumentMatchers.eq(String.class), anyString()))
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), anyString()))
                 .thenReturn(new ArrayList<>());
 
-        assertNull(service.findSiteId(DEVICECODE), "无对应站点应返回 null");
+        assertNull(service.findSiteId(DEVICECODE), "无对应设备应返回 null");
         assertNull(service.findSiteId("  "), "空白 devicecode 应直接返回 null");
     }
 }
