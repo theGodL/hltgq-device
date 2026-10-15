@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 /**
  * 视频通道 → 设备/站点归属同步定时任务（站点-设备数据架构改造后：设备表为视频资产权威源）
@@ -27,6 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <ul>
  *   <li>设备不存在（新通道）：先按NVR名/组织名解析业务站——命中则站点 epjutj 追加
  *       {@code |#5#} 后建设备挂靠；未命中则查找/新建兜底站（epjutj=#5#、无devicecode，
+ *       基名按NVR名去噪归并——同NVR多通道共用一个兜底站，恢复"站点≠设备、一站多设备"；
  *       名称重名追加"-视频"后缀）并记"待挂靠"日志；</li>
  *   <li>设备已挂兜底站：每轮重试业务站匹配，命中即改挂（兜底站行保留不删，退场由人工处置）；</li>
  *   <li>设备已挂旧迁移行（epjutj=#5# 含 devicecode，待迁移脚本换指）：本轮跳过不动；</li>
@@ -75,6 +77,15 @@ public class StationStatusSyncService {
         aliases.put("二号渡槽", "2#渡槽");
         PARENT_NAME_ALIASES = Collections.unmodifiableMap(aliases);
     }
+
+    /**
+     * 兜底站基名尾部噪声模式（2026-10-15 治理）：站点表不应出现设备式名称——
+     * ICC 同 NVR 下通道重名自动追加"_数字"后缀（如"五圩支渠摄像机_1"），
+     * "摄像机/硬盘录像机/录像机"设备词来自 ICC 命名习惯本身。兜底站基名剥除
+     * 这些尾巴后，同 NVR 多通道命中同一基名归并为一个兜底站（一站多设备）。
+     * 多词尾选择长词在前（"硬盘录像机"先于"录像机"，防只剥后缀留下"硬盘"）。
+     */
+    private static final Pattern TRAIL_NAME_NOISE = Pattern.compile("(_\\d+|硬盘录像机|录像机|摄像机)+$");
 
     /** 设备树递归最大深度，防止异常数据导致无限递归 */
     private static final int MAX_TREE_DEPTH = 10;
@@ -562,7 +573,7 @@ public class StationStatusSyncService {
      * 调用方负责传入并维护 usedNames（含本轮已插入的新站点名），
      * 防止同一轮内多个同名新通道互相撞名。
      *
-     * @param baseName  通道名称（zzkaec候选值）
+     * @param baseName  站点基名（NVR名/通道名去噪后值，zzkaec候选）
      * @param usedNames 已使用名称集合（会被修改：登记最终使用的名称）
      * @return 去重后的站点名称
      */
@@ -640,52 +651,111 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 兜底站复用查找：按通道名候选（原名/原名+"-视频"）在兜底站中查已建行——
-     * 设备创建失败重试/同通道名多设备场景复用同一兜底站，防重复建站。
+     * 兜底站复用查找：按基名候选列表（含各候选的"-视频"去重变体）在兜底站中查已建行——
+     * 同NVR多通道归并复用/设备创建失败重试场景复用同一兜底站，防重复建站。
+     * 候选含去噪基名与通道原名（旧命名），防基名规则变更前已建的旧命名兜底站因查不到而重复建站。
      * 仅匹配纯#5#且无 devicecode 的行，业务站与旧迁移行天然排除。
      *
      * @return 兜底站ID；无匹配/查询失败返回null
      */
-    private String findFallbackStationByName(String baseName) {
-        if (baseName == null || baseName.trim().isEmpty()) {
+    private String findFallbackStationByNames(List<String> baseNames) {
+        if (baseNames == null || baseNames.isEmpty()) {
             return null;
         }
-        String name = baseName.trim();
+        List<String> names = new ArrayList<>();
+        for (String base : baseNames) {
+            addCandidateName(names, base);
+            addCandidateName(names, base + "-视频");
+        }
+        if (names.isEmpty()) {
+            return null;
+        }
+        StringBuilder placeholders = new StringBuilder();
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) {
+                placeholders.append(", ");
+            }
+            placeholders.append("?");
+        }
         try {
             String sql = "SELECT id FROM " + STATION_TABLE +
                     " WHERE epjutj = '" + VIDEO_TYPE + "' AND COALESCE(devicecode, '') = ''" +
-                    " AND (zzkaec = ? OR zzkaec = ?) LIMIT 1";
-            List<String> ids = jdbcTemplate.queryForList(sql, String.class, name, name + "-视频");
+                    " AND zzkaec IN (" + placeholders + ") LIMIT 1";
+            List<String> ids = jdbcTemplate.queryForList(sql, String.class, names.toArray());
             return (ids == null || ids.isEmpty()) ? null : ids.get(0);
         } catch (Exception e) {
-            log.warn("[站点同步] 兜底站查找失败: 名称={}: {}", baseName, e.getMessage());
+            log.warn("[站点同步] 兜底站复用查找失败: 候选={}: {}", names, e.getMessage());
             return null;
         }
     }
 
     /**
      * 兜底站解析（复用或新建）：新通道匹配不到业务站时调用。
+     * <p>基名优先级（2026-10-15 NVR归并治理，历史教训：按ICC通道原名逐通道建站产生
+     * "五圩支渠摄像机_1"等设备式站名，违背"站点≠设备、一站多设备"模型）：
+     * NVR名去噪 → 通道名去噪 → 通道原名 → devicecode；去噪剥除尾部"_数字"（ICC重名
+     * 后缀）与设备词（摄像机/硬盘录像机），同NVR多通道命中同一基名共用一个兜底站。
      * 新站名称经 uniqueStationName 与全表名称去重（重名追加"-视频"后缀），
      * 并把新行登记进本轮快照（siteById），防同轮多通道重复建站、供设备命名取值。
      *
      * @return 兜底站ID；查找与新建均失败返回null
      */
     private String resolveOrCreateFallbackStation(VideoChannel ch, ExistingStations existing, RoundStats stats) {
-        String baseName = str(ch.name);
-        if (baseName == null || baseName.isEmpty()) {
-            baseName = ch.devicecode;
+        List<String> candidates = fallbackBaseNameCandidates(ch);
+        if (candidates.isEmpty()) {
+            return null;
         }
-        String reused = findFallbackStationByName(baseName);
+        String reused = findFallbackStationByNames(candidates);
         if (reused != null) {
             return reused;
         }
-        String fallbackName = uniqueStationName(baseName, existing.names);
+        String fallbackName = uniqueStationName(candidates.get(0), existing.names);
         String siteId = insertFallbackStation(fallbackName);
         if (siteId != null) {
             existing.siteById.put(siteId, new SiteRow(siteId, fallbackName, VIDEO_TYPE, null));
             stats.fallbackCreated++;
         }
         return siteId;
+    }
+
+    /**
+     * 兜底站基名候选（精确度递减、去重）：NVR名去噪 → 通道名去噪 → 通道原名 → devicecode。
+     * 首项为建站基名；全列表供复用查找兼容历史命名。
+     */
+    private List<String> fallbackBaseNameCandidates(VideoChannel ch) {
+        List<String> candidates = new ArrayList<>();
+        addCandidateName(candidates, denoiseStationName(ch.nvrName));
+        addCandidateName(candidates, denoiseStationName(ch.name));
+        addCandidateName(candidates, str(ch.name));
+        addCandidateName(candidates, str(ch.devicecode));
+        return candidates;
+    }
+
+    /** 候选名登记（null/空白/已存在跳过；入参可为null，由 {@link #denoiseStationName} 产出） */
+    private static void addCandidateName(List<String> candidates, String name) {
+        if (name != null && !name.isEmpty() && !candidates.contains(name)) {
+            candidates.add(name);
+        }
+    }
+
+    /**
+     * 站点基名去噪：循环剥除尾部"_数字"与设备词（见 TRAIL_NAME_NOISE），
+     * 如"五圩支渠摄像机_1"→"五圩支渠"、"渠首硬盘录像机"→"渠首"；
+     * 整名均为噪声时返回空串（调用方按下一优先级候选降级）。
+     */
+    private static String denoiseStationName(String name) {
+        String trimmed = str(name);
+        if (trimmed == null || trimmed.isEmpty()) {
+            return "";
+        }
+        String current = trimmed;
+        while (true) {
+            String stripped = TRAIL_NAME_NOISE.matcher(current).replaceAll("");
+            if (stripped.equals(current)) {
+                return stripped.trim();
+            }
+            current = stripped;
+        }
     }
 
     /**

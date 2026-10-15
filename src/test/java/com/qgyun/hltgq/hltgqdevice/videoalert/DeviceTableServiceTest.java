@@ -92,6 +92,13 @@ class DeviceTableServiceTest {
         assertNull(service.deviceNameOf("  "));
     }
 
+    /** 站点名已以后缀结尾（旧兜底站"五圩支渠摄像机_1"）：仅追加"#"，禁止"摄像机摄像机#"叠词 */
+    @Test
+    void deviceNameOfNeverDoublesSuffixWord() {
+        assertEquals("五圩支渠摄像机#", service.deviceNameOf("五圩支渠摄像机"));
+        assertEquals("夏家湖渡槽-视频摄像机#", service.deviceNameOf("夏家湖渡槽-视频"));
+    }
+
     /** 首次创建：INSERT 设备表，字段含 name/site/type=#5#/code/status/位置/启用日期/系统字段 */
     @Test
     void createDeviceFirstTime() {

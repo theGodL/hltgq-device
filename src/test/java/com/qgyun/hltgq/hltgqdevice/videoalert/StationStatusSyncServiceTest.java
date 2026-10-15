@@ -40,8 +40,8 @@ import static org.mockito.Mockito.when;
 /**
  * 视频站点同步单测（站点-设备架构改造后：设备表为视频资产权威源的四态同步）。
  * 覆盖：启动异步首轮、轮巡互斥、遍历失败跳过离线标注、新通道挂靠业务站/兜底站
- * （名称去重/复用）、旧迁移行跳过、兜底站改挂、悬空指向修复、业务站类型追加、
- * 位置口径（管理所-通道名）、消失通道离线标注、通道缓存与查询、站点ID查询。
+ * （基名NVR归并去噪/名称去重/复用）、旧迁移行跳过、兜底站改挂、悬空指向修复、
+ * 业务站类型追加、位置口径（管理所-通道名）、消失通道离线标注、通道缓存与查询、站点ID查询。
  */
 class StationStatusSyncServiceTest {
 
@@ -419,7 +419,7 @@ class StationStatusSyncServiceTest {
         Object[] args = argsOf(insert);
         assertEquals(8, args.length);
         String fallbackSiteId = String.valueOf(args[0]);
-        assertEquals("野站闸_1", args[6], "兜底站名=通道名（无重名不加后缀）");
+        assertEquals("野站闸", args[6], "兜底站名=NVR名去噪（同NVR多通道归并一站，不取带_1后缀的通道原名）");
         assertEquals("#5#", args[7], "兜底站 epjutj=#5#");
         assertFalse(Arrays.asList(args).contains("1000900$1$0$0"), "兜底站不写 devicecode");
         assertFalse(insertSql.contains("devicecode"), "兜底站 SQL 不含 devicecode 列");
@@ -430,12 +430,12 @@ class StationStatusSyncServiceTest {
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000900$1$0$0"), eq("#1#"), eq("望江县-野站闸_1"));
     }
 
-    /** 兜底站重名去重：通道名与已有站点重名 → 追加"-视频"后缀（与 uniqueStationName 规则一致） */
+    /** 兜底站重名去重：NVR去噪基名与已有站点（旧迁移行）重名 → 追加"-视频"后缀（与 uniqueStationName 规则一致） */
     @Test
     void fallbackStationNameDeduplicatedWithSuffix() {
         mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
         when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
-                stationRow("existing-1", "野站闸_1", "#2#", null, null)));
+                stationRow("existing-1", "野站闸", "#5#", "1000218$1$0$6", null)));
         List<InvocationOnMock> updates = captureAllUpdates();
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString())).thenReturn("device-001");
@@ -444,15 +444,16 @@ class StationStatusSyncServiceTest {
 
         InvocationOnMock insert = findUpdate(updates, "INSERT INTO");
         assertNotNull(insert);
-        assertEquals("野站闸_1-视频", argsOf(insert)[6], "重名应追加-视频后缀");
+        assertEquals("野站闸-视频", argsOf(insert)[6], "重名应追加-视频后缀");
     }
 
-    /** 兜底站复用：同通道名兜底站已存在（设备创建失败重试/同名多设备场景）→ 复用不重复建站 */
+    /** 兜底站复用：同基名兜底站已存在（同NVR多通道/设备创建失败重试场景）→ 复用不重复建站；
+     *  基名候选含去噪基名与通道原名（旧命名）及其"-视频"变体，变参 IN 查找 */
     @Test
     void fallbackStationReusedWhenExists() {
         mockNvrTreeWithChannel("望江县", "野站闸", "野站闸_1", "1000900$1$0$0");
         when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
-        when(jdbcTemplate.queryForList(anyString(), eq(String.class), anyString(), anyString()))
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), any(Object.class)))
                 .thenReturn(Collections.singletonList("fallback-001"));
         List<InvocationOnMock> updates = captureAllUpdates();
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
@@ -588,7 +589,8 @@ class StationStatusSyncServiceTest {
         verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
     }
 
-    /** NVR 下的新通道：位置取"管理所-通道名"，NVR 名不进入位置（历史教训：16个通道全写成NVR名无法区分） */
+    /** NVR 下的新通道：兜底站基名=NVR名去噪（同NVR归并一站）；位置仍取"管理所-通道名"
+     *  （历史教训：16个通道全写成NVR名无法区分，位置不归并） */
     @Test
     void nvrChannelLocationUsesChannelNameNotNvrName() {
         mockNvrTree();
@@ -600,12 +602,13 @@ class StationStatusSyncServiceTest {
 
         service.syncVideoStationStatus();
 
-        // 兜底站名=通道名；NVR 名不进入名称/位置
+        // 兜底站基名=NVR名去设备词后缀（"渠首硬盘录像机"→"渠首"）；NVR原始设备名不进站名
         InvocationOnMock insert = findUpdate(updates, "INSERT INTO");
         assertNotNull(insert);
         Object[] args = argsOf(insert);
-        assertTrue(Arrays.asList(args).contains(CHANNEL_NAME), "兜底站名应为通道名");
-        assertFalse(Arrays.asList(args).contains(NVR_NAME), "NVR名不应进入站点名称");
+        assertEquals("渠首", args[6], "兜底站基名=NVR名去噪（同NVR多通道归并一站）");
+        assertFalse(Arrays.asList(args).contains(NVR_NAME), "NVR原始设备名不应直接作为站点名");
+        assertFalse(Arrays.asList(args).contains(CHANNEL_NAME), "通道名不再作站名（NVR归并优先）");
         assertFalse(Arrays.asList(args).contains(ORG_NAME + "-" + NVR_NAME), "位置不应为管理所-NVR名");
         // 设备安装位置=管理所-通道名（设备表 wlcvig，站点同步轮维护）
         verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));

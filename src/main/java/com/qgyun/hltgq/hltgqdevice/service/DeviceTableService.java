@@ -114,12 +114,20 @@ public class DeviceTableService {
         migrateLegacyDeviceRefs();
     }
 
-    /** 设备名派生：站点名 + 后缀 + "#"（如"渠首电站上游摄像机#"） */
+    /**
+     * 设备名派生：站点名 + 后缀 + "#"（如"渠首电站上游摄像机#"）。
+     * 站点名已以后缀结尾时仅追加"#"，禁止叠词（2026-10-15 教训：
+     * 旧兜底站"五圩支渠摄像机_1"产出过"五圩支渠摄像机_1摄像机#"叠词设备名）。
+     */
     public String deviceNameOf(String siteName) {
         if (siteName == null || siteName.trim().isEmpty()) {
             return null;
         }
-        return siteName.trim() + deviceSuffix + "#";
+        String name = siteName.trim();
+        if (deviceSuffix != null && !deviceSuffix.isEmpty() && name.endsWith(deviceSuffix)) {
+            return name + "#";
+        }
+        return name + deviceSuffix + "#";
     }
 
     /**

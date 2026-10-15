@@ -794,36 +794,7 @@
       const rootUl = document.createElement('ul');
       rootUl.appendChild(rootNode);
 
-      // 麻塘湖灌区占位节点（暂未接入设备）
-      const mtNode = document.createElement('li');
-      mtNode.className = 'tree-node root-node';
-      mtNode.dataset.id = 'matanghu';
-      mtNode.dataset.name = '麻塘湖灌区';
-      mtNode.dataset.nodeType = 'org';
-      mtNode.dataset.isParent = 'true';
-      mtNode.dataset.loaded = 'true';
-      const mtRow = document.createElement('div');
-      mtRow.className = 'node-row';
-      mtRow.innerHTML = '<span class="expand-icon">▶</span>' +
-        '<span class="node-icon">📁</span>' +
-        '<span class="node-label">麻塘湖灌区</span>';
-      mtNode.appendChild(mtRow);
-      const mtKids = document.createElement('ul');
-      mtKids.className = 'children collapsed';
-      const mtPlaceholder = document.createElement('li');
-      mtPlaceholder.className = 'tree-node leaf';
-      const mtPhRow = document.createElement('div');
-      mtPhRow.className = 'node-row';
-      mtPhRow.innerHTML = '<span class="expand-icon">▶</span>' +
-        '<span class="node-icon">📁</span>' +
-        '<span class="node-label" style="color:#999;font-style:italic">暂未接入设备</span>';
-      mtPlaceholder.appendChild(mtPhRow);
-      mtKids.appendChild(mtPlaceholder);
-      mtNode.appendChild(mtKids);
-      const mtExpand = mtNode.querySelector('.expand-icon');
-      mtExpand.onclick = (e) => { e.stopPropagation(); toggleNode(mtNode); };
-      mtRow.onclick = () => toggleNode(mtNode);
-      rootUl.appendChild(mtNode);
+      // 麻塘湖灌区已作为独立组织接入 ICC 设备树，随 appendChildrenFlattened 真实渲染，无需占位节点
 
       container.appendChild(rootUl);
 
