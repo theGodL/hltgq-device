@@ -102,6 +102,42 @@ class VideoPatrolRecordServiceTest {
         assertTrue(updateInvocations.isEmpty());
     }
 
+    /** 夜间豁免：纯红外现象（黑白/过暗）落库为 ok 并保留类型（提示）；仍有真实故障时只留剩余类型 */
+    @Test
+    void saveRoundAppliesNightExemptFaults() {
+        Map<String, Set<VideoFaultType>> abnormal = new HashMap<>();
+        abnormal.put(CHANNEL_A, EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.TOO_DARK));
+        abnormal.put(CHANNEL_B, EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.BLUR));
+        abnormal.put(CHANNEL_C, EnumSet.of(VideoFaultType.SIGNAL_LOSS));
+        Set<String> inspected = new HashSet<>(Arrays.asList(CHANNEL_A, CHANNEL_B, CHANNEL_C));
+
+        doAnswer(inv -> {
+            updateInvocations.add(inv);
+            return 1;
+        }).when(jdbcTemplate).update(
+                argThat(sql -> sql.contains("t_auto_hltgq_water_video_patrol")),
+                any(), any(), any(), any(), any(), any(), any(), any());
+
+        service.saveRound(1757400000000L, abnormal, inspected, new HashSet<>(),
+                EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.TOO_DARK, VideoFaultType.COLOR_CAST));
+
+        Map<String, Object[]> byCode = new HashMap<>();
+        for (InvocationOnMock inv : updateInvocations) {
+            Object[] args = (Object[]) ((Invocation) inv).getRawArguments()[1];
+            byCode.put(String.valueOf(args[3]), args);
+        }
+        assertEquals(3, byCode.size());
+        // 全豁免 → ok + 保留类型（页面展示为「提示」，不计故障）
+        assertEquals("ok", byCode.get(CHANNEL_A)[4]);
+        assertEquals("TOO_DARK,GRAYSCALE", byCode.get(CHANNEL_A)[5]);
+        // 部分豁免 → 只保留真实故障
+        assertEquals("fail", byCode.get(CHANNEL_B)[4]);
+        assertEquals("BLUR", byCode.get(CHANNEL_B)[5]);
+        // 非豁免类别不受影响
+        assertEquals("fail", byCode.get(CHANNEL_C)[4]);
+        assertEquals("SIGNAL_LOSS", byCode.get(CHANNEL_C)[5]);
+    }
+
     /** 落库：单行入库失败不影响其余通道（逐行 try-catch） */
     @Test
     void saveRoundSingleRowFailureDoesNotAbortRound() {

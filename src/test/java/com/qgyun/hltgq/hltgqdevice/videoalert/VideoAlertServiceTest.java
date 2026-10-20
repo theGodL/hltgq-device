@@ -1,6 +1,7 @@
 package com.qgyun.hltgq.hltgqdevice.videoalert;
 
 import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
+import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -44,7 +45,8 @@ class VideoAlertServiceTest {
     private static final String SITE_ID = "site-001";
     private static final String SITE_NAME = "渠首电站上游";
     private static final String DEVICE_ID = "device-001";
-    private static final String DEVICE_NAME = SITE_NAME + "摄像机#";
+    /** 设备表 name = ICC 通道原名（2026-10-20 起不再拼站点前缀/“摄像机#”后缀） */
+    private static final String CHANNEL_NAME = "大门外";
     private static final String CONTENT = SITE_NAME + "-视频 信号丢失！";
     private static final String TITLE = SITE_NAME + "-视频 信号丢失";
     private static final String ORG_NAME = "库上防汛办";
@@ -52,6 +54,7 @@ class VideoAlertServiceTest {
     private JdbcTemplate jdbcTemplate;
     private WorkOrderService workOrderService;
     private DeviceTableService deviceTableService;
+    private StationStatusSyncService stationStatusSyncService;
     private VideoAlertService service;
     /** doAnswer 捕获的全部 update 调用（原始参数，绕开 Mockito varargs 展开匹配） */
     private final List<InvocationOnMock> updateInvocations = new ArrayList<>();
@@ -61,10 +64,12 @@ class VideoAlertServiceTest {
         jdbcTemplate = mock(JdbcTemplate.class);
         workOrderService = mock(WorkOrderService.class);
         deviceTableService = mock(DeviceTableService.class);
+        stationStatusSyncService = mock(StationStatusSyncService.class);
         service = new VideoAlertService();
         ReflectionTestUtils.setField(service, "jdbcTemplate", jdbcTemplate);
         ReflectionTestUtils.setField(service, "workOrderService", workOrderService);
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
+        ReflectionTestUtils.setField(service, "stationStatusSyncService", stationStatusSyncService);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
         // 站点预置（站点解析走设备表 JOIN，返回 id/zzkaec 两列），避免测试重复模拟查询
         Map<String, Object> row = new HashMap<>();
@@ -72,8 +77,10 @@ class VideoAlertServiceTest {
         row.put("zzkaec", SITE_NAME);
         when(jdbcTemplate.queryForList(anyString(), eq(DEVICECODE)))
                 .thenReturn(Arrays.asList(row));
-        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status/位置传 null，由站点同步轮维护）
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
+        // 设备预置：设备已存在（resolveSite 即由设备表 JOIN 得到站点）→ 直接取 ID，不触发 ICC 遍历；
+        // 仅在设备缺失的用例里覆盖为 null，走"取 ICC 通道名补建"分支
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef(DEVICE_ID, SITE_ID));
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 nullable(String.class), nullable(String.class))).thenReturn(DEVICE_ID);
         updateInvocations.clear();
@@ -130,10 +137,10 @@ class VideoAlertServiceTest {
             }
         }
         assertTrue(codeChecked, "告警编号 code 应存在于插入参数中");
-        // 兜底查/建设备：type=#5# 视频、code=通道devicecode、status/位置留空（均由站点同步轮按设备树维护）
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
-                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), isNull(),
-                isNull());
+        // 设备解析：设备已存在（resolveSite JOIN 命中）→ 直接取设备ID，不再走查/建
+        verify(deviceTableService).findVideoDeviceByCode(DEVICECODE);
+        verify(deviceTableService, never()).lookupOrCreateDevice(anyString(), anyString(), anyString(),
+                anyString(), nullable(String.class), nullable(String.class));
         // 工单联动：alert=告警ID、site=站点ID、device=设备ID、title=content去"！"、content 与告警一致、qjulvf=#hxqm#设备故障抢修
         verify(workOrderService).createIfAbsent(anyString(), eq(SITE_ID), eq(DEVICE_ID), eq(TITLE), eq(CONTENT),
                 eq("#hxqm#"));
@@ -242,6 +249,7 @@ class VideoAlertServiceTest {
     /** 设备缺失（设备表不可达/创建失败）：跳过告警，不插入、不建工单 */
     @Test
     void reportFaultSkipsWhenDeviceMissing() {
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE)).thenReturn(null);
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 nullable(String.class), nullable(String.class))).thenReturn(null);
         when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
@@ -255,12 +263,67 @@ class VideoAlertServiceTest {
     /** 恢复时设备缺失：返回 0，不关告警、不关工单 */
     @Test
     void recoverFaultSkipsWhenDeviceMissing() {
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE)).thenReturn(null);
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 nullable(String.class), nullable(String.class))).thenReturn(null);
 
         assertEquals(0, service.recoverFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         assertTrue(updateInvocations.isEmpty());
         verify(workOrderService, never()).closeByContent(any(), any(), any());
+    }
+
+    /**
+     * R7 回归：通道未入库时先按 ICC 设备树即时补建（ensureDeviceRegistered），
+     * 补建成功后再解析站点并落告警，不再"因设备表缺台账直接丢弃"。
+     */
+    @Test
+    void reportFaultRegistersMissingChannelThenReports() {
+        Map<String, Object> row = new HashMap<>();
+        row.put("id", SITE_ID);
+        row.put("zzkaec", SITE_NAME);
+        // 第一次解析（补建前）无结果，补建后第二次解析命中
+        when(jdbcTemplate.queryForList(anyString(), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>())
+                .thenReturn(Arrays.asList(row));
+        when(stationStatusSyncService.ensureDeviceRegistered(DEVICECODE)).thenReturn(true);
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+
+        assertTrue(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+
+        verify(stationStatusSyncService).ensureDeviceRegistered(DEVICECODE);
+        assertEquals(1, updateInvocations.size());
+    }
+
+    /** 补建失败：跳过告警并记录，不插入任何数据 */
+    @Test
+    void reportFaultSkipsWhenRegistrationFails() {
+        when(jdbcTemplate.queryForList(anyString(), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(stationStatusSyncService.ensureDeviceRegistered(DEVICECODE)).thenReturn(false);
+
+        assertFalse(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+
+        verify(stationStatusSyncService).ensureDeviceRegistered(DEVICECODE);
+        assertTrue(updateInvocations.isEmpty());
+    }
+
+    /**
+     * 设备名口径：需要补建设备时，name 取 ICC 通道原名（不是站点名 + “摄像机#”）。
+     */
+    @Test
+    void createDeviceUsesIccChannelName() {
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE)).thenReturn(null);
+        StationStatusSyncService.VideoChannel channel = mock(StationStatusSyncService.VideoChannel.class);
+        when(channel.getName()).thenReturn(CHANNEL_NAME);
+        when(stationStatusSyncService.findChannel(DEVICECODE)).thenReturn(channel);
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+
+        assertTrue(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+
+        verify(deviceTableService).lookupOrCreateDevice(eq(CHANNEL_NAME), eq(SITE_ID),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), isNull(), isNull());
     }
 
     /** 站点缓存 TTL 过期：站点名被人为修改后过期自动重查（防按旧名派生设备名建重复设备） */

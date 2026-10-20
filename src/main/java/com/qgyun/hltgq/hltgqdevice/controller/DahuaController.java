@@ -13,6 +13,7 @@ import com.qgyun.hltgq.hltgqdevice.service.DahuaPtzService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaRecordService;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaVideoService;
 import com.qgyun.hltgq.hltgqdevice.service.PtzCommandDispatcher;
+import com.qgyun.hltgq.hltgqdevice.service.SiteVideoQueryService;
 import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import com.qgyun.hltgq.hltgqdevice.videoalert.AlertQueryService;
 import lombok.extern.slf4j.Slf4j;
@@ -62,6 +63,9 @@ public class DahuaController {
 
     @Resource
     private StationStatusSyncService stationSyncService;
+
+    @Resource
+    private SiteVideoQueryService siteVideoQueryService;
 
     // ==================== 设备树 ====================
 
@@ -121,6 +125,38 @@ public class DahuaController {
     }
 
     // ==================== 视频流 ====================
+
+    /**
+     * 查询站点下的视频设备清单（站点视频监控面板左侧列表数据源）
+     * <p>
+     * 前端调用：GET /api/dahua/site-channels?siteId=xxx（或 channelId / siteName 兜底）
+     * <p>
+     * 返回该站点全部视频设备（code 去重）及 cameraType、在线状态、最新一轮巡检结果，
+     * 纯只读，不写任何表。
+     *
+     * @param siteId    站点ID（优先）
+     * @param siteName  站点名称（siteId 缺失时精确匹配）
+     * @param channelId 通道ID（站点仍无法定位时按通道反查归属站点）
+     * @return {siteId, siteName, total, channels:[{channelId, name, location, online, cameraType, patrolResult, faultTypes}]}
+     */
+    @GetMapping("/site-channels")
+    public ApiResponse<Map<String, Object>> getSiteChannels(
+            @RequestParam(required = false) String siteId,
+            @RequestParam(required = false) String siteName,
+            @RequestParam(required = false) String channelId) {
+        boolean blankAll = (siteId == null || siteId.trim().isEmpty())
+                && (siteName == null || siteName.trim().isEmpty())
+                && (channelId == null || channelId.trim().isEmpty());
+        if (blankAll) {
+            return ApiResponse.fail("缺少站点参数（siteId / siteName / channelId 至少一个）");
+        }
+        try {
+            return ApiResponse.success(siteVideoQueryService.query(siteId, siteName, channelId));
+        } catch (Exception e) {
+            log.error("查询站点视频设备接口异常：", e);
+            return ApiResponse.fail("查询站点视频设备失败：" + e.getMessage());
+        }
+    }
 
     /**
      * 获取视频流播放地址

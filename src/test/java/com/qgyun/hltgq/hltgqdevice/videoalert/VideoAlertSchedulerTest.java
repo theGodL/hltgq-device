@@ -1,17 +1,52 @@
 package com.qgyun.hltgq.hltgqdevice.videoalert;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 轮巡调度器单测：夜间豁免时段判断（跨天窗口边界、同日窗口、未启用）。
+ * 轮巡调度器单测：夜间豁免时段判断（跨天窗口边界、同日窗口、未启用）、全天提示类与夜间豁免合并口径。
  */
 class VideoAlertSchedulerTest {
+
+    /** 黑白/偏色全天提示；过暗仅夜间提示（规则性现象不报警、不计故障） */
+    @Test
+    void noticeFaultsAllDayAndNightFaultsOnlyAtNight() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        ReflectionTestUtils.setField(scheduler, "noticeFaultsConfig", "GRAYSCALE,COLOR_CAST");
+        ReflectionTestUtils.setField(scheduler, "nightExemptEnabled", true);
+        ReflectionTestUtils.setField(scheduler, "nightExemptWindow", "18:30-07:30");
+        ReflectionTestUtils.setField(scheduler, "nightExemptFaultsConfig", "TOO_DARK");
+        scheduler.init();
+
+        // 白天：只有全天提示类（黑白/偏色），过暗仍按故障处理
+        assertEquals(EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.COLOR_CAST),
+                scheduler.effectiveExemptFaults(at(12, 0)));
+        // 夜间：叠加过暗
+        assertEquals(EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.TOO_DARK, VideoFaultType.COLOR_CAST),
+                scheduler.effectiveExemptFaults(at(20, 0)));
+    }
+
+    /** 黑白为设备正常输出（黑白机/夜间红外）：检测到也直接剔除，混合故障只保留其余项 */
+    @Test
+    void ignoreGrayscaleBeforeNoticeAndAlert() {
+        Set<VideoFaultType> ignored = EnumSet.of(VideoFaultType.GRAYSCALE);
+        assertTrue(VideoAlertScheduler.removeIgnored(
+                EnumSet.of(VideoFaultType.GRAYSCALE), ignored).isEmpty(), "纯黑白应完全忽略");
+        assertEquals(EnumSet.of(VideoFaultType.NOISE), VideoAlertScheduler.removeIgnored(
+                EnumSet.of(VideoFaultType.GRAYSCALE, VideoFaultType.NOISE), ignored), "混合故障应保留其余项");
+        assertEquals(EnumSet.of(VideoFaultType.GRAYSCALE), VideoAlertScheduler.removeIgnored(
+                EnumSet.of(VideoFaultType.GRAYSCALE), Collections.emptySet()), "未配置忽略时保持原样");
+    }
 
     /** 18:30-07:30 跨天窗口：左闭右开，覆盖前夜后半段与当日凌晨 */
     @Test

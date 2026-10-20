@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -34,8 +35,10 @@ import java.util.regex.Pattern;
  *   <li>设备已挂旧迁移行（epjutj=#5# 含 devicecode，待迁移脚本换指）：本轮跳过不动；</li>
  *   <li>设备已挂业务站：站点 epjutj 未含 #5# 时追加，设备状态/位置按设备树同步。</li>
  * </ul>
- * 站点表仅写入三类内容：业务站 epjutj 追加 {@code |#5#}、兜底站新建、系统字段
- * （updated_at/updated_by）——不再写 zebpsu/mivbcz/ahieto/devicecode（D1 决策：状态位置归设备表）。
+ * 站点表仅写入四类内容：业务站 epjutj 追加 {@code |#5#}、兜底站新建、系统字段
+ * （updated_at/updated_by）、纯视频站点状态 zebpsu（D1 决策的状态写入例外：纯视频站没有遥测，
+ * 站点在线与否只能由视频设备状态代表；混合站/无视频站的状态仍由 mq 按遥测维护）。
+ * 不再写 zebpsu/mivbcz/ahieto/devicecode 的其他场景（D1 决策：状态位置归设备表）。
  * <p>通道消失：仅联动设备表标离线（站点表旧行保留不动，退役行由迁移/对账侧处理）。
  * 仅在整轮遍历无任何失败节点时执行，防止某子树查询失败被误判为通道消失。
  * <p>ID生成、系统字段（corp_code/created_at等）与hltgq-mq站点写入规则一致。
@@ -75,6 +78,8 @@ public class StationStatusSyncService {
         Map<String, String> aliases = new HashMap<>();
         aliases.put("荞麦岭泄洪闸", "荞麦岭泄洪河");
         aliases.put("二号渡槽", "2#渡槽");
+        // 麻塘湖灌区：ICC 点位名为"五圩支渠摄像机"，Excel 台账/点位站名为"五圩支渠进水闸"
+        aliases.put("五圩支渠", "五圩支渠进水闸");
         PARENT_NAME_ALIASES = Collections.unmodifiableMap(aliases);
     }
 
@@ -86,6 +91,12 @@ public class StationStatusSyncService {
      * 多词尾选择长词在前（"硬盘录像机"先于"录像机"，防只剥后缀留下"硬盘"）。
      */
     private static final Pattern TRAIL_NAME_NOISE = Pattern.compile("(_\\d+|硬盘录像机|录像机|摄像机)+$");
+
+    /**
+     * 同名消歧所用父节点名的最短有效长度：更短的多为"渠首""院内"等泛称，
+     * 不足以区分点位（如"渠首硬盘录像机"去噪后只剩"渠首"）。
+     */
+    private static final int MIN_DISAMBIGUATOR_LENGTH = 4;
 
     /** 设备树递归最大深度，防止异常数据导致无限递归 */
     private static final int MAX_TREE_DEPTH = 10;
@@ -146,11 +157,10 @@ public class StationStatusSyncService {
         }
         long start = System.currentTimeMillis();
         try {
-            // 1. 递归遍历ICC设备树，收集全部视频通道
+            // 1. 递归遍历ICC设备树，收集全部视频通道（同名通道按父节点名消歧）
             // traversalFailed：任一节点查询失败即置true，本轮跳过"消失站点标离线"，防止误伤
-            List<VideoChannel> channels = new ArrayList<>();
             AtomicBoolean traversalFailed = new AtomicBoolean(false);
-            collectChannels("001", null, null, channels, 0, traversalFailed);
+            List<VideoChannel> channels = collectChannelsWithDisambiguation(traversalFailed);
             log.info("[站点同步] ICC设备树遍历完成，共{}个视频通道，遍历失败={}",
                     channels.size(), traversalFailed.get());
 
@@ -185,6 +195,7 @@ public class StationStatusSyncService {
             // 此时标离线会误伤，故失败即跳过（下轮重试）；站点表旧行不动（退役行处理见迁移/对账）。
             if (!traversalFailed.get()) {
                 stats.offlineMarked = deviceTableService.markOfflineByMissingCodes(processedCodes);
+                syncVideoOnlyStationStatus();
                 log.info("[站点同步] 完成，耗时{}ms：{}", System.currentTimeMillis() - start, stats.describe());
             } else {
                 log.warn("[站点同步] 完成但遍历存在失败节点，本轮跳过设备离线标注：{}", stats.describe());
@@ -197,6 +208,69 @@ public class StationStatusSyncService {
     }
 
     /**
+     * 纯视频站点状态刷新：站点下全部设备都是视频时（至少 1 台），站点在线与否只取决于视频设备——
+     * 任一视频在线记 {@code #1#}，全部离线记 {@code #2#}。混合站与无视频站不处理，
+     * 由 mq 按遥测口径维护（2026-10-20 与 mq 的分工：纯视频站归 device，其余归 mq）。
+     * <p>空类型设备视为非视频：设备档案里存在未分类设备，说明站点并非"只有视频"，
+     * 不抢 mq 的判定（如汪元节制闸：3 台视频 + 3 台空类型闸门设备）。
+     * 只更新状态变化的行（幂等），状态取自设备表（整点同步刚写入），不依赖 ICC 实时接口。
+     */
+    private void syncVideoOnlyStationStatus() {
+        String sql = "SELECT s.id AS site_id, s.zzkaec AS site_name, s.zebpsu AS site_status, " +
+                "v.video_cnt, v.video_online " +
+                "FROM " + STATION_TABLE + " s " +
+                "JOIN (SELECT site, count(*) AS video_cnt, " +
+                "             count(*) FILTER (WHERE status = ?) AS video_online " +
+                "      FROM " + DEVICE_TABLE + " WHERE \"type\" LIKE ? GROUP BY site) v ON v.site = s.id " +
+                "WHERE NOT EXISTS (SELECT 1 FROM " + DEVICE_TABLE + " d " +
+                "                  WHERE d.site = s.id AND (d.\"type\" IS NULL OR d.\"type\" NOT LIKE ?)) " +
+                // 测试站不参与（与 mq 同口径：站名含“测试”或 RTU 站号 9999 开头）
+                "  AND COALESCE(s.zzkaec, '') NOT LIKE '%测试%' " +
+                "  AND COALESCE(s.iofhpi, '') NOT LIKE '9999%'";
+        try {
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql,
+                    STATUS_ONLINE, "%" + VIDEO_TYPE + "%", "%" + VIDEO_TYPE + "%");
+            int online = 0;
+            int offline = 0;
+            int updated = 0;
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            for (Map<String, Object> row : rows) {
+                int onlineCount = num(row.get("video_online"));
+                String target = onlineCount > 0 ? STATUS_ONLINE : STATUS_OFFLINE;
+                if (STATUS_ONLINE.equals(target)) {
+                    online++;
+                } else {
+                    offline++;
+                }
+                String siteId = str(row.get("site_id"));
+                if (siteId == null || siteId.isEmpty() || target.equals(str(row.get("site_status")))) {
+                    continue;
+                }
+                try {
+                    updated += jdbcTemplate.update("UPDATE " + STATION_TABLE +
+                                    " SET zebpsu = ?, updated_at = ?, updated_by = 'SYSTEM'" +
+                                    " WHERE id = ? AND zebpsu IS DISTINCT FROM ?",
+                            target, now, siteId, target);
+                } catch (Exception e) {
+                    // 单站失败不影响其余纯视频站，下轮重试
+                    log.warn("[站点同步] 纯视频站点状态更新失败: site={}({}), target={}: {}",
+                            str(row.get("site_name")), siteId, target, e.getMessage());
+                }
+            }
+            log.info("[站点同步] 纯视频站点状态刷新: 纯视频站{}个（在线{}，离线{}），更新{}行",
+                    rows.size(), online, offline, updated);
+        } catch (Exception e) {
+            // 站点状态刷新失败不影响视频设备/站点归属同步，下轮重试
+            log.warn("[站点同步] 纯视频站点状态刷新失败: {}", e.getMessage());
+        }
+    }
+
+    /** Object 值转 int（null 记 0；count 结果兼容 Long/Integer/BigDecimal） */
+    private static int num(Object value) {
+        return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
+    /**
      * 单通道同步：设备表为权威源的四态判定（新通道 / 兜底站 / 迁移行 / 业务站）。
      * <ul>
      *   <li><b>设备不存在</b>（新通道）：解析业务站，命中先追加站点 #5# 类型再建设备挂靠；
@@ -206,7 +280,8 @@ public class StationStatusSyncService {
      *   <li><b>设备已挂业务站</b>：epjutj 未含 #5# 时追加，设备状态/位置持续同步。</li>
      * </ul>
      * 设备 site 悬空（指向不存在的站点行）时按"业务站优先、兜底站其次"重挂靠。
-     * 全部路径均不写站点 zebpsu/mivbcz/ahieto（D1：站点状态位置归设备表）。
+     * 单通道路径均不写站点 zebpsu/mivbcz/ahieto（D1：站点状态位置归设备表）；
+     * 纯视频站状态在整轮末尾由 {@link #syncVideoOnlyStationStatus()} 统一写。
      */
     private void syncChannel(VideoChannel ch, ExistingStations existing, RoundStats stats) {
         String target = ch.online ? STATUS_ONLINE : STATUS_OFFLINE;
@@ -234,7 +309,7 @@ public class StationStatusSyncService {
                 log.info("[站点同步] 新通道挂靠兜底站（待挂靠）: devicecode={}, 兜底站={}", ch.devicecode, stationName);
             }
             String deviceId = deviceTableService.lookupOrCreateDevice(
-                    deviceTableService.deviceNameOf(stationName), siteId,
+                    deviceTableService.channelNameOf(ch.name), siteId,
                     DeviceTableService.DEVICE_TYPE_VIDEO, ch.devicecode, target, location);
             if (deviceId == null) {
                 log.warn("[站点同步] 视频设备创建失败: devicecode={}, 站点={}", ch.devicecode, siteId);
@@ -302,9 +377,8 @@ public class StationStatusSyncService {
      * @return 通道列表；遍历存在失败节点时返回null（数据不完整，调用方自行决定本轮是否可用）
      */
     public List<VideoChannel> collectVideoChannels() {
-        List<VideoChannel> channels = new ArrayList<>();
         AtomicBoolean traversalFailed = new AtomicBoolean(false);
-        collectChannels("001", null, null, channels, 0, traversalFailed);
+        List<VideoChannel> channels = collectChannelsWithDisambiguation(traversalFailed);
         if (traversalFailed.get()) {
             log.warn("[视频告警] ICC设备树遍历存在失败节点，通道数据不完整，返回null");
             return null;
@@ -342,9 +416,8 @@ public class StationStatusSyncService {
             return cached;
         }
         log.info("[通道查询] 缓存未命中，实时遍历设备树：channelId={}", key);
-        List<VideoChannel> channels = new ArrayList<>();
         AtomicBoolean failed = new AtomicBoolean(false);
-        collectChannels("001", null, null, channels, 0, failed);
+        List<VideoChannel> channels = collectChannelsWithDisambiguation(failed);
         if (failed.get()) {
             log.warn("[通道查询] 实时遍历存在失败节点，结果可能不完整：channelId={}", key);
         }
@@ -354,6 +427,49 @@ public class StationStatusSyncService {
             }
         }
         return null;
+    }
+
+    /**
+     * 告警/事件侧兜底补建：通道在设备表缺失时，按 ICC 设备树即时补建并挂靠站点
+     * （业务站优先，未命中则复用/新建兜底站），使新通道与历史缺口不必等整点同步
+     * 即可产生告警与工单（2026-10-20 裁定：21 条缺失通道由代码自动补建）。
+     * <p>与整点同步共用同一套四态判定（{@link #syncChannel}）；同一通道并发补建由
+     * DeviceTableService 的 code→deviceId 缓存保证只建一台。
+     *
+     * @param devicecode 通道编码（设备表 code）
+     * @return true-设备已存在或补建成功；false-ICC 无此通道/站点解析失败/数据库不可达
+     */
+    public boolean ensureDeviceRegistered(String devicecode) {
+        if (devicecode == null || devicecode.trim().isEmpty()) {
+            return false;
+        }
+        String code = devicecode.trim();
+        if (deviceTableService.findVideoDeviceByCode(code) != null) {
+            return true;
+        }
+        try {
+            VideoChannel ch = findChannel(code);
+            if (ch == null) {
+                log.warn("[站点同步] 即时补建跳过：ICC 设备树中不存在该通道, devicecode={}", code);
+                return false;
+            }
+            ExistingStations existing = loadExistingStations();
+            if (existing == null) {
+                log.warn("[站点同步] 即时补建跳过：站点表加载失败, devicecode={}", code);
+                return false;
+            }
+            syncChannel(ch, existing, new RoundStats());
+            boolean registered = deviceTableService.findVideoDeviceByCode(code) != null;
+            if (registered) {
+                log.info("[站点同步] 告警侧即时补建设备成功: devicecode={}, name={}", code, ch.name);
+            } else {
+                log.warn("[站点同步] 告警侧即时补建设备失败: devicecode={}", code);
+            }
+            return registered;
+        } catch (Exception e) {
+            log.error("[站点同步] 告警侧即时补建异常: devicecode=" + code, e);
+            return false;
+        }
     }
 
     /**
@@ -454,12 +570,97 @@ public class StationStatusSyncService {
     }
 
     /**
+     * 收集设备树全部通道并做同名消歧（遍历入口统一走这里，保证同步/缓存/弹窗查询口径一致）。
+     *
+     * @param failed 任一节点查询失败即置true（语义同 collectChannels）
+     * @return 通道列表（name 已完成消歧）
+     */
+    private List<VideoChannel> collectChannelsWithDisambiguation(AtomicBoolean failed) {
+        List<VideoChannel> channels = new ArrayList<>();
+        collectChannels("001", null, null, channels, 0, failed);
+        disambiguateNames(channels);
+        return channels;
+    }
+
+    /**
+     * 通道同名消歧：ICC 会在同一 NVR 下自动给重名通道加"_数字"，但跨 NVR 不会——
+     * 如 1000395（父节点"易潭支渠中段摄像机"）与 1000396（父节点"九朋支渠中尾段摄像机"）
+     * 通道名同为"易潭支渠中段摄像机"（2026-10-20 现场核对）。同一组织内重名时：
+     * <ol>
+     *   <li>父节点名可区分点位（见 {@link #disambiguatorOf}）→ 改用父节点名
+     *       （1000396 → "九朋支渠中尾段摄像机"），与设备树层级、点位站点名保持一致；</li>
+     *   <li>父节点名只是 NVR 设备名（"毕岭管理所硬盘录像机"/"渠首硬盘录像机"）→ 保留原通道名；</li>
+     *   <li>基名仍重复（同一 NVR 下多条同名）→ 追加"_2"、"_3"…。</li>
+     * </ol>
+     * 仅在重名组内生效，正常通道名原样保留。消歧结果用于设备名与业务站匹配。
+     */
+    private void disambiguateNames(List<VideoChannel> channels) {
+        Map<String, List<VideoChannel>> groups = new LinkedHashMap<>();
+        for (VideoChannel ch : channels) {
+            String key = str(ch.orgName) + "\u0001" + str(ch.name);
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(ch);
+        }
+        for (List<VideoChannel> group : groups.values()) {
+            if (group.size() <= 1) {
+                continue;
+            }
+            Set<String> used = new HashSet<>();
+            for (VideoChannel ch : group) {
+                String candidate = disambiguatorOf(ch);
+                if (candidate == null) {
+                    candidate = ch.name;
+                }
+                if (!used.add(candidate)) {
+                    // 基名也重复：基名 + 序号（从2起，"_1"留给ICC自动后缀语义）
+                    String base = candidate;
+                    int seq = 2;
+                    while (!used.add(candidate = base + "_" + seq)) {
+                        seq++;
+                    }
+                }
+                if (!candidate.equals(ch.name)) {
+                    log.info("[站点同步] 通道重名消歧: code={}, {} → {}", ch.devicecode, ch.name, candidate);
+                    ch.renameTo(candidate);
+                }
+            }
+        }
+    }
+
+    /**
+     * 同名消歧用的父节点名：剥除尾部设备词后仍具点位含义才可用，否则返回 null（退回原通道名 + 序号）。
+     * <p>不可用的两类（2026-10-20 ICC 实测）：
+     * <ul>
+     *   <li>去噪后等于组织名——"毕岭管理所硬盘录像机" → "毕岭管理所"，只说明 NVR 归属；
+     *       该 NVR 下两条同名"太宿进水闸上游"若改用父节点名，会得到"毕岭管理所硬盘录像机"；</li>
+     *   <li>去噪后不足 {@link #MIN_DISAMBIGUATOR_LENGTH} 字——"渠首硬盘录像机" → "渠首"；
+     *       该 NVR 下两条同名"虎形潭渡槽"若改用父节点名，会得到"渠首硬盘录像机"。</li>
+     * </ul>
+     * 可用示例："九朋支渠中尾段摄像机" → "九朋支渠中尾段"（7 字，点位明确）。
+     */
+    private static String disambiguatorOf(VideoChannel ch) {
+        String nvr = str(ch.nvrName);
+        if (nvr == null || nvr.isEmpty() || nvr.equals(ch.name)) {
+            return null;
+        }
+        String denoised = TRAIL_NAME_NOISE.matcher(nvr).replaceAll("").trim();
+        if (denoised.length() < MIN_DISAMBIGUATOR_LENGTH) {
+            return null;
+        }
+        String org = str(ch.orgName);
+        if (org != null && denoised.equals(org)) {
+            return null;
+        }
+        return nvr;
+    }
+
+    /**
      * 加载站点表快照（单次全表查询）：
      * <ul>
      *   <li>siteById：站点ID → 行信息（名称/类型/devicecode），供设备已挂站点三态判定
      *       （业务站/兜底站/迁移行，见 {@link SiteRow}）；</li>
      *   <li>names：全表站点名称（zzkaec），兜底站新建重名时追加"-视频"后缀；</li>
-     *   <li>idsByName：业务站（非纯#5#行，含迁移后追加#5#的）名称 → 站点ID候选（业务站匹配用）；</li>
+     *   <li>idsByName：业务站（非纯#5#行，含迁移后追加#5#的）与视频点站（纯#5#+有上级无devicecode）
+     *       名称 → 站点ID候选（业务站匹配用）；</li>
      *   <li>videoParentByName：纯#5#行名 → 已挂ahieto（"跟随同名视频行归属"用，重名歧义置null禁用）。</li>
      * </ul>
      *
@@ -486,9 +687,19 @@ public class StationStatusSyncService {
                 if (idStr == null || idStr.isEmpty()) {
                     continue;
                 }
-                snapshot.siteById.put(idStr, new SiteRow(idStr, nameStr, typeStr, codeStr));
+                snapshot.siteById.put(idStr, new SiteRow(idStr, nameStr, typeStr, codeStr, parentStr));
                 if (VIDEO_TYPE.equals(typeStr)) {
-                    // 纯#5#行（旧迁移行或兜底站）：名称 → 已挂上级；同名行重复出现即歧义（置null禁用），防"跟随"挂错
+                    // 纯#5#行分三类：
+                    // 1) 有 ahieto 且无 devicecode = 按点位建的视频点站（如麻塘湖 34 个点位），
+                    //    参与业务站匹配——否则同步轮按组织名兜底会把设备改挂回上级片区；
+                    // 2) 无 ahieto = 兜底站，仅参与"同名视频行归属跟随"；
+                    // 3) 有 devicecode = 旧迁移行，不参与匹配（待迁移脚本换指）。
+                    boolean hasParent = parentStr != null && !parentStr.isEmpty();
+                    boolean hasDeviceCode = codeStr != null && !codeStr.isEmpty();
+                    if (nameStr != null && !nameStr.isEmpty() && hasParent && !hasDeviceCode) {
+                        snapshot.idsByName.computeIfAbsent(nameStr, k -> new ArrayList<>()).add(idStr);
+                    }
+                    // 纯#5#行名称 → 已挂上级；同名行重复出现即歧义（置null禁用），防"跟随"挂错
                     if (nameStr != null && !nameStr.isEmpty()) {
                         if (snapshot.videoParentByName.containsKey(nameStr)) {
                             snapshot.videoParentByName.put(nameStr, null);
@@ -526,7 +737,9 @@ public class StationStatusSyncService {
      * 站点行快照（设备 site 指向行的三态判定）：
      * <ul>
      *   <li>业务站：epjutj 非纯 #5#（闸站/管理所/片区，含迁移后追加 #5# 的）——正常挂靠目标；</li>
-     *   <li>兜底站：epjutj = #5# 且无 devicecode（同步轮自建，待挂靠）——每轮重试业务站匹配；</li>
+     *   <li>视频点站：epjutj = #5#、无 devicecode、有 ahieto（按 ICC 点位建的站，如麻塘湖 34 个）——
+     *       与业务站同等对待，不参与每轮兜底重试；</li>
+     *   <li>兜底站：epjutj = #5#、无 devicecode、无 ahieto（同步轮自建，待挂靠）——每轮重试业务站匹配；</li>
      *   <li>迁移行：epjutj = #5# 且有 devicecode（旧同步产出的待迁移行）——迁移换指前跳过不动。</li>
      * </ul>
      */
@@ -535,22 +748,26 @@ public class StationStatusSyncService {
         final String name;
         final String type;
         final String devicecode;
+        /** 上级站点ID（ahieto）：纯#5#行有上级即为"视频点站"，不是兜底站 */
+        final String parentId;
 
-        SiteRow(String id, String name, String type, String devicecode) {
+        SiteRow(String id, String name, String type, String devicecode, String parentId) {
             this.id = id;
             this.name = name;
             this.type = type;
             this.devicecode = devicecode;
+            this.parentId = parentId;
         }
 
-        /** 纯 #5# 行（旧迁移行或兜底站） */
+        /** 纯 #5# 行（视频点站/旧迁移行/兜底站） */
         boolean isPureVideo() {
             return VIDEO_TYPE.equals(type);
         }
 
-        /** 兜底站：纯 #5# 且无 devicecode（旧迁移行均有 devicecode，以此区分） */
+        /** 兜底站：纯 #5#、无 devicecode、且无上级（有上级的是按点位建的视频点站） */
         boolean isFallback() {
-            return isPureVideo() && (devicecode == null || devicecode.isEmpty());
+            return isPureVideo() && (devicecode == null || devicecode.isEmpty())
+                    && (parentId == null || parentId.isEmpty());
         }
 
         /** 旧迁移行：纯 #5# 且有 devicecode（待迁移脚本换指） */
@@ -712,7 +929,7 @@ public class StationStatusSyncService {
         String fallbackName = uniqueStationName(candidates.get(0), existing.names);
         String siteId = insertFallbackStation(fallbackName);
         if (siteId != null) {
-            existing.siteById.put(siteId, new SiteRow(siteId, fallbackName, VIDEO_TYPE, null));
+            existing.siteById.put(siteId, new SiteRow(siteId, fallbackName, VIDEO_TYPE, null, null));
             stats.fallbackCreated++;
         }
         return siteId;
@@ -793,7 +1010,17 @@ public class StationStatusSyncService {
             if (!base.equals(nvrName)) {
                 candidates.add(base);
             }
-            String alias = PARENT_NAME_ALIASES.get(base);
+            // 去噪名：剥除尾部"_数字"/"摄像机"/"录像机"。麻塘湖等点位的 NVR 名带"摄像机"后缀，
+            // 档案/点位站名不带（如"老水厂出水口摄像机" → "老水厂出水口"），去噪后才能命中点位站
+            String denoised = denoiseStationName(base);
+            if (!denoised.isEmpty() && !candidates.contains(denoised)) {
+                candidates.add(denoised);
+            }
+            // 人工别名按去噪名优先匹配（如"五圩支渠" → 档案"五圩支渠进水闸"），兼容别名表按原名登记
+            String alias = PARENT_NAME_ALIASES.get(denoised.isEmpty() ? base : denoised);
+            if (alias == null) {
+                alias = PARENT_NAME_ALIASES.get(base);
+            }
             if (alias != null && !candidates.contains(alias)) {
                 candidates.add(alias);
             }
@@ -838,12 +1065,16 @@ public class StationStatusSyncService {
     }
 
     /**
-     * 视频设备状态/位置同步（仅设备表写入，站点表不再联动）：
-     * 状态随通道在线/离线（updateDeviceStatus 内 IS DISTINCT FROM 变化才写），
+     * 视频设备名称/状态/位置同步（仅设备表写入，站点表不再联动）：
+     * 名称随 ICC 通道名（updateDeviceName 内 name IS DISTINCT FROM 变化才写），
+     * 状态随通道在线/离线（updateDeviceStatus 内 status IS DISTINCT FROM 变化才写），
      * 安装位置随设备树层级（updateDeviceLocation 同源守卫）；均按通道 devicecode 精确匹配——
      * 历史教训：按 name 匹配会波及同名僵尸节点设备，故一律以 code 为键。
      */
     private void syncDeviceState(VideoChannel ch, String status, String location, RoundStats stats) {
+        if (deviceTableService.updateDeviceName(ch.devicecode, ch.name) > 0) {
+            stats.nameUpdated++;
+        }
         if (deviceTableService.updateDeviceStatus(ch.devicecode, status) > 0) {
             stats.statusUpdated++;
         } else {
@@ -860,6 +1091,8 @@ public class StationStatusSyncService {
     private static class RoundStats {
         /** 新设备挂靠台数（新建或按名兜底挂接，含业务站/兜底站） */
         int deviceCreated;
+        /** 设备名称按 ICC 通道名校正台数 */
+        int nameUpdated;
         /** 设备状态更新台数 */
         int statusUpdated;
         /** 设备状态无变化台数 */
@@ -878,7 +1111,7 @@ public class StationStatusSyncService {
         int offlineMarked;
 
         String describe() {
-            return "新设备" + deviceCreated + "台，状态更新" + statusUpdated + "台，状态无变化" + unchanged
+            return "新设备" + deviceCreated + "台，名称校正" + nameUpdated + "台，状态更新" + statusUpdated + "台，状态无变化" + unchanged
                     + "台，位置更新" + locationUpdated + "台，兜底改挂" + reattached + "台，新建兜底站"
                     + fallbackCreated + "个，类型追加" + videoTypeAppended + "站，迁移行跳过"
                     + legacySkipped + "台，消失标离线" + offlineMarked + "台";
@@ -912,8 +1145,8 @@ public class StationStatusSyncService {
     public static class VideoChannel {
         /** 设备编码（如1000231$1$0$10），匹配站点表devicecode */
         private final String devicecode;
-        /** 通道名称 → 站点名称zzkaec 与 站点位置mivbcz后半（如"大门外"） */
-        private final String name;
+        /** 通道名称 → 设备名name与站点位置后半（如"大门外"）；同名消歧后可能改为父节点名，故非final */
+        private String name;
         /** 管理所级组织名称 → 站点位置mivbcz前半（如"集岭管理所"），未遍历到org时为null */
         private final String orgName;
         /** 最近一层非org父节点名（NVR/位置节点名，如"郝大屋泄洪闸上游"）→ 业务站匹配线索（resolveBusinessSite），直挂org时为null */
@@ -939,6 +1172,13 @@ public class StationStatusSyncService {
 
         public String getName() {
             return name;
+        }
+
+        /** 同名通道消歧：改用父节点名或追加序号（见 disambiguateNames） */
+        void renameTo(String newName) {
+            if (newName != null && !newName.trim().isEmpty()) {
+                this.name = newName.trim();
+            }
         }
 
         public String getOrgName() {

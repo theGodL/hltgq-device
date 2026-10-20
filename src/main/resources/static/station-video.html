@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>视频监控</title>
+<!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265)，与 monitor.html 一致 -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<style>
+/* ===== 站点视频监控面板（深蓝弹窗风格）=====
+   布局：左侧「监控设备列表 + 云台控制」，右侧视频区；
+   交互：点击设备卡片切换右侧视频，云台控制作用于当前选中设备；
+   权限：仅系统管理员展示云台面板（与 monitor.html 同一语义），
+        固定枪机/未选中通道时云台不可操作并红字提示。
+   数据：GET /api/dahua/site-channels（站点设备 + cameraType + 在线 + 最近巡检结果） */
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  background: #071627;
+  color: #DCE8F8;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  display: flex; flex-direction: column;
+}
+
+/* ============ 主体两栏 ============ */
+.layout { flex: 1; min-height: 0; display: flex; }
+
+/* ---- 左列：设备列表 + 云台 ---- */
+.side {
+  width: 372px; min-width: 300px; flex-shrink: 0;
+  background: #08192C; border-right: 1px solid #17355C;
+  display: flex; flex-direction: column; min-height: 0;
+}
+.sec-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; flex-shrink: 0; }
+.sec-mark { width: 8px; height: 8px; border-radius: 1px; background: #2F7CE0; box-shadow: 0 0 6px rgba(47,124,224,0.8); }
+.sec-title { font-size: 14px; font-weight: 600; color: #E8F1FF; }
+.sec-count { font-size: 12px; color: #7C96B8; }
+
+.dev-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 14px 14px; }
+.dev-list::-webkit-scrollbar { width: 6px; }
+.dev-list::-webkit-scrollbar-thumb { background: #1E3E66; border-radius: 3px; }
+.dev-list::-webkit-scrollbar-track { background: transparent; }
+
+.dev-card {
+  background: #0E2340; border: 1px solid #1C3A60; border-radius: 8px;
+  padding: 12px 12px 10px; margin-bottom: 10px; cursor: pointer;
+  display: flex; align-items: flex-start; gap: 10px;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+.dev-card:hover { border-color: #2C5B96; background: #10294A; }
+.dev-card.selected { border-color: #3B82F6; background: #102A4E; box-shadow: 0 0 0 1px rgba(59,130,246,0.35) inset, 0 4px 14px rgba(8,30,60,0.6); }
+.dev-main { flex: 1; min-width: 0; }
+.dev-title { font-size: 14px; font-weight: 600; color: #F2F7FF; line-height: 1.4; word-break: break-all; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.dev-title .warn-mark { color: #FF6B6B; font-size: 12px; }
+.tag { font-size: 11px; line-height: 1; padding: 3px 6px; border-radius: 2px; border: 1px solid transparent; font-weight: 400; }
+.tag-online { color: #4ADE80; border-color: rgba(74,222,128,0.45); background: rgba(74,222,128,0.08); }
+.tag-offline { color: #93A4BC; border-color: rgba(147,164,188,0.45); background: rgba(147,164,188,0.08); }
+.dev-meta { font-size: 12px; color: #8BA4C4; margin-top: 5px; line-height: 1.5; word-break: break-all; }
+.dev-meta .label { color: #6E88A8; }
+.dev-meta .fault { color: #FF6B6B; font-weight: 600; }
+.dev-meta .ok { color: #4ADE80; }
+.dev-meta .warn { color: #F0B45A; }
+.dev-meta .notice { color: #5AA9E6; }
+.dev-meta .muted { color: #6E88A8; }
+.play-chip {
+  flex-shrink: 0; align-self: center;
+  display: flex; align-items: center; gap: 4px;
+  height: 30px; padding: 0 12px; border-radius: 4px;
+  border: 1px solid #2F7CE0; background: rgba(47,124,224,0.10);
+  color: #5FA8FF; font-size: 12px; cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.dev-card.selected .play-chip { background: #2F7CE0; color: #FFFFFF; }
+.play-chip .tri { font-size: 10px; }
+
+/* 空态/加载态 */
+.dev-empty { padding: 30px 12px; text-align: center; color: #7C96B8; font-size: 13px; line-height: 1.8; }
+
+/* ---- 云台面板（仅管理员可见） ---- */
+.ptz-panel { flex-shrink: 0; border-top: 1px solid #17355C; padding: 12px 16px 14px; background: #08192C; }
+.ptz-head { display: flex; align-items: center; gap: 8px; }
+.ptz-dev { font-size: 12px; color: #7C96B8; margin-left: auto; max-width: 55%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ptz-hint { display: none; font-size: 12px; font-weight: 600; color: #FF6B6B; margin-top: 6px; line-height: 1.5; }
+.ptz-hint.show { display: block; }
+.ptz-body { margin-top: 10px; display: flex; align-items: center; gap: 16px; }
+.ptz-body.disabled { pointer-events: none; opacity: 0.32; }
+.ptz-pad {
+  display: grid; grid-template-columns: repeat(3, 46px); grid-template-rows: repeat(3, 46px);
+  gap: 4px; flex-shrink: 0;
+}
+.ptz-pad button {
+  border-radius: 6px; border: 1px solid #24456F; background: #10243F; color: #B7CCE6;
+  font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  padding: 0; touch-action: none; -webkit-user-select: none; user-select: none;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.ptz-pad button:hover { background: #17355A; border-color: #35699F; color: #E8F1FF; }
+.ptz-pad button.pressing { background: #2F7CE0; border-color: #4D9BFF; color: #FFFFFF; }
+.ptz-pad .empty { visibility: hidden; }
+.ptz-pad .ptz-stop { color: #FF6B6B; font-size: 13px; font-weight: 600; }
+.ptz-pad .ptz-stop:hover { background: rgba(255,107,107,0.14); border-color: #A9464B; color: #FF8A8A; }
+.ptz-tip { font-size: 12px; color: #6E88A8; line-height: 1.7; }
+.ptz-tip b { color: #A9C3E4; font-weight: 600; }
+
+/* ---- 右列：视频 ---- */
+/* 铺满（cover）去掉左右黑边：视频比例与容器不一致时按容器裁切，不再留黑边；
+   容器底色用页面深蓝而非纯黑，任何比例下都不会出现突兀的黑色块 */
+.stage-wrap { flex: 1; min-width: 0; position: relative; background: #071627; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.stage-wrap video { width: 100%; height: 100%; object-fit: cover; background: #071627; }
+.stage-head {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 3;
+  padding: 12px 16px 26px;
+  background: linear-gradient(180deg, rgba(3,12,24,0.78) 0%, rgba(3,12,24,0) 100%);
+  display: flex; align-items: center; gap: 10px; pointer-events: none;
+}
+.stage-name { font-size: 14px; font-weight: 600; color: #FFFFFF; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-loc { font-size: 12px; color: #A9C3E4; max-width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-placeholder {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  color: #7C96B8; font-size: 13px; z-index: 2;
+}
+.spinner {
+  width: 28px; height: 28px; border: 3px solid rgba(255,255,255,0.18);
+  border-top-color: #4D9BFF; border-radius: 50%; animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.play-btn {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 58px; height: 58px; border-radius: 50%; border: none; z-index: 4;
+  background: rgba(255,255,255,0.86); color: #12233C; font-size: 22px; cursor: pointer;
+  display: none;
+}
+.stage-error {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  background: rgba(6,18,33,0.86); border: 1px solid rgba(255,107,107,0.4);
+  color: #FF8A8A; font-size: 13px; padding: 10px 16px; border-radius: 6px;
+  display: none; z-index: 5; max-width: 70%; text-align: center; line-height: 1.6;
+}
+.stage-empty { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); color: #6E88A8; font-size: 14px; z-index: 2; display: none; }
+
+/* toast */
+.toast {
+  position: fixed; left: 50%; top: 16%; transform: translateX(-50%);
+  background: rgba(8,22,40,0.94); border: 1px solid #2C5B96; color: #DCE8F8;
+  font-size: 13px; padding: 9px 16px; border-radius: 6px; z-index: 99; display: none; max-width: 80%;
+}
+
+/* 窄屏：上下堆叠（左列占上半屏，设备列表横向可读） */
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  .side { width: 100%; min-width: 0; height: 48vh; border-right: none; border-bottom: 1px solid #17355C; }
+  .stage-wrap { flex: 1; min-height: 0; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+  <!-- 左列：监控设备 + 云台控制 -->
+  <aside class="side">
+    <div class="sec-head">
+      <span class="sec-mark"></span>
+      <span class="sec-title">监控设备</span>
+      <span class="sec-count" id="devCount">共 0 个</span>
+    </div>
+    <div class="dev-list" id="devList">
+      <div class="dev-empty">正在加载设备...</div>
+    </div>
+
+    <!-- 云台控制：仅系统管理员展示（非管理员整块隐藏，权限返回前保持隐藏） -->
+    <div class="ptz-panel" id="ptzPanel" style="display:none">
+      <div class="ptz-head">
+        <span class="sec-mark"></span>
+        <span class="sec-title">云台控制</span>
+        <span class="ptz-dev" id="ptzDev"></span>
+      </div>
+      <div class="ptz-hint" id="ptzHint"></div>
+      <div class="ptz-body" id="ptzBody">
+        <div class="ptz-pad">
+          <button class="empty"></button>
+          <button class="ptz-btn" data-dir="up" title="上">▲</button>
+          <button class="empty"></button>
+          <button class="ptz-btn" data-dir="left" title="左">◀</button>
+          <button class="ptz-stop" id="ptzStop" title="停止">停</button>
+          <button class="ptz-btn" data-dir="right" title="右">▶</button>
+          <button class="empty"></button>
+          <button class="ptz-btn" data-dir="down" title="下">▼</button>
+          <button class="empty"></button>
+        </div>
+        <div class="ptz-tip">按住方向键<b>转动</b>，松开即停止<br>异常断开自动兜底停止</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 右列：视频 -->
+  <section class="stage-wrap" id="stageWrap">
+    <div class="stage-head">
+      <span class="stage-name" id="stageName">未选择设备</span>
+      <span class="stage-loc" id="stageLoc"></span>
+    </div>
+    <video id="video" playsinline webkit-playsinline muted></video>
+    <div class="stage-placeholder" id="stagePlaceholder" style="display:none">
+      <div class="spinner"></div>
+      <span>正在连接视频...</span>
+    </div>
+    <div class="stage-empty" id="stageEmpty" style="display:none">暂无视频设备</div>
+    <button class="play-btn" id="playBtn">▶</button>
+    <div class="stage-error" id="stageError"></div>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== 常量与全局 ====================
+// ★ nginx 统一前缀适配：经 /hltgq-device/ 代理访问时浏览器侧绝对路径需动态补前缀，
+// 直连部署（无前缀）自动不补，两种部署方式通用（与 monitor.html / live-popup.html 一致）
+const APP_BASE = location.pathname.indexOf('/hltgq-device/') === 0 ? '/hltgq-device' : '';
+const API_BASE = APP_BASE + '/api/dahua';
+/** 后端返回的绝对代理地址（/api/dahua/hls-proxy?...）补前缀供浏览器请求 */
+function proxyUrl(path) {
+  if (!path) return path;
+  return path.indexOf('/api/') === 0 ? APP_BASE + path : path;
+}
+
+const params = new URLSearchParams(location.search);
+const siteIdParam = (params.get('siteId') || '').trim();
+const siteNameParam = (params.get('siteName') || '').trim();
+const channelIdParam = (params.get('channelId') || '').trim();
+
+let channels = [];              // 站点下视频设备：[{channelId,name,location,online,cameraType,patrolResult,faultTypes}]
+let currentChannelId = '';      // 当前选中通道（右侧视频 + 云台操作对象）
+let userIsAdmin = false;        // 云台操作权限（系统管理员），与 monitor.html 同一权限语义
+let loadError = '';             // 设备列表加载失败原因（空=正常）
+let hlsInstance = null;         // hls.js 实例
+
+// 云台命令状态（与 live-popup.html 同款串行链：保证 START 先于 STOP 到达后端）
+let ptzUserInteracting = false;
+let ptzTimer = null;            // 1秒心跳
+let ptzHardTimeout = null;      // 3秒硬超时兜底
+let lastPtzDirection = null;
+let ptzChannelId = '';          // 本次按压作用的通道（切通道时对旧通道补发 STOP）
+let ptzChain = Promise.resolve();
+let ptzInFlight = 0;
+
+// ==================== 工具 ====================
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, 2500);
+}
+
+// ==================== fetch 封装（与 PC 端同一权限语义） ====================
+async function apiGet(url) {
+  const resp = await fetch(url, { headers: sessionHeaders() });
+  if (resp.status === 401) {
+    const body = await resp.json().catch(() => ({}));
+    location.href = body.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) throw new Error('无操作权限，仅系统管理员可操作');
+  if (resp.status === 503) throw new Error('权限服务不可用，请稍后重试');
+  return resp.json();
+}
+async function apiPost(url, body) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, sessionHeaders()),
+    body: JSON.stringify(body)
+  });
+  if (resp.status === 401) {
+    const j = await resp.json().catch(() => ({}));
+    location.href = j.redirectUrl || '/';
+    throw new Error('未登录');
+  }
+  if (resp.status === 403) { showToast('无操作权限，仅系统管理员可操作'); throw new Error('403'); }
+  if (resp.status === 503) { showToast('权限服务不可用，请稍后重试'); throw new Error('503'); }
+  return resp.json();
+}
+function sessionHeaders() {
+  const headers = {};
+  const m = document.cookie.match(/(?:^|;\s*)sessionId=([^;]+)/);
+  if (m && m[1]) headers['X-Session-Id'] = m[1];
+  return headers;
+}
+
+// ==================== 设备列表 ====================
+/** 提示类故障 → 文案（仅 ok + faultTypes 时出现，属设备输出特性或物理现象，不算报警） */
+const NOTICE_LABELS = { GRAYSCALE: '黑白图像', TOO_DARK: '图像偏暗', COLOR_CAST: '图像偏色' };
+
+function noticeText(faultTypes) {
+  const names = String(faultTypes).split(',').filter(Boolean)
+    .map(t => NOTICE_LABELS[t] || t);
+  return names.length ? '提示：' + names.join('/') : '提示';
+}
+
+/** 巡检结果 → 展示文案与颜色（无记录不显示红色，避免误导业主） */
+function patrolView(result, faultTypes) {
+  if (result === 'ok') {
+    return faultTypes ? { text: noticeText(faultTypes), cls: 'notice' } : { text: '正常', cls: 'ok' };
+  }
+  if (result === 'fail') return { text: '检出故障', cls: 'fault' };
+  if (result === 'error') return { text: '检测异常', cls: 'warn' };
+  return { text: '暂无巡检记录', cls: 'muted' };
+}
+
+function currentChannel() {
+  for (const c of channels) {
+    if (c.channelId === currentChannelId) return c;
+  }
+  return null;
+}
+
+function renderDevices() {
+  const list = document.getElementById('devList');
+  document.getElementById('devCount').textContent = '共 ' + channels.length + ' 个';
+  if (loadError) {
+    list.innerHTML = '<div class="dev-empty">设备列表加载失败<br>' + escapeHtml(loadError) + '</div>';
+    return;
+  }
+  if (channels.length === 0) {
+    list.innerHTML = '<div class="dev-empty">该站点暂无监控设备<br>请确认设备已接入视频平台</div>';
+    return;
+  }
+  let html = '';
+  for (const c of channels) {
+    const online = c.online === true;
+    const patrol = patrolView(c.patrolResult, c.faultTypes);
+    const faultMark = c.patrolResult === 'fail' ? '<span class="warn-mark">△</span>' : '';
+    const loc = c.location ? escapeHtml(c.location) : '—';
+    html += '<div class="dev-card' + (c.channelId === currentChannelId ? ' selected' : '') + '" data-id="' + escapeHtml(c.channelId) + '">' +
+      '<div class="dev-main">' +
+        '<div class="dev-title">' + faultMark + escapeHtml(c.name || c.channelId) +
+          '<span class="tag ' + (online ? 'tag-online' : 'tag-offline') + '">' + (online ? '在线' : '离线') + '</span>' +
+        '</div>' +
+        '<div class="dev-meta"><span class="label">编号：</span>' + escapeHtml(c.channelId) + '</div>' +
+        '<div class="dev-meta"><span class="label">位置：</span>' + loc + '</div>' +
+        '<div class="dev-meta"><span class="label">巡检结果：</span><span class="' + patrol.cls + '">' + patrol.text + '</span></div>' +
+      '</div>' +
+      '<button class="play-chip"><span class="tri">▶</span>播放</button>' +
+    '</div>';
+  }
+  list.innerHTML = html;
+  list.querySelectorAll('.dev-card').forEach(el => {
+    el.addEventListener('click', () => selectChannel(el.dataset.id));
+  });
+}
+
+/** 初始选中：URL 指定通道 → 第一个在线设备 → 第一个设备 */
+function pickInitialChannel() {
+  if (channelIdParam) {
+    for (const c of channels) {
+      if (c.channelId === channelIdParam) return channelIdParam;
+    }
+  }
+  for (const c of channels) {
+    if (c.online === true) return c.channelId;
+  }
+  return channels.length > 0 ? channels[0].channelId : '';
+}
+
+/** 站点下设备清单加载（siteId 优先，channelId / siteName 兜底由后端解析） */
+async function loadSiteChannels() {
+  let query;
+  if (siteIdParam) query = 'siteId=' + encodeURIComponent(siteIdParam);
+  else if (channelIdParam) query = 'channelId=' + encodeURIComponent(channelIdParam);
+  else if (siteNameParam) query = 'siteName=' + encodeURIComponent(siteNameParam);
+  else throw new Error('缺少参数：siteId（或 channelId / siteName）');
+
+  const json = await apiGet(API_BASE + '/site-channels?' + query);
+  if (json.success !== true) throw new Error(json.desc || '设备列表加载失败');
+  const data = json.data || {};
+  channels = Array.isArray(data.channels) ? data.channels : [];
+  const siteName = data.siteName || siteNameParam;
+  document.title = siteName ? siteName + ' · 视频监控' : '视频监控';
+}
+
+// ==================== 通道切换 ====================
+/**
+ * 切换右侧视频与控制目标：
+ * 1. 终止旧通道云台动作（对旧通道入链补发 STOP，保证顺序不乱）；
+ * 2. 销毁旧播放器后重新取流；
+ * 3. 同步云台面板可用状态与画面信息条。
+ */
+function selectChannel(channelId) {
+  if (!channelId) return;
+  if (channelId === currentChannelId) {
+    // 重复点击当前设备：按重连处理（播放失败后可直接再点一次重试）
+    destroyPlayer();
+    startPlay();
+    return;
+  }
+  stopPtzOnSwitch();
+  destroyPlayer();
+  currentChannelId = channelId;
+  const c = currentChannel();
+  document.getElementById('stageName').textContent = c ? (c.name || c.channelId) : '未选择设备';
+  document.getElementById('stageLoc').textContent = c && c.location ? c.location : '';
+  document.querySelectorAll('.dev-card').forEach(el => {
+    el.classList.toggle('selected', el.dataset.id === channelId);
+  });
+  updatePtzState();
+  startPlay();
+}
+
+// ==================== 播放 ====================
+function isPlayInterrupted(err, msg) {
+  if (err) {
+    if (err.name === 'NotAllowedError' || err.name === 'AbortError') return true;
+    if (/play\(\) request was interrupted/i.test(err.message || '')) return true;
+  }
+  return /play\(\) request was interrupted/i.test(msg || '');
+}
+
+function showStageError(msg) {
+  const errorEl = document.getElementById('stageError');
+  errorEl.textContent = msg;
+  errorEl.style.display = 'block';
+  document.getElementById('stagePlaceholder').style.display = 'none';
+}
+
+function hideStageError() {
+  document.getElementById('stageError').style.display = 'none';
+}
+
+/** 取辅码流（与 monitor.html 一致）并起播：静音自动播放，被拦截时显示播放按钮 */
+async function startPlay() {
+  if (!currentChannelId) return;
+  const video = document.getElementById('video');
+  const playBtn = document.getElementById('playBtn');
+  hideStageError();
+  playBtn.style.display = 'none';
+  document.getElementById('stagePlaceholder').style.display = 'flex';
+  const targetChannel = currentChannelId;
+  try {
+    const json = await apiGet(API_BASE + '/stream-url?channelId=' + encodeURIComponent(targetChannel) +
+      '&streamType=2&protocol=hls');
+    if (targetChannel !== currentChannelId) return;   // 取流期间已切到别的通道，丢弃本次结果
+    if (json.success !== true || !json.data || !json.data.url) {
+      throw new Error(json.desc || '获取视频流失败');
+    }
+    const url = proxyUrl(json.data.url);
+    if (Hls.isSupported()) {
+      if (hlsInstance) hlsInstance.destroy();
+      const hls = new Hls({ enableWorker: true });
+      hlsInstance = hls;
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (evt, data) => {
+        if (!data.fatal || hlsInstance !== hls) return;
+        console.error('[HLS] 致命错误：', data);
+        if (isPlayInterrupted(null, data.details || (data.error && data.error.message))) {
+          playBtn.style.display = 'block';
+        } else {
+          showStageError('视频流加载失败，请检查设备在线状态');
+          playBtn.style.display = 'block';
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+    } else {
+      throw new Error('当前浏览器不支持视频播放');
+    }
+    try {
+      await video.play();
+    } catch (playErr) {
+      if (isPlayInterrupted(playErr)) {
+        console.warn('[Play] 自动播放被浏览器拦截，显示播放按钮：', playErr.name);
+        playBtn.style.display = 'block';
+      } else {
+        throw playErr;
+      }
+    }
+  } catch (err) {
+    if (targetChannel !== currentChannelId) return;
+    console.error('[Play] 播放失败：', err);
+    if (err.message && err.message !== '未登录') showStageError(err.message);
+    playBtn.style.display = 'block';
+  }
+}
+
+function bindVideoEvents() {
+  const video = document.getElementById('video');
+  const playBtn = document.getElementById('playBtn');
+  video.addEventListener('playing', () => {
+    document.getElementById('stagePlaceholder').style.display = 'none';
+    playBtn.style.display = 'none';
+    hideStageError();
+  });
+  playBtn.addEventListener('click', () => {
+    if (hlsInstance || video.src) video.play().catch(() => {});
+    else startPlay();
+  });
+  document.getElementById('stageWrap').addEventListener('click', () => {
+    if (video.paused) {
+      if (hlsInstance || video.src) video.play().catch(() => {});
+      else if (currentChannelId) startPlay();
+    }
+  });
+}
+
+function destroyPlayer() {
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  const video = document.getElementById('video');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  document.getElementById('stagePlaceholder').style.display = 'none';
+  document.getElementById('playBtn').style.display = 'none';
+  hideStageError();
+}
+
+// ==================== 云台控制（与 monitor.html 同一权限语义） ====================
+/** 仅系统管理员展示云台面板；非管理员整块隐藏 */
+async function loadPermission() {
+  try {
+    const json = await apiGet(API_BASE + '/auth/current-user');
+    userIsAdmin = !!(json.success === true && json.data && json.data.isAdmin === true);
+    console.log('[Auth] 云台权限 isAdmin=' + userIsAdmin);
+  } catch (err) {
+    console.warn('[Auth] 权限查询失败，默认无云台权限：', err);
+    userIsAdmin = false;
+  }
+  updatePtzState();
+}
+
+/** 当前选中通道是否支持云台（cameraType：1=枪机 2=球机 3=半球 4=云台，与 PC 端一致） */
+function currentHasPtz() {
+  const c = currentChannel();
+  return !!(c && parseInt(c.cameraType) >= 2);
+}
+
+/**
+ * 云台面板状态：
+ * ① 非系统管理员 → 整块隐藏（无权限不展示）；
+ * ② 管理员 + 未选中 → 红字「请选择视频通道」，按钮禁用；
+ * ③ 管理员 + 固定枪机 → 红字「当前为固定摄像头，不支持云台控制」，按钮禁用；
+ * ④ 管理员 + 云台设备 → 启用。
+ */
+function updatePtzState() {
+  const panel = document.getElementById('ptzPanel');
+  const hint = document.getElementById('ptzHint');
+  const body = document.getElementById('ptzBody');
+  if (!userIsAdmin) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  const c = currentChannel();
+  document.getElementById('ptzDev').textContent = c ? (c.name || c.channelId) : '';
+  if (!c) {
+    hint.textContent = '请选择视频通道';
+    hint.classList.add('show');
+    body.classList.add('disabled');
+    return;
+  }
+  if (!currentHasPtz()) {
+    hint.textContent = '当前为固定摄像头，不支持云台控制';
+    hint.classList.add('show');
+    body.classList.add('disabled');
+    return;
+  }
+  hint.textContent = '';
+  hint.classList.remove('show');
+  body.classList.remove('disabled');
+}
+
+async function doSendPtz(url, body) {
+  try {
+    const json = await apiPost(API_BASE + url, body);
+    if (json.success !== true) {
+      console.warn('[PTZ] 命令返回失败：', json.desc || json.code);
+      if (String(json.code) === '403') { userIsAdmin = false; updatePtzState(); }
+      return false;
+    }
+    return true;
+  } catch (err) {
+    if (err.message === '403') { userIsAdmin = false; updatePtzState(); }
+    return false;
+  }
+}
+
+/** 入链串行发送：所有 PTZ 命令严格按入队顺序逐个发出（防 STOP 先于 START 到达） */
+function enqueuePtz(url, body) {
+  ptzInFlight++;
+  const p = ptzChain.then(() => doSendPtz(url, body));
+  ptzChain = p.then(() => { ptzInFlight--; }, () => { ptzInFlight--; });
+  return p;
+}
+
+/** 3 秒硬超时兜底：touchend/mouseup 丢失或网络中断时强制停止，防止设备永久失控 */
+function armPtzHardTimeout() {
+  if (ptzHardTimeout) clearTimeout(ptzHardTimeout);
+  ptzHardTimeout = setTimeout(() => {
+    console.error('[PTZ] 3秒无成功指令，强制停止');
+    ptzStop();
+  }, 3000);
+}
+
+function ptzStart(direction) {
+  if (!userIsAdmin || !currentHasPtz() || !currentChannelId) return;
+  console.log('[PTZ] 按下方向：' + direction + ', channelId=' + currentChannelId);
+  ptzUserInteracting = true;
+  ptzChannelId = currentChannelId;
+  lastPtzDirection = direction;
+  enqueuePtz('/ptz/direct', { channelId: ptzChannelId, direction: direction, speed: 5 })
+    .then(ok => { if (ok && ptzUserInteracting) armPtzHardTimeout(); });
+  if (ptzTimer) clearInterval(ptzTimer);
+  // 1 秒心跳维持转动（官方模式：一次 START 即持续转动）；心跳成功才重置硬超时
+  ptzTimer = setInterval(() => {
+    if (ptzInFlight !== 0 || !ptzUserInteracting) return;
+    enqueuePtz('/ptz/direct', { channelId: ptzChannelId, direction: lastPtzDirection, speed: 5 })
+      .then(ok => { if (ok && ptzUserInteracting) armPtzHardTimeout(); });
+  }, 1000);
+  armPtzHardTimeout();
+}
+
+/**
+ * 停止当前云台动作：先保存本次方向（后端要求 STOP 的 direction 与 START 一致），
+ * 等链上在途命令完成后才发 STOP，失败重试最多 3 次。
+ */
+async function ptzStop() {
+  if (!ptzUserInteracting) return;
+  const stopDir = lastPtzDirection;
+  const ch = ptzChannelId || currentChannelId;
+  console.log('[PTZ] 松开，停止方向：' + stopDir + ', channelId=' + ch);
+  ptzUserInteracting = false;
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  lastPtzDirection = null;
+  await ptzChain;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (ptzUserInteracting) return;   // 用户已开始新操作，放弃本次停止
+    if (!ch) return;
+    const ok = await enqueuePtz('/ptz/stop', { channelId: ch, direction: stopDir });
+    if (ok) {
+      console.log('[PTZ] 停止命令第' + attempt + '次成功');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.error('[PTZ] 停止命令3次均失败，请检查网络');
+}
+
+/** 切通道前对旧通道补发停止（入链保证在旧通道在途 START 之后执行） */
+function stopPtzOnSwitch() {
+  if (!ptzUserInteracting) return;
+  const stopDir = lastPtzDirection;
+  const ch = ptzChannelId;
+  ptzUserInteracting = false;
+  if (ptzTimer) { clearInterval(ptzTimer); ptzTimer = null; }
+  if (ptzHardTimeout) { clearTimeout(ptzHardTimeout); ptzHardTimeout = null; }
+  lastPtzDirection = null;
+  document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+  if (ch) {
+    console.log('[PTZ] 切换通道，停止旧通道：' + ch);
+    enqueuePtz('/ptz/stop', { channelId: ch, direction: stopDir });
+  }
+}
+
+/** 按压绑定：触摸 + 鼠标双支持 */
+function bindPtzButton(btn) {
+  const dir = btn.dataset.dir;
+  let lastTouchTs = 0;
+  const pressDown = () => { btn.classList.add('pressing'); ptzStart(dir); };
+  const pressUp = () => { btn.classList.remove('pressing'); ptzStop(); };
+  btn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    lastTouchTs = e.timeStamp;
+    pressDown();
+  }, { passive: false });
+  btn.addEventListener('touchend', (e) => { e.preventDefault(); pressUp(); }, { passive: false });
+  btn.addEventListener('touchcancel', () => pressUp());
+  btn.addEventListener('mousedown', (e) => {
+    if (lastTouchTs > 0 && e.timeStamp - lastTouchTs < 500) return;   // 触摸后模拟鼠标事件防重
+    e.preventDefault();
+    pressDown();
+  });
+  btn.addEventListener('mouseup', () => pressUp());
+  btn.addEventListener('mouseleave', () => { if (ptzUserInteracting) pressUp(); });
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+}
+
+/** 全局兜底：按钮外松开 / 切后台 / 页面卸载，一律停止，防止设备失控 */
+function bindPtzSafety() {
+  document.addEventListener('mouseup', () => {
+    if (ptzUserInteracting) {
+      document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+      ptzStop();
+    }
+  });
+  document.addEventListener('touchend', () => {
+    if (ptzUserInteracting) {
+      document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+      ptzStop();
+    }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && ptzUserInteracting) {
+      document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+      ptzStop();
+    }
+  });
+  window.addEventListener('blur', () => {
+    if (ptzUserInteracting) {
+      document.querySelectorAll('.ptz-btn').forEach(b => b.classList.remove('pressing'));
+      ptzStop();
+    }
+  });
+  window.addEventListener('pagehide', () => {
+    // 页面卸载：fetch 可能被取消，用 sendBeacon 保证 STOP 送达（后端队列去重，重复 STOP 无害）
+    if (ptzUserInteracting && ptzChannelId) {
+      try {
+        navigator.sendBeacon(API_BASE + '/ptz/stop',
+          new Blob([JSON.stringify({ channelId: ptzChannelId, direction: lastPtzDirection })],
+            { type: 'application/json' }));
+      } catch (e) { console.warn('[PTZ] sendBeacon 兜底失败：', e); }
+    }
+    ptzStop();
+    destroyPlayer();
+  });
+}
+
+// ==================== 初始化 ====================
+async function init() {
+  bindVideoEvents();
+  document.querySelectorAll('.ptz-btn').forEach(bindPtzButton);
+  document.getElementById('ptzStop').addEventListener('click', () => ptzStop());
+  bindPtzSafety();
+
+  // 权限与设备清单并行加载；权限失败按无云台权限处理（安全侧）
+  await Promise.all([loadPermission(), loadSiteChannels().catch(err => {
+    console.error('[Init] 设备列表加载失败：', err);
+    channels = [];
+    loadError = err.message || '未知错误';
+  })]);
+
+  renderDevices();
+  if (channels.length === 0) {
+    updatePtzState();
+    document.getElementById('stageName').textContent = loadError ? '设备列表加载失败' : '暂无视频设备';
+    document.getElementById('stagePlaceholder').style.display = 'none';
+    document.getElementById('stageEmpty').textContent = loadError ? '视频设备加载失败' : '暂无视频设备';
+    document.getElementById('stageEmpty').style.display = 'block';
+    return;
+  }
+  document.getElementById('stageEmpty').style.display = 'none';
+  selectChannel(pickInitialChannel());
+  updatePtzState();
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

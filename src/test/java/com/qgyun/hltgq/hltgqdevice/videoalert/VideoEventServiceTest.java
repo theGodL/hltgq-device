@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSONObject;
 import com.qgyun.hltgq.hltgqdevice.config.DahuaConfig;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaAuthService;
 import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
+import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -41,10 +42,10 @@ class VideoEventServiceTest {
     private static final String SITE_ID = "site-001";
     private static final String SITE_NAME = "海棠洼节制闸";
     private static final String DEVICE_ID = "device-001";
-    private static final String DEVICE_NAME = SITE_NAME + "摄像机#";
 
     private JdbcTemplate jdbcTemplate;
     private DeviceTableService deviceTableService;
+    private StationStatusSyncService stationStatusSyncService;
     private VideoAlertService alertService;
     private DahuaConfig dahuaConfig;
     private VideoEventService service;
@@ -53,12 +54,14 @@ class VideoEventServiceTest {
     void setUp() {
         jdbcTemplate = mock(JdbcTemplate.class);
         deviceTableService = mock(DeviceTableService.class);
+        stationStatusSyncService = mock(StationStatusSyncService.class);
         alertService = mock(VideoAlertService.class);
         DahuaAuthService authService = mock(DahuaAuthService.class);
         dahuaConfig = new DahuaConfig();
         service = new VideoEventService();
         ReflectionTestUtils.setField(service, "jdbcTemplate", jdbcTemplate);
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
+        ReflectionTestUtils.setField(service, "stationStatusSyncService", stationStatusSyncService);
         ReflectionTestUtils.setField(service, "alertService", alertService);
         ReflectionTestUtils.setField(service, "authService", authService);
         ReflectionTestUtils.setField(service, "dahuaConfig", dahuaConfig);
@@ -68,8 +71,9 @@ class VideoEventServiceTest {
         row.put("zzkaec", SITE_NAME);
         when(jdbcTemplate.queryForList(anyString(), eq(NODE_CODE)))
                 .thenReturn(Arrays.asList(row));
-        // 设备预置：设备名派生 + 兜底查/建设备返回设备ID（status/位置传 null，由站点同步轮维护）
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
+        // 设备预置：通道已入库（告警/事件侧先查设备表直接取 ID，不触发 ICC 遍历）
+        when(deviceTableService.findVideoDeviceByCode(NODE_CODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef(DEVICE_ID, SITE_ID));
         when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
                 nullable(String.class), nullable(String.class))).thenReturn(DEVICE_ID);
     }
@@ -105,10 +109,10 @@ class VideoEventServiceTest {
 
         String content = SITE_NAME + "-视频智能事件 区域入侵！";
         verify(alertService).reportEventAlert(SITE_ID, DEVICE_ID, content, "#4#");
-        // 设备解析：status/位置留空（由站点同步轮按设备树维护）
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(SITE_ID),
-                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(NODE_CODE), isNull(),
-                isNull());
+        // 设备已入库：直接按 code 取 ID，不重复创建设备
+        verify(deviceTableService).findVideoDeviceByCode(NODE_CODE);
+        verify(deviceTableService, never()).lookupOrCreateDevice(anyString(), anyString(), anyString(),
+                anyString(), nullable(String.class), nullable(String.class));
     }
 
     /** alarmStat=2（消失）：按 content 关闭告警并联动工单 */

@@ -24,13 +24,13 @@ import java.util.concurrent.ConcurrentMap;
  * 视频设备表服务：视频设备入库 {@code t_auto_hltgq_water_device}（type=#5# 视频），
  * 模式移植自 hltgq-mq MonitorDataService.lookupOrCreateDeviceByName（同表、同字段语义）：
  * <ul>
- *   <li>设备名 = 站点名 + 后缀（默认"摄像机"）+ "#"，如"南山寺节制闸摄像机#"
- *       （站点名含"-视频"后缀时如"夏家湖渡槽-视频摄像机#"），
- *       对齐 hltgq-mq "{站点名}{设备类型}#"（如"集岭管理所雨量计#"）命名风格；</li>
- *   <li>每个视频站点（通道）对应 1 台设备，site 存站点ID，code 存通道 devicecode；</li>
- *   <li>设备匹配键 = code（通道 devicecode，唯一）；name 仅展示（创建时写入）。历史教训：
- *       按 name 匹配时僵尸站点与树内站点重名（如两个"大门外"），树内同步会波及同名僵尸设备、
- *       树内站点自身设备反而错配（2026-09-05 线上核对发现 21 条 wlcvig 不一致）；</li>
+ *   <li>设备名 = ICC 通道原名（2026-10-20 业务裁定：设备已挂在站点下，同一站点内通道名可区分，
+ *       不再拼站点前缀与"摄像机#"后缀），客户看到的名称与编码与大华设备树完全一致；</li>
+ *   <li>每个视频通道对应 1 台设备，site 存站点ID，code 存通道 devicecode；</li>
+ *   <li>设备匹配键 = code（通道 devicecode，唯一）；name 仅展示，由站点同步轮按 ICC 通道名持续校正。
+ *       历史教训：按 name 匹配时僵尸站点与树内站点重名（如两个"大门外"），树内同步会波及同名僵尸设备、
+ *       树内站点自身设备反而错配（2026-09-05 线上核对发现 21 条 wlcvig 不一致）；
+ *       2026-10-20 进一步收窄：仅"无 code 的历史行"允许按 name 兜底回填，同名但 code 不同的行绝不复用；</li>
  *   <li>code → deviceId 永久缓存（code 稳定，查询/创建失败不缓存可重试）；</li>
  *   <li>动态列适配：启动时加载设备表列元数据，列不存在自动跳过；</li>
  *   <li>设备运行状态 status（#1#在线/#2#离线）由站点同步维护；</li>
@@ -65,10 +65,6 @@ public class DeviceTableService {
 
     @Value("${app.corp-code:hltgq}")
     private String corpCode;
-
-    /** 视频设备名称后缀（默认"摄像机"，与 hltgq-mq "雨量计#" 命名风格一致） */
-    @Value("${video-alert.device-suffix:摄像机}")
-    private String deviceSuffix;
 
     /** 设备表有效列名缓存（动态列适配，与 hltgq-mq 一致） */
     private Set<String> deviceColumns = Collections.emptySet();
@@ -115,19 +111,15 @@ public class DeviceTableService {
     }
 
     /**
-     * 设备名派生：站点名 + 后缀 + "#"（如"渠首电站上游摄像机#"）。
-     * 站点名已以后缀结尾时仅追加"#"，禁止叠词（2026-10-15 教训：
-     * 旧兜底站"五圩支渠摄像机_1"产出过"五圩支渠摄像机_1摄像机#"叠词设备名）。
+     * 设备名归一：设备表 name 直接取 ICC 通道原名（2026-10-20 业务裁定）。
+     * 站点-设备架构下设备挂在站点下，同一站点内通道名可区分，不再拼站点前缀与"摄像机#"后缀；
+     * 客户看到的设备名称与大华设备树完全一致。空白名返回 null。
      */
-    public String deviceNameOf(String siteName) {
-        if (siteName == null || siteName.trim().isEmpty()) {
+    public String channelNameOf(String channelName) {
+        if (channelName == null || channelName.trim().isEmpty()) {
             return null;
         }
-        String name = siteName.trim();
-        if (deviceSuffix != null && !deviceSuffix.isEmpty() && name.endsWith(deviceSuffix)) {
-            return name + "#";
-        }
-        return name + deviceSuffix + "#";
+        return channelName.trim();
     }
 
     /**
@@ -150,9 +142,10 @@ public class DeviceTableService {
 
     /**
      * 按通道 devicecode（code）查找或创建设备（带缓存），可选写入 type/code/status/location。
-     * <p>code 为设备唯一匹配键；name 仅作展示字段（创建时写入）。
-     * 历史设备可能缺失 code（早期版本按 name 创建），code 查不到时按 name 兜底并回填 code
-     * （按设备ID精确回填，避免 name 重名波及多行）。
+     * <p>code 为设备唯一匹配键；name 为 ICC 通道原名，仅作展示字段（创建时写入，
+     * 已存在设备由站点同步轮 {@link #updateDeviceName} 持续校正）。
+     * 历史设备可能缺失 code（早期版本按 name 创建），仅这类"无 code 旧行"允许按 name 兜底并回填 code；
+     * 同名但 code 不同的行属于另一台设备，不再复用（防新通道被同名旧行吞并）。
      * <p>查询失败/创建失败返回 null 且不缓存，下次调用重试。
      *
      * @param location 安装位置（wlcvig，可为 null；创建时写入，已存在设备不更新）
@@ -163,7 +156,7 @@ public class DeviceTableService {
         if (name == null || name.trim().isEmpty()) {
             return null;
         }
-        // 匹配键：通道 devicecode 唯一；历史设备缺失 code 时回退 name（旧行为）
+        // 匹配键：通道 devicecode 唯一；历史设备缺失 code 时回退 name（仅无 code 旧行）
         String matchKey = (code != null && !code.trim().isEmpty()) ? code.trim() : name.trim();
         String cached = deviceCache.get(matchKey);
         if (cached != null) {
@@ -171,28 +164,45 @@ public class DeviceTableService {
         }
         // computeIfAbsent 内返回 null 不缓存（ConcurrentHashMap 语义），创建失败下次重试
         return deviceCache.computeIfAbsent(matchKey, key -> {
-            String id = findDeviceByCodeOrName(key, name.trim());
+            String id = findDeviceByCodeOrLegacyName(key, name.trim());
             return id != null ? id : createDevice(name.trim(), siteId, type, code, status, location);
         });
     }
 
     /**
-     * 按 code 查设备ID；code 查不到时按 name 兜底（历史设备缺失 code 场景），
-     * 命中后回填 code（按设备ID精确更新），后续轮次即可按 code 匹配。
+     * 按 code 查设备ID；code 查不到时仅对"无 code 的历史行"按 name 兜底并回填 code，
+     * 同名但已带其他 code 的行不复用（2026-10-20 修正：此前按 name 无条件兜底，
+     * 导致 ICC 重建通道后的新编码被同名旧设备行吞并，告警/巡检长期挂在僵尸设备上）。
      */
-    private String findDeviceByCodeOrName(String key, String name) {
+    private String findDeviceByCodeOrLegacyName(String key, String name) {
         String id = findDeviceByKey("code", key);
         if (id != null) {
             return id;
         }
-        String byName = findDeviceByKey("name", name);
+        String byName = findLegacyDeviceByName(name);
         if (byName != null && !key.equals(name)) {
             backfillCode(byName, key);
         }
         return byName;
     }
 
-    /** 按设备表列（code/name，内部常量）查视频设备ID（不创建），不存在或查询失败返回 null */
+    /** 按 name 查"无 code 的历史视频设备"（code 为空才返回；同名但带 code 的行属于另一台设备） */
+    private String findLegacyDeviceByName(String name) {
+        try {
+            String sql = "SELECT id FROM " + DEVICE_TABLE + " WHERE name = ? AND type = '"
+                    + DEVICE_TYPE_VIDEO + "' AND (code IS NULL OR code = '')";
+            List<String> results = jdbcTemplate.queryForList(sql, String.class, name);
+            if (results != null && !results.isEmpty()
+                    && results.get(0) != null && !results.get(0).trim().isEmpty()) {
+                return results.get(0).trim();
+            }
+        } catch (Exception e) {
+            log.warn("[视频设备] 查找历史无code设备失败, name={}: {}", name, e.getMessage());
+        }
+        return null;
+    }
+
+    /** 按设备表 code 查视频设备ID（不创建），不存在或查询失败返回 null */
     private String findDeviceByKey(String column, String value) {
         try {
             // type 条件限定视频设备：站点表存在与视频通道同 devicecode 的其他类型站点
@@ -340,6 +350,32 @@ public class DeviceTableService {
                     new Timestamp(System.currentTimeMillis()), code.trim(), location.trim());
         } catch (Exception e) {
             log.warn("[视频设备] 更新设备安装位置失败, code={}: {}", code, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * 更新设备名称（name 与 ICC 通道名不一致时）：站点同步轮每轮校正，
+     * 使客户看到的名称始终与大华设备树一致（人工改名也会被下一轮同步覆盖）。
+     * 按通道 devicecode（code）精确匹配，仅名称变化时写库。
+     *
+     * @param code 通道 devicecode（唯一匹配键，为空跳过）
+     * @param name ICC 通道原名（为空跳过）
+     * @return 实际更新的行数（无变化为 0）
+     */
+    public int updateDeviceName(String code, String name) {
+        if (code == null || code.trim().isEmpty() || name == null || name.trim().isEmpty()) {
+            return 0;
+        }
+        try {
+            String sql = "UPDATE " + DEVICE_TABLE +
+                    " SET name = ?, updated_at = ?, updated_by = 'SYSTEM' " +
+                    " WHERE code = ? AND type = '" + DEVICE_TYPE_VIDEO +
+                    "' AND name IS DISTINCT FROM ?";
+            return jdbcTemplate.update(sql, name.trim(),
+                    new Timestamp(System.currentTimeMillis()), code.trim(), name.trim());
+        } catch (Exception e) {
+            log.warn("[视频设备] 更新设备名称失败, code={}: {}", code, e.getMessage());
             return 0;
         }
     }
@@ -504,7 +540,9 @@ public class DeviceTableService {
                     continue;
                 }
                 String siteId = String.valueOf(sid).trim();
-                String deviceName = deviceNameOf(String.valueOf(sname).trim());
+                // 设备名优先取 ICC 通道原名；此迁移路径只有站点行（无通道名），暂用站点名，
+                // 首轮站点同步会按 ICC 通道名 updateDeviceName 校正
+                String deviceName = channelNameOf(String.valueOf(sname).trim());
                 if (deviceName == null) {
                     continue;
                 }

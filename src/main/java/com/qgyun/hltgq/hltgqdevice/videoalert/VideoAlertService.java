@@ -1,6 +1,7 @@
 package com.qgyun.hltgq.hltgqdevice.videoalert;
 
 import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
+import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import com.qgyun.hltgq.hltgqdevice.util.IdGenerator;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -80,6 +81,9 @@ public class VideoAlertService {
     @Resource
     private DeviceTableService deviceTableService;
 
+    @Resource
+    private StationStatusSyncService stationStatusSyncService;
+
     @Value("${app.corp-code:hltgq}")
     private String corpCode;
 
@@ -147,8 +151,10 @@ public class VideoAlertService {
 
     /**
      * 新增故障告警：站点名 + 故障名拼装 content（"{站点}-视频 {故障}！"，对齐 hltgq-mq 风格），
-     * device 存设备表视频设备 ID（type=#5#，查不到自动兜底创建），
+     * device 存设备表视频设备 ID（type=#5#），
      * 同一未关闭告警（site+device+content）不重复新增，新增成功自动联动生成工单。
+     * <p>通道尚未入库（ICC 新增通道/历史缺口）时，先按 ICC 设备树即时补建再重试解析，
+     * 避免"巡检发现了故障却因设备表没有台账而丢告警"（2026-10-20 R7 修复）。
      *
      * @param devicecode 通道设备编码（设备表 code 匹配）
      * @param fault      故障类型
@@ -156,8 +162,12 @@ public class VideoAlertService {
      */
     public boolean reportFault(String devicecode, VideoFaultType fault) {
         SiteInfo site = resolveSite(devicecode);
+        if (site == null && stationStatusSyncService.ensureDeviceRegistered(devicecode)) {
+            // 补建后设备已挂站点：再解析一次（siteCache 只缓存成功结果，不会命中空值）
+            site = resolveSite(devicecode);
+        }
         if (site == null) {
-            log.warn("[视频告警] 通道 {} 未匹配到站点，跳过告警: {}", devicecode, fault.getLabel());
+            log.warn("[视频告警] 通道 {} 未匹配到站点且即时补建失败，跳过告警: {}", devicecode, fault.getLabel());
             return false;
         }
         String deviceId = resolveOrCreateDevice(devicecode, site);
@@ -414,13 +424,23 @@ public class VideoAlertService {
     }
 
     /**
-     * devicecode → 设备表视频设备ID（type=#5#）：设备名 = 站点名 + 后缀 + "#"，
+     * devicecode → 设备表视频设备ID（type=#5#）：设备名优先取 ICC 通道原名（与站点同步同一口径，
+     * 设备已挂在站点下，不再拼站点名前缀/后缀），取不到时退回站点名；
      * 查不到自动兜底创建（设备状态/位置留空，由站点同步轮按设备树维护——架构改造后
      * 站点 mivbcz 不再维护，安装位置以设备表 wlcvig 为准）；设备表不可达返回 null。
      */
     private String resolveOrCreateDevice(String devicecode, SiteInfo site) {
         try {
-            String deviceName = deviceTableService.deviceNameOf(site.name);
+            // 正常路径：设备已存在（resolveSite 即由设备表 JOIN 得到站点），直接取 ID，不触发 ICC 遍历
+            DeviceTableService.VideoDeviceRef existing = deviceTableService.findVideoDeviceByCode(devicecode);
+            if (existing != null) {
+                return existing.getId();
+            }
+            String deviceName = site.name;
+            StationStatusSyncService.VideoChannel ch = stationStatusSyncService.findChannel(devicecode);
+            if (ch != null && ch.getName() != null && !ch.getName().trim().isEmpty()) {
+                deviceName = ch.getName().trim();
+            }
             return deviceTableService.lookupOrCreateDevice(deviceName, site.id,
                     DeviceTableService.DEVICE_TYPE_VIDEO, devicecode, null, null);
         } catch (Exception e) {

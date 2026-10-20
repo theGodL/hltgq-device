@@ -47,7 +47,8 @@ class StationStatusSyncServiceTest {
 
     private static final String DEVICECODE = "1000231$1$0$10";
     private static final String CHANNEL_NAME = "渠首电站上游";
-    private static final String DEVICE_NAME = CHANNEL_NAME + "摄像机#";
+    /** 设备表 name = ICC 通道原名（2026-10-20 起不再拼站点前缀/“摄像机#”后缀） */
+    private static final String DEVICE_NAME = CHANNEL_NAME;
     /** 设备树层级：001→管理所org→位置节点org→通道，位置应取"管理所-通道名" */
     private static final String ORG_ID = "001001";
     private static final String ORG_NAME = "渠首管理所";
@@ -70,7 +71,8 @@ class StationStatusSyncServiceTest {
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
         ReflectionTestUtils.setField(service, "jdbcTemplate", jdbcTemplate);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
-        when(deviceTableService.deviceNameOf(anyString())).thenReturn(DEVICE_NAME);
+        // 设备名 = ICC 通道原名（channelNameOf 归一后原样返回）
+        when(deviceTableService.channelNameOf(anyString())).thenAnswer(inv -> inv.getArgument(0));
     }
 
     /** 在线通道节点（cameraType=球机，供通道信息缓存用例断言） */
@@ -308,6 +310,7 @@ class StationStatusSyncServiceTest {
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), eq("#1#"), eq(LOCATION));
         verify(deviceTableService).updateDeviceStatus(eq(DEVICECODE), eq("#1#"));
         verify(deviceTableService).updateDeviceLocation(eq(DEVICECODE), eq(LOCATION));
+        verify(deviceTableService).updateDeviceName(eq(DEVICECODE), eq(CHANNEL_NAME));
         // 本轮见到的通道参与消失标注
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Collection<String>> seenCaptor = ArgumentCaptor.forClass(Collection.class);
@@ -331,7 +334,8 @@ class StationStatusSyncServiceTest {
         service.syncVideoStationStatus();
 
         assertEquals("parent-001", argsOf(updates.get(0))[1], "NVR名应命中同名业务站");
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-001"),
+        // 设备名 = ICC 通道原名（含 _1 后缀），不再是"NVR名+摄像机#"
+        verify(deviceTableService).lookupOrCreateDevice(eq("孟垅直灌涵_1"), eq("parent-001"),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000329$1$0$0"), eq("#1#"), eq("宿松-孟垅直灌涵_1"));
     }
 
@@ -351,7 +355,7 @@ class StationStatusSyncServiceTest {
         service.syncVideoStationStatus();
 
         assertEquals("parent-river", argsOf(updates.get(0))[1], "别名应映射到荞麦岭泄洪河");
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-river"),
+        verify(deviceTableService).lookupOrCreateDevice(eq("荞麦岭泄洪闸上游_1"), eq("parent-river"),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000332$1$0$0"), eq("#1#"), anyString());
     }
 
@@ -371,7 +375,7 @@ class StationStatusSyncServiceTest {
         service.syncVideoStationStatus();
 
         assertEquals("parent-biling", argsOf(updates.get(0))[1], "应跟随同名视频行已挂的上级");
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("parent-biling"),
+        verify(deviceTableService).lookupOrCreateDevice(eq("段垅节制闸上游_1"), eq("parent-biling"),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000347$1$0$0"), eq("#1#"), anyString());
     }
 
@@ -426,7 +430,7 @@ class StationStatusSyncServiceTest {
         assertFalse(insertSql.contains("zebpsu"), "兜底站 SQL 不含 zebpsu（状态归设备表）");
         assertFalse(insertSql.contains("mivbcz"), "兜底站 SQL 不含 mivbcz（位置归设备表）");
         // 设备挂靠兜底站
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq(fallbackSiteId),
+        verify(deviceTableService).lookupOrCreateDevice(eq("野站闸_1"), eq(fallbackSiteId),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000900$1$0$0"), eq("#1#"), eq("望江县-野站闸_1"));
     }
 
@@ -462,7 +466,7 @@ class StationStatusSyncServiceTest {
         service.syncVideoStationStatus();
 
         assertNull(findUpdate(updates, "INSERT INTO"), "兜底站已存在不应重复建站");
-        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), eq("fallback-001"),
+        verify(deviceTableService).lookupOrCreateDevice(eq("野站闸_1"), eq("fallback-001"),
                 eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000900$1$0$0"), eq("#1#"), anyString());
     }
 
@@ -487,6 +491,59 @@ class StationStatusSyncServiceTest {
         verify(deviceTableService, never()).updateDeviceSite(anyString(), anyString());
         verify(deviceTableService, never()).updateDeviceStatus(anyString(), anyString());
         verify(deviceTableService, never()).updateDeviceLocation(anyString(), anyString());
+        verify(deviceTableService, never()).updateDeviceName(anyString(), anyString());
+    }
+
+    // ==================== 告警/事件侧即时补建（ensureDeviceRegistered） ====================
+
+    /**
+     * 通道未入库时即时补建：按 ICC 设备树取通道 → 业务站未命中落兜底站 →
+     * 设备名取通道原名 → 状态/位置/名称同步，补建后 findVideoDeviceByCode 可查到。
+     */
+    @Test
+    void ensureDeviceRegisteredCreatesMissingChannel() {
+        mockThreeLevelTree();
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(null)
+                .thenReturn(null)
+                .thenReturn(new DeviceTableService.VideoDeviceRef("device-001", "fb-new"));
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-001");
+
+        assertTrue(service.ensureDeviceRegistered(DEVICECODE));
+
+        verify(deviceTableService).lookupOrCreateDevice(eq(DEVICE_NAME), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq(DEVICECODE), eq("#1#"), eq(LOCATION));
+        verify(deviceTableService).updateDeviceName(eq(DEVICECODE), eq(CHANNEL_NAME));
+        assertNotNull(findUpdate(updates, "INSERT INTO"), "未命中业务站应落兜底站");
+    }
+
+    /** ICC 设备树中不存在该通道：补建直接失败，不写库 */
+    @Test
+    void ensureDeviceRegisteredReturnsFalseWhenChannelAbsent() {
+        when(deviceService.getDeviceTreeWithStatus(anyString()))
+                .thenReturn(DahuaDeviceService.DeviceTreeResult.success(Collections.emptyList()));
+        when(deviceTableService.findVideoDeviceByCode("no-such-channel")).thenReturn(null);
+
+        assertFalse(service.ensureDeviceRegistered("no-such-channel"));
+        assertFalse(service.ensureDeviceRegistered("  "));
+        verify(deviceTableService, never()).lookupOrCreateDevice(anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString());
+    }
+
+    /** 设备已存在：直接返回 true，不再遍历设备树/写库 */
+    @Test
+    void ensureDeviceRegisteredSkipsWhenDeviceExists() {
+        when(deviceTableService.findVideoDeviceByCode(DEVICECODE))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("device-001", "biz-001"));
+
+        assertTrue(service.ensureDeviceRegistered(DEVICECODE));
+
+        verify(deviceService, never()).getDeviceTreeWithStatus(anyString());
+        verify(deviceTableService, never()).lookupOrCreateDevice(anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString());
     }
 
     /**
@@ -688,5 +745,230 @@ class StationStatusSyncServiceTest {
 
         assertNull(service.findSiteId(DEVICECODE), "无对应设备应返回 null");
         assertNull(service.findSiteId("  "), "空白 devicecode 应直接返回 null");
+    }
+
+    // ==================== 麻塘湖点位站与同名通道消歧（2026-10-20） ====================
+
+    /** 通道节点（在线球机） */
+    private DahuaDeviceService.DeviceTreeNode channelNode(String code, String name) {
+        DahuaDeviceService.DeviceTreeNode node = new DahuaDeviceService.DeviceTreeNode();
+        node.setId(code);
+        node.setName(name);
+        node.setNodeType("ch");
+        node.setIsOnline(1);
+        node.setCameraType(2);
+        return node;
+    }
+
+    /** 同一组织下两个 NVR、各挂一条通道（麻塘湖点位场景：NVR名带"摄像机"后缀） */
+    private void mockTwoNvrTree(String orgName,
+                                String nvrName1, String channelName1, String code1,
+                                String nvrName2, String channelName2, String code2) {
+        when(deviceService.getDeviceTreeWithStatus(anyString())).thenAnswer(inv -> {
+            String pid = inv.getArgument(0);
+            if ("001".equals(pid)) {
+                return DahuaDeviceService.DeviceTreeResult.success(
+                        Collections.singletonList(orgNode(ORG_ID, orgName)));
+            }
+            if (ORG_ID.equals(pid)) {
+                return DahuaDeviceService.DeviceTreeResult.success(Arrays.asList(
+                        devNode("nvr-1", nvrName1), devNode("nvr-2", nvrName2)));
+            }
+            if ("nvr-1".equals(pid)) {
+                return DahuaDeviceService.DeviceTreeResult.success(
+                        Collections.singletonList(channelNode(code1, channelName1)));
+            }
+            return DahuaDeviceService.DeviceTreeResult.success(
+                    Collections.singletonList(channelNode(code2, channelName2)));
+        });
+    }
+
+    /** 同一组织下一个 NVR、挂两条通道（同 NVR 内同名场景） */
+    private void mockSameNvrTree(String orgName, String nvrName,
+                                 String channelName1, String code1,
+                                 String channelName2, String code2) {
+        when(deviceService.getDeviceTreeWithStatus(anyString())).thenAnswer(inv -> {
+            String pid = inv.getArgument(0);
+            if ("001".equals(pid)) {
+                return DahuaDeviceService.DeviceTreeResult.success(
+                        Collections.singletonList(orgNode(ORG_ID, orgName)));
+            }
+            if (ORG_ID.equals(pid)) {
+                return DahuaDeviceService.DeviceTreeResult.success(
+                        Collections.singletonList(devNode("nvr-1", nvrName)));
+            }
+            return DahuaDeviceService.DeviceTreeResult.success(Arrays.asList(
+                    channelNode(code1, channelName1), channelNode(code2, channelName2)));
+        });
+    }
+
+    /**
+     * 同名通道按父节点名消歧：1000395（NVR"易潭支渠中段摄像机"）与 1000396（NVR"九朋支渠中尾段摄像机"）
+     * 通道名同为"易潭支渠中段摄像机_1"（ICC 跨 NVR 不自动加后缀）→ 后者设备名改用其父节点名，
+     * 与设备树层级/点位站名一致（2026-10-20 业务确认）。
+     */
+    @Test
+    void duplicateChannelNameDisambiguatedByParentName() {
+        mockTwoNvrTree("麻塘湖灌区",
+                "易潭支渠中段摄像机", "易潭支渠中段摄像机_1", "1000395$1$0$0",
+                "九朋支渠中尾段摄像机", "易潭支渠中段摄像机_1", "1000396$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-x");
+
+        service.syncVideoStationStatus();
+
+        verify(deviceTableService).lookupOrCreateDevice(eq("易潭支渠中段摄像机"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000395$1$0$0"), eq("#1#"), anyString());
+        verify(deviceTableService).lookupOrCreateDevice(eq("九朋支渠中尾段摄像机"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000396$1$0$0"), eq("#1#"), anyString());
+        verify(deviceTableService, never()).lookupOrCreateDevice(eq("易潭支渠中段摄像机_1"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), anyString(), anyString(), anyString());
+    }
+
+    /**
+     * 父节点名只是 NVR 设备名时保留原通道名：毕岭管理所硬盘录像机下两条同名"太宿进水闸上游"，
+     * 若用父节点名会变成"毕岭管理所硬盘录像机"/"_2"（丢失点位信息）→ 应为原名与"原名_2"。
+     */
+    @Test
+    void duplicateChannelNameKeepsOriginalWhenParentIsNvrDevice() {
+        mockSameNvrTree("毕岭管理所", "毕岭管理所硬盘录像机",
+                "太宿进水闸上游", "1000218$1$0$2",
+                "太宿进水闸上游", "1000218$1$0$3");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-x");
+
+        service.syncVideoStationStatus();
+
+        verify(deviceTableService).lookupOrCreateDevice(eq("太宿进水闸上游"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000218$1$0$2"), eq("#1#"), anyString());
+        verify(deviceTableService).lookupOrCreateDevice(eq("太宿进水闸上游_2"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000218$1$0$3"), eq("#1#"), anyString());
+        verify(deviceTableService, never()).lookupOrCreateDevice(eq("毕岭管理所硬盘录像机"), anyString(),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), anyString(), anyString(), anyString());
+    }
+
+    /**
+     * 新通道命中视频点站：NVR"老水厂出水口摄像机"去噪后为"老水厂出水口"，
+     * 与纯#5#点位站（有上级 ahieto）同名 → 设备直接挂点位站，不落兜底站、不被组织名改挂片区。
+     */
+    @Test
+    void newChannelLinksVideoPointStation() {
+        mockNvrTreeWithChannel("麻塘湖灌区", "老水厂出水口摄像机", "老水厂出水口摄像机_1", "1000362$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
+                stationRow("site-mth", "老水厂出水口", "#5#", null, "area-mth"),
+                stationRow("area-mth", "麻塘湖灌区", "#7#", null, null)));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-1");
+
+        service.syncVideoStationStatus();
+
+        assertNull(findUpdate(updates, "INSERT INTO"), "命中点位站不应新建兜底站");
+        verify(deviceTableService).lookupOrCreateDevice(eq("老水厂出水口摄像机_1"), eq("site-mth"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000362$1$0$0"), eq("#1#"), anyString());
+        verify(deviceTableService, never()).updateDeviceSite(anyString(), anyString());
+    }
+
+    /**
+     * 设备已挂视频点站：点位站（纯#5#+有上级）不参与兜底站每轮重试 →
+     * 即使组织名"麻塘湖灌区"存在同名片区站，也不会被改挂回片区；状态/名称照常同步。
+     */
+    @Test
+    void videoPointStationDeviceNotReattachedToArea() {
+        mockNvrTreeWithChannel("麻塘湖灌区", "老水厂出水口摄像机", "老水厂出水口摄像机_1", "1000362$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Arrays.asList(
+                stationRow("site-mth", "老水厂出水口", "#5#", null, "area-mth"),
+                stationRow("area-mth", "麻塘湖灌区", "#7#", null, null)));
+        when(deviceTableService.findVideoDeviceByCode("1000362$1$0$0"))
+                .thenReturn(new DeviceTableService.VideoDeviceRef("dev-1", "site-mth"));
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        assertEquals(0, updates.size(), "点位站设备不应触发建站/追加/改挂写库");
+        verify(deviceTableService, never()).updateDeviceSite(anyString(), anyString());
+        verify(deviceTableService).updateDeviceName(eq("1000362$1$0$0"), eq("老水厂出水口摄像机_1"));
+        verify(deviceTableService).updateDeviceStatus(eq("1000362$1$0$0"), eq("#1#"));
+        verify(deviceTableService).updateDeviceLocation(eq("1000362$1$0$0"), eq("麻塘湖灌区-老水厂出水口摄像机_1"));
+    }
+
+    /**
+     * 去噪名经人工别名命中点位站：ICC"NVR=五圩支渠摄像机"去噪为"五圩支渠"，
+     * 台账/点位站名为"五圩支渠进水闸" → 别名映射后命中，不落兜底站。
+     */
+    @Test
+    void newChannelLinksVideoPointStationViaAlias() {
+        mockNvrTreeWithChannel("麻塘湖灌区", "五圩支渠摄像机", "五圩支渠摄像机_1", "1000364$1$0$0");
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(Collections.singletonList(
+                stationRow("site-wx", "五圩支渠进水闸", "#5#", null, "area-mth")));
+        List<InvocationOnMock> updates = captureAllUpdates();
+        when(deviceTableService.lookupOrCreateDevice(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString())).thenReturn("device-1");
+
+        service.syncVideoStationStatus();
+
+        assertNull(findUpdate(updates, "INSERT INTO"), "别名命中点位站不应新建兜底站");
+        verify(deviceTableService).lookupOrCreateDevice(eq("五圩支渠摄像机_1"), eq("site-wx"),
+                eq(DeviceTableService.DEVICE_TYPE_VIDEO), eq("1000364$1$0$0"), eq("#1#"), anyString());
+    }
+
+    /**
+     * 纯视频站点状态刷新：任一视频在线记 #1#，全部离线记 #2#，状态未变化的行不写库；
+     * 混合站/无视频站不在查询结果内（由 mq 遥测口径维护）。
+     */
+    @Test
+    void syncsVideoOnlyStationStatusByVideoState() {
+        when(deviceService.getDeviceTreeWithStatus(anyString()))
+                .thenReturn(DahuaDeviceService.DeviceTreeResult.success(Collections.emptyList()));
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+
+        Map<String, Object> toOnline = videoOnlySiteRow("site-a", "在线站", "#2#", 2L, 2L);
+        Map<String, Object> toOffline = videoOnlySiteRow("site-b", "离线站", "#1#", 1L, 0L);
+        Map<String, Object> unchanged = videoOnlySiteRow("site-c", "不变站", "#1#", 3L, 1L);
+        when(jdbcTemplate.queryForList(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(Arrays.asList(toOnline, toOffline, unchanged));
+
+        List<InvocationOnMock> updates = captureAllUpdates();
+
+        service.syncVideoStationStatus();
+
+        assertEquals(2, updates.size(), "只应更新状态变化的两行");
+        assertEquals("#1#", argsOf(updates.get(0))[0]);
+        assertEquals("site-a", argsOf(updates.get(0))[2]);
+        assertEquals("#2#", argsOf(updates.get(1))[0]);
+        assertEquals("site-b", argsOf(updates.get(1))[2]);
+    }
+
+    /** 测试站不参与纯视频站点判定（与 mq 同口径：站名含"测试"或 RTU 站号 9999 开头） */
+    @Test
+    void videoOnlyStatusQueryExcludesTestSites() {
+        when(deviceService.getDeviceTreeWithStatus(anyString()))
+                .thenReturn(DahuaDeviceService.DeviceTreeResult.success(Collections.emptyList()));
+        when(jdbcTemplate.queryForList(anyString())).thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(new ArrayList<>());
+
+        service.syncVideoStationStatus();
+
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), anyString(), anyString(), anyString());
+        String sql = sqlCaptor.getValue();
+        assertTrue(sql.contains("zzkaec, '') NOT LIKE '%测试%'"), "应排除站名含测试的站点：" + sql);
+        assertTrue(sql.contains("iofhpi, '') NOT LIKE '9999%'"), "应排除 RTU 站号 9999 开头的站点：" + sql);
+    }
+
+    /** 纯视频站点聚合查询结果行（site_id/site_name/site_status/video_cnt/video_online） */
+    private Map<String, Object> videoOnlySiteRow(String id, String name, String status, long videoCnt, long online) {
+        Map<String, Object> row = new HashMap<>();
+        row.put("site_id", id);
+        row.put("site_name", name);
+        row.put("site_status", status);
+        row.put("video_cnt", videoCnt);
+        row.put("video_online", online);
+        return row;
     }
 }

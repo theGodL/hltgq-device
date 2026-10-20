@@ -12,6 +12,8 @@ import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -24,6 +26,9 @@ import java.util.Set;
  * （不过防抖——防抖属告警层，统计按每轮原始结果计数）：
  * <ul>
  *   <li>result=ok：检测正常；fail：检出故障（fault_types 存枚举名逗号分隔）；error：检测异常/超时；</li>
+ *   <li>提示类故障（黑白/偏色全天、过暗仅夜间，与告警层同一套豁免配置）在落库前剔除，
+ *       剔除后无剩余故障记 ok 但保留 fault_types——语义为「提示」：属设备输出特性或物理现象，
+ *       不是设备故障（不进告警、不计失败），页面据 ok+fault_types 与真正「正常」区分；</li>
  *   <li>整轮跳过（登录失败/设备树遍历不完整）当轮无留痕 → collected 少、successRate 自然下降（同 mq 断网期语义）；</li>
  *   <li>同轮同通道幂等（UNIQUE(round_time, channel_code) + ON CONFLICT DO NOTHING，重跑防重）。</li>
  * </ul>
@@ -64,13 +69,7 @@ public class VideoPatrolRecordService {
     // ======================== 巡检留痕落库 ========================
 
     /**
-     * 落库一轮巡检的逐通道原始结果（不过防抖）。检测结果三个来源取并集：
-     * <ul>
-     *   <li>abnormalByChannel：检出故障的通道（result=fail，fault_types=枚举名逗号分隔）；</li>
-     *   <li>inspectedChannels：完成检测的正常通道（result=ok）；</li>
-     *   <li>errorChannels：检测异常/超时的通道（result=error）。</li>
-     * </ul>
-     * 被取消未完成检测的通道不落库。单行落库失败不阻断整轮（仅记日志，下轮重试）。
+     * 落库一轮巡检的逐通道原始结果（不过防抖，按原始检测口径留痕）。
      *
      * @param roundTime          轮实际开始时间（毫秒）
      * @param abnormalByChannel  通道 → 故障枚举集合
@@ -79,6 +78,30 @@ public class VideoPatrolRecordService {
      */
     public void saveRound(long roundTime, Map<String, Set<VideoFaultType>> abnormalByChannel,
                           Set<String> inspectedChannels, Set<String> errorChannels) {
+        saveRound(roundTime, abnormalByChannel, inspectedChannels, errorChannels, Collections.emptySet());
+    }
+
+    /**
+     * 落库一轮巡检的逐通道结果（不退防抖）。检测结果三个来源取并集：
+     * <ul>
+     *   <li>abnormalByChannel：检出故障的通道（result=fail，fault_types=枚举名逗号分隔）；</li>
+     *   <li>inspectedChannels：完成检测的正常通道（result=ok）；</li>
+     *   <li>errorChannels：检测异常/超时的通道（result=error）。</li>
+     * </ul>
+     * exemptFaults（提示类故障：偏色全天、过暗夜间；黑白为设备正常输出，检测后已直接忽略）
+     * 在判定前从故障集合中剔除：
+     * 剔除后为空记 ok 并保留被剔除的 fault_types 作为「提示」；仍有剩余故障（如同时判模糊/取流异常）
+     * 照常记 fail。被取消未完成检测的通道不落库。单行落库失败不阻断整轮（仅记日志，下轮重试）。
+     *
+     * @param roundTime          轮实际开始时间（毫秒）
+     * @param abnormalByChannel  通道 → 故障枚举集合
+     * @param inspectedChannels  完成检测的通道集合（含检出故障的通道）
+     * @param errorChannels      检测异常/超时的通道集合
+     * @param exemptFaults       提示类故障类别（全天提示类 + 夜间豁免类，非夜间且无全天类传空集）
+     */
+    public void saveRound(long roundTime, Map<String, Set<VideoFaultType>> abnormalByChannel,
+                          Set<String> inspectedChannels, Set<String> errorChannels,
+                          Set<VideoFaultType> exemptFaults) {
         Set<String> all = new HashSet<>(abnormalByChannel.keySet());
         all.addAll(inspectedChannels);
         all.addAll(errorChannels);
@@ -88,8 +111,13 @@ public class VideoPatrolRecordService {
         Timestamp roundTs = new Timestamp(roundTime);
         Timestamp now = new Timestamp(System.currentTimeMillis());
         int saved = 0;
+        int exempted = 0;
         for (String code : all) {
-            Set<VideoFaultType> faults = abnormalByChannel.get(code);
+            Set<VideoFaultType> original = abnormalByChannel.get(code);
+            Set<VideoFaultType> faults = effectiveFaults(original, exemptFaults);
+            if (original != null && faults != null && original.size() > faults.size()) {
+                exempted++;
+            }
             String result;
             String faultTypes = null;
             if (faults != null && !faults.isEmpty()) {
@@ -99,6 +127,10 @@ public class VideoPatrolRecordService {
                 result = RESULT_ERROR;
             } else if (inspectedChannels.contains(code)) {
                 result = RESULT_OK;
+                // 全部故障均被夜间豁免：记 ok 并保留故障类型，作为「提示」与「正常」区分
+                if (original != null && !original.isEmpty()) {
+                    faultTypes = joinFaultNames(original);
+                }
             } else {
                 continue; // 既无故障又未完成检测（理论不可达），不落库
             }
@@ -116,7 +148,21 @@ public class VideoPatrolRecordService {
                 log.warn("[视频巡检] 留痕落库失败, code={}, result={}: {}", code, result, e.getMessage());
             }
         }
-        log.info("[视频巡检] 留痕落库完成: 轮开始{}ms, 写入{}条/结果{}条", roundTime, saved, all.size());
+        log.info("[视频巡检] 留痕落库完成: 轮开始{}ms, 写入{}条/结果{}条, 提示类{}条",
+                roundTime, saved, all.size(), exempted);
+    }
+
+    /**
+     * 剔除夜间豁免故障后的有效故障集（不修改入参）；无豁免或全被剔除返回空集/原点集。
+     */
+    private static Set<VideoFaultType> effectiveFaults(Set<VideoFaultType> faults,
+                                                       Set<VideoFaultType> exemptFaults) {
+        if (faults == null || faults.isEmpty() || exemptFaults == null || exemptFaults.isEmpty()) {
+            return faults;
+        }
+        Set<VideoFaultType> effective = EnumSet.copyOf(faults);
+        effective.removeAll(exemptFaults);
+        return effective;
     }
 
     /** 故障枚举名逗号拼接（枚举声明序，输出稳定） */

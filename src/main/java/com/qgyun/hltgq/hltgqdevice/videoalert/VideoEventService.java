@@ -10,6 +10,7 @@ import com.dahuatech.icc.oauth.utils.HttpUtils;
 import com.qgyun.hltgq.hltgqdevice.config.DahuaConfig;
 import com.qgyun.hltgq.hltgqdevice.service.DahuaAuthService;
 import com.qgyun.hltgq.hltgqdevice.service.DeviceTableService;
+import com.qgyun.hltgq.hltgqdevice.service.StationStatusSyncService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -87,6 +88,9 @@ public class VideoEventService {
     private DeviceTableService deviceTableService;
 
     @Resource
+    private StationStatusSyncService stationStatusSyncService;
+
+    @Resource
     private VideoAlertService alertService;
 
     @Resource
@@ -157,23 +161,27 @@ public class VideoEventService {
         }
 
         // nodeCode → 视频站点（设备表 code 解析，type 含 #5# 限定，非视频子系统事件自然丢弃）
+        String alarmStat = String.valueOf(info.get("alarmStat"));
         StationRef station = resolveStation(nodeCode);
+        if (station == null && ALARM_STAT_ON.equals(alarmStat)
+                && stationStatusSyncService.ensureDeviceRegistered(nodeCode)) {
+            // 事件发生但通道尚未入库（ICC 新增通道/历史缺口）：即时补建后重试解析，
+            // 避免智能事件因设备表缺台账而丢失（2026-10-20 R7 修复，与故障告警同一策略）
+            station = resolveStation(nodeCode);
+        }
         if (station == null) {
             log.debug("[智能事件] nodeCode={} 未匹配到视频站点，丢弃", nodeCode);
             return false;
         }
 
-        // 站点 → 视频设备（code 匹配，查不到自动兜底创建；状态/位置由站点同步轮按设备树维护，此处不写）
-        String deviceId = deviceTableService.lookupOrCreateDevice(
-                deviceTableService.deviceNameOf(station.name), station.id,
-                DeviceTableService.DEVICE_TYPE_VIDEO, nodeCode, null, null);
+        // 站点 → 视频设备（code 匹配；设备名取 ICC 通道原名，状态/位置由站点同步轮维护，此处不写）
+        String deviceId = resolveOrCreateDevice(nodeCode, station);
         if (deviceId == null) {
             log.warn("[智能事件] 设备解析失败，丢弃: nodeCode={}", nodeCode);
             return false;
         }
 
         String content = station.name + CONTENT_PREFIX + eventName + "！";
-        String alarmStat = String.valueOf(info.get("alarmStat"));
         if (ALARM_STAT_ON.equals(alarmStat) || ALARM_STAT_OFF.equals(alarmStat)) {
             // 联调日志：打印事件原始字段与映射结果，部署后从服务器日志即可核对
             // alarmGrade 语义（1~4 与一般~特别严重对应关系）与事件名透传情况，无需人工事前确认
@@ -292,6 +300,24 @@ public class VideoEventService {
     private String formatTime(long millis) {
         return LocalDateTime.ofInstant(Instant.ofEpochMilli(millis), ZoneId.systemDefault())
                 .format(EVENT_TIME_FORMATTER);
+    }
+
+    /**
+     * nodeCode → 设备表视频设备ID：设备已存在直接取 ID（不触发 ICC 遍历）；
+     * 不存在时按 ICC 通道原名补建（取不到通道名退回站点名）。
+     */
+    private String resolveOrCreateDevice(String nodeCode, StationRef station) {
+        DeviceTableService.VideoDeviceRef existing = deviceTableService.findVideoDeviceByCode(nodeCode);
+        if (existing != null) {
+            return existing.getId();
+        }
+        String deviceName = station.name;
+        StationStatusSyncService.VideoChannel ch = stationStatusSyncService.findChannel(nodeCode);
+        if (ch != null && ch.getName() != null && !ch.getName().trim().isEmpty()) {
+            deviceName = ch.getName().trim();
+        }
+        return deviceTableService.lookupOrCreateDevice(deviceName, station.id,
+                DeviceTableService.DEVICE_TYPE_VIDEO, nodeCode, null, null);
     }
 
     /**

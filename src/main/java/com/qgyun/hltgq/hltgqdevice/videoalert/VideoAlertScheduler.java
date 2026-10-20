@@ -77,8 +77,16 @@ public class VideoAlertScheduler {
     private String nightExemptWindow;
 
     /** 夜间豁免故障类别（逗号分隔的枚举名），配置项 video-alert.night-exempt.faults */
-    @Value("${video-alert.night-exempt.faults:GRAYSCALE,TOO_DARK,COLOR_CAST}")
+    @Value("${video-alert.night-exempt.faults:TOO_DARK}")
     private String nightExemptFaultsConfig;
+
+    /** 全天提示类故障（偏色属设备输出特性，不维修、不报警、不计故障），配置项 video-alert.notice-faults */
+    @Value("${video-alert.notice-faults:COLOR_CAST}")
+    private String noticeFaultsConfig;
+
+    /** 忽略类故障（黑白为设备正常输出：黑白机/夜间红外，检测到也直接丢弃），配置项 video-alert.ignore-faults */
+    @Value("${video-alert.ignore-faults:GRAYSCALE}")
+    private String ignoreFaultsConfig;
 
     /** 单路检测时长上限（秒，含流探测+抽帧+分析），配置项 video-alert.stream-seconds */
     @Value("${video-alert.stream-seconds:15}")
@@ -112,6 +120,12 @@ public class VideoAlertScheduler {
     /** 夜间豁免故障类别（解析自配置，空=不豁免） */
     private final Set<VideoFaultType> nightExemptFaults = EnumSet.noneOf(VideoFaultType.class);
 
+    /** 全天提示类故障（解析自配置，空=不启用） */
+    private final Set<VideoFaultType> noticeFaults = EnumSet.noneOf(VideoFaultType.class);
+
+    /** 忽略类故障（解析自配置，空=不忽略；优先于提示/故障判定） */
+    private final Set<VideoFaultType> ignoreFaults = EnumSet.noneOf(VideoFaultType.class);
+
     /** 轮巡互斥锁：同一时刻只允许一轮 */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
@@ -121,11 +135,50 @@ public class VideoAlertScheduler {
     @PostConstruct
     public void init() {
         debouncer = new AlertDebouncer(detectThreshold, recoverThreshold, suppressMinutes * 60000L);
+        initNoticeFaults();
+        initIgnoreFaults();
         initNightExempt();
         log.info("[视频告警] 轮巡调度初始化: enabled={}, 并发{}路, 告警阈值{}轮, 恢复阈值{}轮, 单路超时{}s, "
-                        + "告警抑制{}分钟, 夜间豁免{}",
+                        + "告警抑制{}分钟, 全天提示{}, 忽略{}, 夜间豁免{}",
                 enabled, parallel, detectThreshold, recoverThreshold, streamSeconds, suppressMinutes,
+                noticeFaults.isEmpty() ? "未启用" : noticeFaults,
+                ignoreFaults.isEmpty() ? "未启用" : ignoreFaults,
                 nightExemptFaults.isEmpty() ? "未启用" : nightExemptFaults + " " + nightExemptWindow);
+    }
+
+    /** 解析全天提示类故障配置（解析失败按未启用处理） */
+    private void initNoticeFaults() {
+        noticeFaults.clear();
+        parseFaultTypes(noticeFaultsConfig, "全天提示", noticeFaults);
+    }
+
+    /** 解析忽略类故障配置（黑白属设备正常输出：剔除后不提示、不报警、不留 fault_types） */
+    private void initIgnoreFaults() {
+        ignoreFaults.clear();
+        parseFaultTypes(ignoreFaultsConfig, "忽略", ignoreFaults);
+        if (!Collections.disjoint(ignoreFaults, noticeFaults)) {
+            Set<VideoFaultType> overlap = EnumSet.noneOf(VideoFaultType.class);
+            overlap.addAll(ignoreFaults);
+            overlap.retainAll(noticeFaults);
+            log.warn("[视频告警] 忽略类与全天提示类重叠（忽略优先，不会产生提示）: {}", overlap);
+        }
+    }
+
+    /** 解析逗号分隔的故障枚举名到 target（不存在的名称记日志后忽略） */
+    private static void parseFaultTypes(String config, String scene, Set<VideoFaultType> target) {
+        if (config == null) {
+            return;
+        }
+        for (String name : config.split(",")) {
+            if (name.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                target.add(VideoFaultType.valueOf(name.trim()));
+            } catch (IllegalArgumentException e) {
+                log.warn("[视频告警] {}故障名不存在(忽略): {}", scene, name.trim());
+            }
+        }
     }
 
     /** 解析夜间豁免配置（时段+故障类别）：解析失败按未启用处理（宁可照常告警，不静默丢警） */
@@ -137,16 +190,7 @@ public class VideoAlertScheduler {
             return;
         }
         if (nightExemptFaultsConfig != null) {
-            for (String name : nightExemptFaultsConfig.split(",")) {
-                if (name.trim().isEmpty()) {
-                    continue;
-                }
-                try {
-                    nightExemptFaults.add(VideoFaultType.valueOf(name.trim()));
-                } catch (IllegalArgumentException e) {
-                    log.warn("[视频告警] 夜间豁免故障名不存在(忽略): {}", name.trim());
-                }
-            }
+            parseFaultTypes(nightExemptFaultsConfig, "夜间豁免", nightExemptFaults);
         }
         String[] range = nightExemptWindow == null ? new String[0] : nightExemptWindow.split("-");
         if (range.length == 2) {
@@ -186,6 +230,32 @@ public class VideoAlertScheduler {
             return Collections.emptySet();
         }
         return nightExemptFaults;
+    }
+
+    /**
+     * 本轮提示类故障（全天提示类 + 当前时段夜间豁免类）：
+     * 留痕落库与告警防抖均按此口径剔除，剔除后无剩余故障记 ok（页面展示为「提示」）。
+     * 包内可见供单测。
+     */
+    Set<VideoFaultType> effectiveExemptFaults(long epochMillis) {
+        Set<VideoFaultType> all = EnumSet.noneOf(VideoFaultType.class);
+        all.addAll(noticeFaults);
+        all.addAll(currentNightExemptFaults(epochMillis));
+        return all;
+    }
+
+    /**
+     * 剔除忽略类故障（如黑白属设备正常输出）：剔除后为空即按正常处理，
+     * 不写入巡检 fault_types、不进入防抖告警。包内可见供单测。
+     */
+    static Set<VideoFaultType> removeIgnored(Set<VideoFaultType> faults, Set<VideoFaultType> ignored) {
+        if (faults == null || faults.isEmpty() || ignored == null || ignored.isEmpty()) {
+            return faults;
+        }
+        Set<VideoFaultType> kept = EnumSet.noneOf(VideoFaultType.class);
+        kept.addAll(faults);
+        kept.removeAll(ignored);
+        return kept;
     }
 
     /** 分钟数时段判断（包内可见供单测）：start>end 表示跨天；任一端为负→false（未启用） */
@@ -337,7 +407,7 @@ public class VideoAlertScheduler {
             for (StationStatusSyncService.VideoChannel ch : channels) {
                 futures.add(pool.submit(() -> {
                     try {
-                        Set<VideoFaultType> faults = channelInspector.inspect(ch);
+                        Set<VideoFaultType> faults = removeIgnored(channelInspector.inspect(ch), ignoreFaults);
                         snap.channelResults.put(ch.getDevicecode(), summarize(ch, faults));
                         abnormalByChannel.put(ch.getDevicecode(), faults);
                         inspectedChannels.add(ch.getDevicecode());
@@ -376,21 +446,24 @@ public class VideoAlertScheduler {
             pool.shutdownNow();
         }
 
-        // ============ 巡检留痕落库（统计大屏口径：不过防抖，按每轮原始结果计数） ============
+        // ============ 提示类口径（留痕与告警判定共用，整轮一致） ============
+        // 黑白/偏色属设备输出特性（全天提示），过暗在夜间属无补光物理现象（时段提示）：
+        // 留痕落库前剔除并保留类型（页面显示「提示」），告警防抖同样跳过（不新增不恢复）
+        Set<VideoFaultType> exemptFaults = effectiveExemptFaults(snap.startTime);
+        if (!exemptFaults.isEmpty()) {
+            log.info("[视频告警] 提示口径生效（全天{}，夜间{} {}）：本轮留痕与防抖判定均按提示处理",
+                    noticeFaults, nightExemptFaults, nightExemptWindow);
+        }
+
+        // ============ 巡检留痕落库（统计大屏口径：不过防抖，按每轮结果计数） ============
         try {
-            patrolRecordService.saveRound(snap.startTime, abnormalByChannel, inspectedChannels, errorChannels);
+            patrolRecordService.saveRound(snap.startTime, abnormalByChannel, inspectedChannels, errorChannels,
+                    exemptFaults);
         } catch (Exception e) {
             log.warn("[视频告警] 巡检留痕落库异常: {}", e.getMessage());
         }
 
         // ============ 防抖判定 → 告警新增/恢复 ============
-        // 夜间豁免：红外夜视黑白/无补光过暗/偏色跳过判定（不新增不恢复），白天照常；
-        // 巡检留痕已在上方按原始检测落库，统计口径不受影响
-        Set<VideoFaultType> exemptFaults = currentNightExemptFaults(snap.startTime);
-        if (!exemptFaults.isEmpty()) {
-            log.info("[视频告警] 夜间豁免生效（{}）：{} 本轮跳过防抖判定（留痕照常）",
-                    nightExemptWindow, exemptFaults);
-        }
         List<AlertDebouncer.FaultEvent> events =
                 debouncer.acceptRound(abnormalByChannel, inspectedChannels, exemptFaults);
         for (AlertDebouncer.FaultEvent ev : events) {

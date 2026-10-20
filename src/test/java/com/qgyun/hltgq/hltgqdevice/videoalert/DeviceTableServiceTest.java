@@ -76,7 +76,6 @@ class DeviceTableServiceTest {
         service = new DeviceTableService();
         ReflectionTestUtils.setField(service, "jdbcTemplate", jdbcTemplate);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
-        ReflectionTestUtils.setField(service, "deviceSuffix", "摄像机");
         updateInvocations.clear();
         doAnswer(inv -> {
             updateInvocations.add(inv);
@@ -84,19 +83,20 @@ class DeviceTableServiceTest {
         }).when(jdbcTemplate).update(anyString(), any(Object.class));
     }
 
-    /** 设备名派生：站点名 + 后缀 + "#"，空站点名返回 null */
+    /** 设备名归一：直接取 ICC 通道原名（不再拼站点前缀/“摄像机#”后缀），空白返回 null */
     @Test
-    void deviceNameOfAppendsSuffixAndHash() {
-        assertEquals(DEVICE_NAME, service.deviceNameOf(SITE_NAME));
-        assertNull(service.deviceNameOf(null));
-        assertNull(service.deviceNameOf("  "));
+    void channelNameOfKeepsIccNameAsIs() {
+        assertEquals(SITE_NAME, service.channelNameOf(SITE_NAME));
+        assertEquals("大门外", service.channelNameOf(" 大门外 "));
+        assertNull(service.channelNameOf(null));
+        assertNull(service.channelNameOf("  "));
     }
 
-    /** 站点名已以后缀结尾（旧兜底站"五圩支渠摄像机_1"）：仅追加"#"，禁止"摄像机摄像机#"叠词 */
+    /** ICC 通道名本身带设备词/序号时原样保留（设备已挂站点下，无需再做任何归一） */
     @Test
-    void deviceNameOfNeverDoublesSuffixWord() {
-        assertEquals("五圩支渠摄像机#", service.deviceNameOf("五圩支渠摄像机"));
-        assertEquals("夏家湖渡槽-视频摄像机#", service.deviceNameOf("夏家湖渡槽-视频"));
+    void channelNameOfNeverAppendsSuffix() {
+        assertEquals("五圩支渠摄像机_1", service.channelNameOf("五圩支渠摄像机_1"));
+        assertEquals("野站闸_1", service.channelNameOf("野站闸_1"));
     }
 
     /** 首次创建：INSERT 设备表，字段含 name/site/type=#5#/code/status/位置/启用日期/系统字段 */
@@ -301,7 +301,7 @@ class DeviceTableServiceTest {
                 eq(String.class), eq(DEVICECODE)))
                 .thenReturn(new ArrayList<>());
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE name")),
-                eq(String.class), eq(DEVICE_NAME)))
+                eq(String.class), eq(SITE_NAME)))
                 .thenReturn(new ArrayList<>());
 
         service.init();
@@ -313,7 +313,8 @@ class DeviceTableServiceTest {
         assertTrue(insertSql.contains("INSERT INTO"));
         String deviceId = String.valueOf(insertArgs[0]);
         assertNotNull(deviceId);
-        assertTrue(Arrays.asList(insertArgs).contains(DEVICE_NAME));
+        // 迁移路径只有站点行、没有通道名：先用站点名占位，首轮站点同步会按 ICC 通道名校正
+        assertTrue(Arrays.asList(insertArgs).contains(SITE_NAME));
         // 安装位置：与站点位置 mivbcz 同源直取（不拼接站点名）
         assertTrue(insertSql.contains("wlcvig"));
         assertTrue(Arrays.asList(insertArgs).contains(ORG_NAME));
@@ -395,7 +396,7 @@ class DeviceTableServiceTest {
         verify(jdbcTemplate, never()).update(anyString(), any(Object.class));
     }
 
-    /** 历史设备 code 缺失：按 name 兜底命中后回填 code（按设备ID精确更新，防重名波及多行） */
+    /** 历史设备 code 缺失：按 name 兜底命中后回填 code（仅无 code 旧行，按设备ID精确更新） */
     @Test
     void nameFallbackBackfillsMissingCode() {
         when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
@@ -416,5 +417,42 @@ class DeviceTableServiceTest {
                 any(), any(), any());
         // 不创建新设备
         verify(jdbcTemplate, never()).update(argThat(s -> s.contains("INSERT INTO")), any(), any(), any());
+    }
+
+    /**
+     * R2 回归：同名但已带其他 code 的历史行绝不复用（ICC 重建通道后新编码不得被旧行吞并）。
+     * 按 name 兜底查询必须带 code 为空守卫，查不到则创建新设备。
+     */
+    @Test
+    void nameFallbackDoesNotReuseRowWithDifferentCode() {
+        when(jdbcTemplate.queryForList(argThat(sqlContains("SELECT id FROM", "WHERE code")),
+                eq(String.class), eq(DEVICECODE)))
+                .thenReturn(new ArrayList<>());
+        when(jdbcTemplate.queryForList(
+                argThat(sqlContains("SELECT id FROM", "WHERE name", "(code IS NULL OR code = '')")),
+                eq(String.class), eq(DEVICE_NAME)))
+                .thenReturn(new ArrayList<>());
+
+        String id = service.lookupOrCreateDevice(DEVICE_NAME, SITE_ID, "#5#", DEVICECODE, "#1#", LOCATION);
+
+        assertNotNull(id);
+        verify(jdbcTemplate).queryForList(
+                argThat(sqlContains("WHERE name", "(code IS NULL OR code = '')")),
+                eq(String.class), eq(DEVICE_NAME));
+        verify(jdbcTemplate).update(argThat(s -> s.contains("INSERT INTO")), any(Object.class));
+    }
+
+    /** 设备名称校正：按 code 精确匹配，仅名称变化写库（name IS DISTINCT FROM 守卫） */
+    @Test
+    void updateDeviceNameOnlyUpdatesWhenChanged() {
+        when(jdbcTemplate.update(contains("t_auto_hltgq_water_device"), any(), any(), any(), any()))
+                .thenReturn(1);
+
+        int rows = service.updateDeviceName(DEVICECODE, " 大门外 ");
+
+        assertEquals(1, rows);
+        verify(jdbcTemplate).update(
+                argThat(s -> s.contains("SET name = ?") && s.contains("name IS DISTINCT FROM")),
+                eq("大门外"), any(), eq(DEVICECODE), eq("大门外"));
     }
 }
