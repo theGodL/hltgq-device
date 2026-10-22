@@ -3,6 +3,7 @@ package com.qgyun.hltgq.hltgqdevice.videoalert;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.Collections;
@@ -12,9 +13,13 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
- * 轮巡调度器单测：夜间豁免时段判断（跨天窗口边界、同日窗口、未启用）、全天提示类与夜间豁免合并口径。
+ * 轮巡调度器单测：夜间豁免时段判断（跨天窗口边界、同日窗口、未启用）、全天提示类与夜间豁免合并口径、
+ * 重启后恢复对账调用。
  */
 class VideoAlertSchedulerTest {
 
@@ -75,6 +80,59 @@ class VideoAlertSchedulerTest {
     void disabledWhenNotConfigured() {
         assertFalse(VideoAlertScheduler.inTimeWindow(-1, 7 * 60 + 30, at(23, 0)));
         assertFalse(VideoAlertScheduler.inTimeWindow(18 * 60 + 30, -1, at(23, 0)));
+    }
+
+    /** 重启后对账：每轮按 recover-threshold 调用服务对账（防抖内存清零兜底） */
+    @Test
+    void reconcileRecoveredAlertsUsesConfiguredThreshold() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        ReflectionTestUtils.setField(scheduler, "recoverThreshold", 2);
+        when(alertService.reconcileRecovered(2)).thenReturn(3);
+
+        assertEquals(3, scheduler.reconcileRecoveredAlerts());
+        verify(alertService).reconcileRecovered(2);
+    }
+
+    /** 对账异常不影响巡检：返回 0 */
+    @Test
+    void reconcileRecoveredAlertsSwallowsException() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        ReflectionTestUtils.setField(scheduler, "recoverThreshold", 2);
+        when(alertService.reconcileRecovered(2)).thenThrow(new RuntimeException("db down"));
+
+        assertEquals(0, scheduler.reconcileRecoveredAlerts());
+    }
+
+    /** 启动后立即对账一次：重启清零防抖状态的历史告警不等下一轮巡检 */
+    @Test
+    void initReconcilesRecoveredAlertsOnStartup() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        ReflectionTestUtils.setField(scheduler, "recoverThreshold", 2);
+        when(alertService.reconcileRecovered(2)).thenReturn(1);
+
+        scheduler.init();
+
+        verify(alertService).reconcileRecovered(2);
+    }
+
+    /** 本轮对账使用本轮开始时间作为巡检轮次下界，避免陈旧巡检数据误关 */
+    @Test
+    void roundReconcileUsesRoundStartBoundary() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        ReflectionTestUtils.setField(scheduler, "recoverThreshold", 2);
+        Timestamp roundStart = new Timestamp(1757400000000L);
+        when(alertService.reconcileRecovered(2, roundStart)).thenReturn(1);
+
+        assertEquals(1, scheduler.reconcileRecoveredAlerts(roundStart));
+        verify(alertService).reconcileRecovered(2, roundStart);
     }
 
     private static long at(int hour, int minute) {

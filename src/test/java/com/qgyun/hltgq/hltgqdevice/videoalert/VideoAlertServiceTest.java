@@ -14,6 +14,7 @@ import java.lang.reflect.Method;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -25,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.nullable;
@@ -71,6 +73,7 @@ class VideoAlertServiceTest {
         ReflectionTestUtils.setField(service, "deviceTableService", deviceTableService);
         ReflectionTestUtils.setField(service, "stationStatusSyncService", stationStatusSyncService);
         ReflectionTestUtils.setField(service, "corpCode", "hltgq");
+        ReflectionTestUtils.setField(service, "dedupWindowHours", 24L);
         // 站点预置（站点解析走设备表 JOIN，返回 id/zzkaec 两列），避免测试重复模拟查询
         Map<String, Object> row = new HashMap<>();
         row.put("id", SITE_ID);
@@ -180,6 +183,56 @@ class VideoAlertServiceTest {
         verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
     }
 
+    /** 24h 去重：窗口内已有同站同内容告警（即使已关闭）→ 不新增、不建单 */
+    @Test
+    void reportFaultSkipsWhenRecentSameContentExists() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+        when(jdbcTemplate.queryForList(anyString(), any(Object.class), any(Object.class), any(Object.class)))
+                .thenReturn(Collections.singletonList(Collections.<String, Object>singletonMap("?column?", 1)));
+
+        assertFalse(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+        assertTrue(updateInvocations.isEmpty());
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
+    }
+
+    /** 24h 去重同样覆盖智能事件入口，避免事件恢复后同日重复建单 */
+    @Test
+    void reportEventAlertSkipsWhenRecentSameContentExists() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+        when(jdbcTemplate.queryForList(anyString(), any(Object.class), any(Object.class), any(Object.class)))
+                .thenReturn(Collections.singletonList(Collections.<String, Object>singletonMap("?column?", 1)));
+        String eventContent = SITE_NAME + "-视频智能事件 区域入侵！";
+
+        assertFalse(service.reportEventAlert(SITE_ID, DEVICE_ID, eventContent, "#2#"));
+        assertTrue(updateInvocations.isEmpty());
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
+    }
+
+    /** 24h 查重失败 fail-open：放行插入，不阻断告警 */
+    @Test
+    void recentDedupFailureFailsOpen() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+        when(jdbcTemplate.queryForList(anyString(), any(Object.class), any(Object.class), any(Object.class)))
+                .thenThrow(new RuntimeException("db down"));
+
+        assertTrue(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+        assertEquals(1, updateInvocations.size());
+    }
+
+    /** 窗口配置为 0：关闭 24h 查重，不再查询告警表 */
+    @Test
+    void recentDedupDisabledWhenWindowIsZero() {
+        ReflectionTestUtils.setField(service, "dedupWindowHours", 0L);
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+
+        assertTrue(service.reportFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
+        verify(jdbcTemplate, never()).queryForList(anyString(), any(Object.class), any(Object.class), any(Object.class));
+    }
+
     /** 站点缺失：不插入告警、不建工单 */
     @Test
     void reportFaultSkipsWhenSiteMissing() {
@@ -190,23 +243,89 @@ class VideoAlertServiceTest {
         verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
     }
 
-    /** 恢复关警：按 site+device+content 精确匹配，status 置 #4#，并联动关闭工单 */
+    /** 恢复关警：按 device + "%-视频 信号丢失！" 匹配，不依赖站点名；按告警ID关工单 */
     @Test
     void recoverFaultClosesAlertAndWorkOrder() {
-        service.recoverFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS);
+        String pattern = "%-视频 信号丢失！";
+        when(jdbcTemplate.queryForList(contains("SELECT id FROM"), eq(DEVICE_ID), eq(pattern), eq("#4#")))
+                .thenReturn(Collections.singletonList(
+                        Collections.<String, Object>singletonMap("id", "alert-1")));
+
+        assertEquals(1, service.recoverFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
 
         assertEquals(1, updateInvocations.size());
         String sql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
         Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
         List<Object> vals = Arrays.asList(args);
         assertEquals("#4#", vals.get(0));
-        assertTrue(vals.contains(SITE_ID));
-        assertTrue(vals.contains(DEVICE_ID));
-        assertTrue(vals.contains(CONTENT));
-        // 关闭条件排除已关闭行（人工已关闭不重复更新）
-        assertTrue(sql.contains("status IS DISTINCT FROM"));
-        // 工单联动：恢复 → 关闭对应工单（device=设备ID）
-        verify(workOrderService).closeByContent(eq(SITE_ID), eq(DEVICE_ID), eq(CONTENT));
+        assertTrue(vals.contains("alert-1"));
+        // 按告警ID关闭（不再按 site+content 精确匹配）
+        assertTrue(sql.contains("id IN (?)"));
+        assertTrue(sql.contains("status IS DISTINCT FROM ?"));
+        // 查未关闭告警：按设备+故障后缀匹配，不依赖站点名前缀
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(DEVICE_ID), eq(pattern), eq("#4#"));
+        String selectSql = sqlCaptor.getValue();
+        assertTrue(selectSql.contains("device = ?"));
+        assertTrue(selectSql.contains("content LIKE ?"));
+        assertFalse(selectSql.contains("site = ?"));
+        // 工单联动：按被关闭告警ID精确关闭
+        verify(workOrderService).closeByAlertIds(Collections.singletonList("alert-1"));
+    }
+
+    /**
+     * 设备换站/站点改名后恢复：告警 content 仍带旧站点名，按 device + 故障后缀仍能关闭，
+     * 不重新拼当前站点名（旧实现会因前缀不匹配漏关）。
+     */
+    @Test
+    void recoverFaultClosesAcrossRenamedSite() {
+        String pattern = "%-视频 噪声干扰！";
+        when(jdbcTemplate.queryForList(contains("SELECT id FROM"), eq(DEVICE_ID), eq(pattern), eq("#4#")))
+                .thenReturn(Collections.singletonList(
+                        Collections.<String, Object>singletonMap("id", "alert-old-site")));
+
+        assertEquals(1, service.recoverFault(DEVICECODE, VideoFaultType.NOISE));
+
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(DEVICE_ID), eq(pattern), eq("#4#"));
+        assertFalse(sqlCaptor.getValue().contains("site = ?"), "恢复不能依赖站点名前缀");
+        verify(workOrderService).closeByAlertIds(Collections.singletonList("alert-old-site"));
+    }
+
+    /** 重启后对账：最近 recover-threshold 轮巡检全 ok 的未关闭告警 → 关闭告警并按ID关工单 */
+    @Test
+    void reconcileRecoveredClosesAlertsAndWorkOrders() {
+        when(jdbcTemplate.queryForList(anyString(), eq("#1#"), any(Timestamp.class)))
+                .thenReturn(Arrays.asList(
+                        Collections.<String, Object>singletonMap("alert_id", "alert-1"),
+                        Collections.<String, Object>singletonMap("alert_id", "alert-2")));
+
+        service.reconcileRecovered(2);
+
+        assertEquals(1, updateInvocations.size());
+        String sql = (String) ((Invocation) updateInvocations.get(0)).getRawArguments()[0];
+        assertTrue(sql.contains("id IN (?, ?)"));
+        assertTrue(sql.contains("status IS DISTINCT FROM ?"));
+        // 对账取最近 2 行巡检结果：不能只用「本轮起点之后」过滤，否则永远只有本轮 1 行
+        ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq("#1#"), any(Timestamp.class));
+        String selectSql = sqlCaptor.getValue();
+        assertTrue(selectSql.contains("video_patrol"));
+        assertTrue(selectSql.contains("LIMIT 2"), "应取最近 recover-threshold 轮");
+        assertTrue(selectSql.contains("max(x.round_time)"), "最新一轮须不早于本轮起点");
+        assertFalse(selectSql.contains("p.round_time >= ?"), "不能用本轮起点过滤掉上一轮");
+        verify(workOrderService).closeByAlertIds(Arrays.asList("alert-1", "alert-2"));
+    }
+
+    /** 对账无满足条件的告警：不更新、不关工单 */
+    @Test
+    void reconcileRecoveredSkipsWhenNoAlert() {
+        when(jdbcTemplate.queryForList(anyString(), eq("#1#"), any(Timestamp.class)))
+                .thenReturn(Collections.emptyList());
+
+        assertEquals(0, service.reconcileRecovered(2));
+        assertTrue(updateInvocations.isEmpty());
+        verify(workOrderService, never()).closeByAlertIds(any());
     }
 
     /** 动态列适配：列元数据不含 content 时，insert SQL 跳过该列 */
@@ -269,7 +388,7 @@ class VideoAlertServiceTest {
 
         assertEquals(0, service.recoverFault(DEVICECODE, VideoFaultType.SIGNAL_LOSS));
         assertTrue(updateInvocations.isEmpty());
-        verify(workOrderService, never()).closeByContent(any(), any(), any());
+        verify(workOrderService, never()).closeByAlertIds(any());
     }
 
     /**

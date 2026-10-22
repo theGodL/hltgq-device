@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.ZoneId;
@@ -144,6 +145,13 @@ public class VideoAlertScheduler {
                 noticeFaults.isEmpty() ? "未启用" : noticeFaults,
                 ignoreFaults.isEmpty() ? "未启用" : ignoreFaults,
                 nightExemptFaults.isEmpty() ? "未启用" : nightExemptFaults + " " + nightExemptWindow);
+        // 启动后立即对账一次：重启会清零防抖内存状态，历史告警按巡检结果兜底收敛（失败不影响启动）
+        if (alertService != null) {
+            int reconciled = reconcileRecoveredAlerts();
+            if (reconciled > 0) {
+                log.info("[视频告警] 启动恢复对账关闭告警 {} 条", reconciled);
+            }
+        }
     }
 
     /** 解析全天提示类故障配置（解析失败按未启用处理） */
@@ -333,9 +341,9 @@ public class VideoAlertScheduler {
                 snap.state = "FINISHED";
             }
             running.set(false);
-            log.info("[视频告警] 轮巡结束: state={}, 通道{}个(在线{})完成{}个, 新增告警{}条, 恢复关警{}条, 耗时{}ms",
+            log.info("[视频告警] 轮巡结束: state={}, 通道{}个(在线{})完成{}个, 新增告警{}条, 恢复关警{}条, 对账关闭{}条, 耗时{}ms",
                     snap.state, snap.totalChannels, snap.onlineChannels, snap.completedChannels.get(),
-                    snap.newAlerts, snap.recoveredAlerts, snap.endTime - snap.startTime);
+                    snap.newAlerts, snap.recoveredAlerts, snap.reconciledAlerts, snap.endTime - snap.startTime);
         }
     }
 
@@ -481,6 +489,13 @@ public class VideoAlertScheduler {
         log.info("[视频告警] 本轮检测完成: 完成{}路, 异常通道{}个, 防抖事件{}个",
                 snap.completedChannels.get(), abnormalByChannel.size(), events.size());
 
+        // ============ 恢复对账（服务重启后防抖内存清零，按巡检结果兜底关闭已恢复告警） ============
+        int reconciled = reconcileRecoveredAlerts(new Timestamp(snap.startTime));
+        if (reconciled > 0) {
+            snap.reconciledAlerts = reconciled;
+            log.info("[视频告警] 恢复对账关闭告警 {} 条（最近{}轮巡检全正常）", reconciled, recoverThreshold);
+        }
+
         // ============ IVSS 智能事件轮询兜底（补偿订阅回调丢失的事件，与回调共用处理链路） ============
         try {
             int polled = videoEventService.pullRecentEvents();
@@ -489,6 +504,28 @@ public class VideoAlertScheduler {
             }
         } catch (Exception e) {
             log.warn("[智能事件] 轮询兜底异常: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 恢复对账：未关闭视频告警对应设备最近 recoverThreshold 轮巡检全 ok → 自动关闭告警和工单。
+     * <p>防抖状态仅存内存，服务重启后历史告警不在状态机里，设备恢复不会产生 RECOVERED 事件；
+     * 每轮巡检后对账兜底（启动后首轮即生效）。对账失败不影响本轮巡检。
+     * 包内可见供单测。
+     */
+    int reconcileRecoveredAlerts() {
+        return reconcileRecoveredAlerts(null);
+    }
+
+    /** 本轮对账：巡检轮次起点限定为本轮开始时间，避免陈旧巡检数据误关 */
+    int reconcileRecoveredAlerts(Timestamp roundStart) {
+        try {
+            return roundStart == null
+                    ? alertService.reconcileRecovered(recoverThreshold)
+                    : alertService.reconcileRecovered(recoverThreshold, roundStart);
+        } catch (Exception e) {
+            log.warn("[视频告警] 恢复对账异常: {}", e.getMessage());
+            return 0;
         }
     }
 
@@ -522,6 +559,8 @@ public class VideoAlertScheduler {
         private final AtomicInteger completedChannels = new AtomicInteger();
         private volatile int newAlerts;
         private volatile int recoveredAlerts;
+        /** 恢复对账关闭的告警条数（重启后防抖状态清零的兜底） */
+        private volatile int reconciledAlerts;
         /** 轮询兜底处理的事件条数（IVSS 智能事件，-1=拉取失败） */
         private volatile int polledEvents;
         /** 轮级登录失败标记（LOGIN_FAIL 故障项） */
@@ -561,6 +600,10 @@ public class VideoAlertScheduler {
 
         public int getRecoveredAlerts() {
             return recoveredAlerts;
+        }
+
+        public int getReconciledAlerts() {
+            return reconciledAlerts;
         }
 
         public int getPolledEvents() {

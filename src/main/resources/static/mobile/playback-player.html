@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>回放播放</title>
-<!-- hls.js 用于回放流播放，与PC端一致（回放流同为HLS m3u8） -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<!-- hls.js 本地引入（1.5.17，回放流同为HLS m3u8；避免 CDN 不可达时 Hls is not defined） -->
+<script src="../js/hls.min.js"></script>
 <style>
 /* ===== 与 live.html 同一风格：浅灰白底，视频区纯黑，主色紫蓝 #7B6CFF ===== */
 * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }

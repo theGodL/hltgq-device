@@ -8,8 +8,8 @@
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <title>实时预览 - 视频监控</title>
-<!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265) -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<!-- hls.js 本地引入（1.5.17 支持HEVC；避免 CDN 不可达时 Hls is not defined） -->
+<script src="js/hls.min.js"></script>
 <style>
 /* ============ 全局重置 ============ */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1604,10 +1604,31 @@ function refreshAll() {
 
 function toggleFullscreen() {
   console.log('[全屏] toggleFullscreen 被调用，fullscreenElement=', document.fullscreenElement);
-  if (document.fullscreenElement) {
-    document.exitFullscreen();
-  } else {
-    document.documentElement.requestFullscreen();
+  const d = document, root = d.documentElement;
+  const fsEl = d.fullscreenElement || d.webkitFullscreenElement;
+  if (fsEl) {
+    // 退出全屏：webkit 前缀兜底 + Promise 拒绝处理
+    const exit = d.exitFullscreen || d.webkitExitFullscreen;
+    if (exit) {
+      const p = exit.call(d);
+      if (p && p.catch) p.catch(() => {});
+    }
+    return;
+  }
+  // 进入全屏：webkit 前缀/旧内核兜底 + Promise 拒绝处理
+  try {
+    if (root.requestFullscreen) {
+      const p = root.requestFullscreen();
+      if (p && p.catch) p.catch(() => console.warn('[全屏] 进入全屏被浏览器拒绝'));
+    } else if (root.webkitRequestFullscreen) {
+      root.webkitRequestFullscreen();
+    } else if (root.msRequestFullscreen) {
+      root.msRequestFullscreen();
+    } else {
+      console.warn('[全屏] 当前浏览器不支持全屏API，请使用 F11');
+    }
+  } catch (err) {
+    console.warn('[全屏] 进入全屏失败：', err);
   }
 }
 
@@ -1622,10 +1643,10 @@ function updateFullscreenBtn(isFullscreen) {
 // 记录浮动按钮的原始父节点，用于全屏退出后还原
 let fsExitBtnOriginalParent = null;
 
-// 监听浏览器全屏变化（ESC/F11 等方式退出），同步按钮状态
-document.addEventListener('fullscreenchange', () => {
-  const isFs = !!document.fullscreenElement;
-  const fsEl = document.fullscreenElement;
+// 监听浏览器全屏变化（按钮/ESC 等方式退出），同步按钮状态；同时兼容 webkit 内核
+function onFullscreenChange() {
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  const isFs = !!fsEl;
   console.log('[全屏] fullscreenchange 触发，isFs=', isFs, 'element=', fsEl);
   updateFullscreenBtn(isFs);
   // 全屏时隐藏入口型按钮（格内⛶），避免和浮动退出按钮叠在一起
@@ -1653,7 +1674,9 @@ document.addEventListener('fullscreenchange', () => {
     }
     floatBtn.classList.toggle('visible', isFs);
   }
-});
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
 
 function updateChannelCount() {
   if (channelCountCache) {

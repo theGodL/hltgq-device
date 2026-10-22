@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>录像回放 - 花凉亭灌区视频监控</title>
-  <!-- hls.js 用于播放HLS(m3u8)录像回放流，1.5.17支持HEVC(H.265) -->
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <!-- hls.js 本地引入（1.5.17 支持HEVC；避免 CDN 不可达时 Hls is not defined） -->
+  <script src="js/hls.min.js"></script>
   <style>
     /* ==================== 基础 ==================== */
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -514,6 +514,53 @@
 
     .ctrl-divider { width: 1px; height: 22px; background: #eceef1; }
 
+    /* ========== 全屏支持 ========== */
+    /* 全屏浮动退出按钮：避开Chrome全屏时顶部工具栏(~60px)覆盖区，全屏时才显示 */
+    .fs-exit-btn {
+      position: fixed;
+      top: 80px; right: 24px;
+      z-index: 99999;
+      padding: 8px 18px;
+      background: rgba(0,0,0,.65);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,.25);
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      transition: background .2s, border-color .2s;
+    }
+    .fs-exit-btn:hover { background: rgba(24,144,255,.85); border-color: rgba(255,255,255,.5); }
+    .fs-exit-btn.visible { display: flex; }
+
+    /* 单格全屏：纵向排列，video占满剩余高度，时间轴/控制栏(由JS注入格内)贴底 */
+    .video-cell:fullscreen,
+    .video-cell:-webkit-full-screen {
+      display: flex;
+      flex-direction: column;
+      background: #000;
+      border-radius: 0;
+    }
+    .video-cell:fullscreen video,
+    .video-cell:-webkit-full-screen video {
+      flex: 1 1 auto;
+      min-height: 0;
+      height: auto;
+    }
+    .video-cell:fullscreen .timeline,
+    .video-cell:-webkit-full-screen .timeline,
+    .video-cell:fullscreen .control-bar,
+    .video-cell:-webkit-full-screen .control-bar {
+      flex: 0 0 auto;
+      border-radius: 0;
+    }
+
     /* 提示浮层 */
     .toast {
       position: fixed;
@@ -562,7 +609,7 @@
         <input id="searchInput" type="text" placeholder="搜索点位..." oninput="filterTree(this.value)">
       </div>
       <button class="icon-btn" title="刷新" onclick="reloadTree()">🔄</button>
-      <button class="icon-btn" title="全屏" onclick="togglePageFullscreen()">⛶</button>
+      <button class="icon-btn" id="fsPageBtn" title="全屏" onclick="togglePageFullscreen()">⛶</button>
       <button class="back-live" onclick="location.href='monitor.html'">返回实时</button>
     </div>
   </header>
@@ -642,6 +689,9 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- 全屏浮动退出按钮：避开Chrome全屏时顶部工具栏覆盖区 -->
+  <button class="fs-exit-btn" id="fsExitBtn" onclick="togglePageFullscreen()">⛶ 退出全屏</button>
 
   <script>
   // ==================== 常量与全局状态 ====================
@@ -1614,26 +1664,129 @@
     fullscreenCellAt(selectedCell);
   }
 
+  // ==================== 全屏（整页/单格） ====================
+  /** 当前全屏元素（含 webkit 前缀内核） */
+  function currentFullscreenElement() {
+    return document.fullscreenElement || document.webkitFullscreenElement || null;
+  }
+
+  /** 元素全屏请求：webkitRequestFullscreen 兜底 + Promise 拒绝处理 */
+  function requestFullscreenSafe(el) {
+    const req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req) {
+      toast('当前浏览器不支持全屏，可使用 F11');
+      return;
+    }
+    try {
+      const p = req.call(el);
+      if (p && p.catch) p.catch(() => toast('当前浏览器不允许全屏，可使用 F11'));
+    } catch (err) {
+      toast('全屏失败：' + err.message);
+    }
+  }
+
+  /** 安全退出全屏：webkitExitFullscreen 兜底 + Promise 拒绝处理 */
+  function exitFullscreenSafe() {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (!exit) return;
+    try {
+      const p = exit.call(document);
+      if (p && p.catch) p.catch(() => {});
+    } catch (err) { /* 状态竞态下已退出，忽略 */ }
+  }
+
   function fullscreenCellAt(idx) {
     const cell = getCell(idx);
     if (!cell || !cellChannels[idx]) {
       toast('该格子暂无回放视频');
       return;
     }
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else if (cell.requestFullscreen) {
-      cell.requestFullscreen().catch(() => {});
+    // ★ 只认"本格已全屏"：整页全屏(fsEl=documentElement)时继续请求本格 → 直接切换为单格全屏
+    if (currentFullscreenElement() === cell) {
+      exitFullscreenSafe();
+    } else {
+      requestFullscreenSafe(cell);
     }
   }
 
   function togglePageFullscreen() {
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else if (document.documentElement.requestFullscreen) {
-      document.documentElement.requestFullscreen().catch(() => {});
+    if (currentFullscreenElement()) {
+      exitFullscreenSafe();
+    } else {
+      requestFullscreenSafe(document.documentElement);
     }
   }
+
+  // ==================== 全屏状态同步（按钮/浮动退出/控制条保留） ====================
+  let fsExitBtnHome = null;     // 浮动按钮原位置 {parent, next}
+  let fsTimelineHome = null;    // 时间轴原位置
+  let fsControlBarHome = null;  // 控制栏原位置
+
+  /** 还原节点到原位置；锚点失效时追加到兜底容器末尾（幂等） */
+  function restoreNodeToHome(node, home, fallbackParent) {
+    if (!node) return;
+    if (!home && node.parentNode === fallbackParent) return;
+    const parent = (home && home.parent && document.contains(home.parent)) ? home.parent : fallbackParent;
+    if (!parent) return;
+    const next = (home && home.next && home.next.parentNode === parent) ? home.next : null;
+    if (node.parentNode === parent && node.nextSibling === next) return;
+    parent.insertBefore(node, next);
+  }
+
+  /** 单格全屏：全屏层外的元素不可见 → 把时间轴+控制栏注入全屏格；退出/整页全屏时还原 */
+  function syncPlayerControls(isCellFs, fsEl) {
+    const timeline = document.getElementById('timeline');
+    const controlBar = document.querySelector('.control-bar');
+    if (isCellFs && fsEl) {
+      if (timeline && timeline.parentNode !== fsEl) {
+        if (!fsTimelineHome) fsTimelineHome = { parent: timeline.parentNode, next: timeline.nextSibling };
+        fsEl.appendChild(timeline);
+      }
+      if (controlBar && controlBar.parentNode !== fsEl) {
+        if (!fsControlBarHome) fsControlBarHome = { parent: controlBar.parentNode, next: controlBar.nextSibling };
+        fsEl.appendChild(controlBar);
+      }
+    } else {
+      const content = document.querySelector('.content');
+      // 先还原时间轴再还原控制栏：锚点失效按 append 时仍保持"时间轴在上"的原始顺序
+      restoreNodeToHome(timeline, fsTimelineHome, content);
+      restoreNodeToHome(controlBar, fsControlBarHome, content);
+      fsTimelineHome = null;
+      fsControlBarHome = null;
+    }
+  }
+
+  function onFullscreenChange() {
+    const fsEl = currentFullscreenElement();
+    const isFs = !!fsEl;
+    const isCellFs = !!(isFs && fsEl.classList && fsEl.classList.contains('video-cell'));
+    // 顶栏按钮状态同步
+    const pageBtn = document.getElementById('fsPageBtn');
+    if (pageBtn) pageBtn.title = isFs ? '退出全屏' : '全屏';
+    // 浮动退出按钮：单格全屏注入格内(右上)；整页全屏固定右上安全区；退出后隐藏
+    const floatBtn = document.getElementById('fsExitBtn');
+    if (floatBtn) {
+      if (isCellFs) {
+        if (floatBtn.parentNode !== fsEl) {
+          if (!fsExitBtnHome) fsExitBtnHome = { parent: floatBtn.parentNode, next: floatBtn.nextSibling };
+          fsEl.appendChild(floatBtn);
+        }
+        floatBtn.style.top = '16px';
+        floatBtn.style.right = '16px';
+        floatBtn.classList.add('visible');
+      } else {
+        restoreNodeToHome(floatBtn, fsExitBtnHome, document.body);
+        fsExitBtnHome = null;
+        floatBtn.style.top = '80px';
+        floatBtn.style.right = '24px';
+        floatBtn.classList.toggle('visible', isFs);
+      }
+    }
+    // 单格全屏时保留回放控制条（时间轴/停止/倍速/截图），避免全屏后无法操作
+    syncPlayerControls(isCellFs, fsEl);
+  }
+  document.addEventListener('fullscreenchange', onFullscreenChange);
+  document.addEventListener('webkitfullscreenchange', onFullscreenChange);
 
   // ==================== 时间轴 ====================
   function renderTimeline() {

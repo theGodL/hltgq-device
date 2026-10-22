@@ -4,8 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>实时监控</title>
-<!-- hls.js 用于播放HLS(m3u8)流，1.5.17支持HEVC(H.265)，与PC端一致 -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<!-- hls.js 本地引入（1.5.17 支持HEVC，与PC端一致；避免 CDN 不可达时 Hls is not defined） -->
+<script src="../js/hls.min.js"></script>
 <style>
 /* ===== 轻量实时监控页（页面跳转集成：前端从列表/地图页整页跳入，自适应视口宽高）=====
    与 mobile/live.html 同源同风格，差异三点：

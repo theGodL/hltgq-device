@@ -285,6 +285,52 @@ public class WorkOrderService {
     // ======================== 告警恢复联动关闭 ========================
 
     /**
+     * 故障恢复（按告警ID精确关闭）：关闭 alert IN (...) 且 status=#1# 待处理的工单。
+     * <p>用于设备换站/站点改名后按 device 关闭告警的联动，避免按站点名+content 匹配不到旧工单。
+     * 人工已开始处理（#2#）、已关闭（#3#）、已取消（#4#）的工单不自动扭转。
+     *
+     * @param alertIds 被关闭的告警ID集合
+     * @return 实际关闭的工单条数
+     */
+    public int closeByAlertIds(List<String> alertIds) {
+        if (alertIds == null || alertIds.isEmpty()) {
+            return 0;
+        }
+        try {
+            Timestamp now = new Timestamp(System.currentTimeMillis());
+            StringBuilder phs = new StringBuilder();
+            List<Object> args = new ArrayList<>();
+            args.add(STATUS_CLOSED);
+            args.add(now);
+            for (String alertId : alertIds) {
+                if (alertId == null || alertId.trim().isEmpty()) {
+                    continue;
+                }
+                if (phs.length() > 0) {
+                    phs.append(", ");
+                }
+                phs.append("?");
+                args.add(alertId);
+            }
+            if (args.size() == 2) {
+                return 0;
+            }
+            args.add(STATUS_PENDING);
+            String sql = "UPDATE " + WORK_ORDER_TABLE +
+                    " SET status = ?, updated_at = ?, updated_by = 'SYSTEM'" +
+                    " WHERE alert IN (" + phs + ") AND status = ?";
+            int rows = jdbcTemplate.update(sql, args.toArray());
+            if (rows > 0) {
+                log.info("[视频告警] 故障恢复, 按告警ID自动关闭工单 {} 条: alertIds={}", rows, alertIds);
+            }
+            return rows;
+        } catch (Exception e) {
+            log.debug("[视频告警] 按告警ID关闭工单失败: {}", e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
      * 故障恢复：按 content 精确匹配关闭工单（与告警 closeByContent 同条件）。
      * <p>人工维护保护：仅关闭 status=#1# 待处理的工单——人工已开始处理（#2#）、
      * 已关闭（#3#）、已取消（#4#）的工单均不自动扭转，保留人工操作结果

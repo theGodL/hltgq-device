@@ -13,6 +13,7 @@ import javax.annotation.Resource;
 import java.sql.Timestamp;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -29,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>code：GJ + yyyyMMddHHmmss + 3位序号（按秒重置、同秒递增）；</li>
  *   <li>content："{站点名}-视频 {故障名}！"，对齐 hltgq-mq "{站点名}-{指标} 设备异常！"风格；</li>
  *   <li>新增默认 status=#1#（未确认），同一未关闭告警（site+device+content 相同）不重复新增；</li>
+ *   <li>同一站点同一内容 24h 内只入库一次（对齐 hltgq-mq 一日去重；恢复关警后同日再触发同样抑制）；</li>
  *   <li>故障恢复时自动置 status=#4#（已关闭），并联动关闭对应工单；平台侧也可手动维护状态（自动+手动结合）；</li>
  *   <li>type 固定 #2#（异常告警，视频故障不属于阈值超限）；</li>
  *   <li>告警新增成功 → 自动生成工单（{@link WorkOrderService}，移植 hltgq-mq 联动模式）；</li>
@@ -53,6 +55,12 @@ public class VideoAlertService {
 
     /** 视频设备表（视频资产权威源：站点解析改走设备表 code → site） */
     private static final String DEVICE_TABLE = SCHEMA + "t_auto_hltgq_water_device";
+
+    /** 巡检留痕表（恢复对账用：最近 N 轮结果全 ok 视为已恢复） */
+    private static final String PATROL_TABLE = SCHEMA + "t_auto_hltgq_water_video_patrol";
+
+    /** 恢复对账巡检回看窗口下限（分钟）：覆盖 recover-threshold 轮 + 轮次延迟/跳过容错 */
+    private static final int RECONCILE_MIN_LOOKBACK_MINUTES = 120;
 
     /** 处理状态：#1#未确认(新增默认) #4#已关闭(恢复) */
     private static final String STATUS_UNCONFIRMED = "#1#";
@@ -109,6 +117,24 @@ public class VideoAlertService {
     private final AtomicInteger codeSeq = new AtomicInteger();
     private volatile long codeLastSecond = 0;
 
+    /** 同站同内容去重窗口（小时，0=关闭；默认 24h，对齐 hltgq-mq 一日去重） */
+    @Value("${video-alert.dedup-window-hours:24}")
+    private long dedupWindowHours;
+
+    /** 告警入库分段锁数（按 site+content 哈希分段，巡检线程与 IVSS 事件线程并发时互斥） */
+    private static final int ALERT_LOCK_STRIPES = 64;
+
+    /** 告警入库分段锁：保证「24h 查重 → 未关闭查重 → 插入 → 建单」原子，防止并发重复入库 */
+    private final Object[] alertLocks = createAlertLocks();
+
+    private static Object[] createAlertLocks() {
+        Object[] locks = new Object[ALERT_LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
     @PostConstruct
     public void init() {
         try {
@@ -140,6 +166,7 @@ public class VideoAlertService {
             }
             log.info("[视频告警] 故障级别覆盖: {}", levelOverrides);
         }
+        log.info("[视频告警] 同站同内容去重窗口: {} 小时（0=关闭）", dedupWindowHours);
     }
 
     /** 故障级别：配置覆盖优先，未配置回退枚举默认值 */
@@ -152,13 +179,14 @@ public class VideoAlertService {
     /**
      * 新增故障告警：站点名 + 故障名拼装 content（"{站点}-视频 {故障}！"，对齐 hltgq-mq 风格），
      * device 存设备表视频设备 ID（type=#5#），
-     * 同一未关闭告警（site+device+content）不重复新增，新增成功自动联动生成工单。
+     * 同一未关闭告警（site+device+content）不重复新增；同站同内容 24h 内只入库一次，
+     * 新增成功自动联动生成工单。
      * <p>通道尚未入库（ICC 新增通道/历史缺口）时，先按 ICC 设备树即时补建再重试解析，
      * 避免"巡检发现了故障却因设备表没有台账而丢告警"（2026-10-20 R7 修复）。
      *
      * @param devicecode 通道设备编码（设备表 code 匹配）
      * @param fault      故障类型
-     * @return true-新增成功，false-站点/设备缺失、已有未关闭同内容告警、入库失败
+     * @return true-新增成功，false-站点/设备缺失、已有未关闭同内容告警、24h 内已有同站同内容告警、入库失败
      */
     public boolean reportFault(String devicecode, VideoFaultType fault) {
         SiteInfo site = resolveSite(devicecode);
@@ -176,19 +204,30 @@ public class VideoAlertService {
             return false;
         }
         String content = site.name + "-视频 " + fault.getLabel() + "！";
-        // device=设备表视频设备ID（与 hltgq-mq 三字段去重同构）
-        if (existsUnclosed(site.id, deviceId, content)) {
-            return false;
+        // 分段锁：同一站点+内容并发进入时，只允许一个线程完成「查重→插入→建单」
+        synchronized (lockFor(site.id, content)) {
+            // device=设备表视频设备ID（与 hltgq-mq 三字段去重同构）
+            if (existsUnclosed(site.id, deviceId, content)) {
+                return false;
+            }
+            // 同站同内容 24h 只入库一次（对齐 hltgq-mq 一日去重）：恢复关警后同日再触发同样抑制，
+            // 不新增告警/工单（平台播报读告警表，不插入即不播报）
+            if (existsRecentSameContent(site.id, content)) {
+                log.info("[视频告警] 24h 内已有同站同内容告警，抑制新增: site={}({}), content={}",
+                        site.id, site.name, content);
+                return false;
+            }
+            insertAlert(site.id, deviceId, content, levelOf(fault), WORK_ORDER_TYPE_FAULT_REPAIR, ALERT_TYPE_ABNORMAL);
         }
-        insertAlert(site.id, deviceId, content, levelOf(fault), WORK_ORDER_TYPE_FAULT_REPAIR, ALERT_TYPE_ABNORMAL);
         log.warn("[视频告警] 新增告警: site={}({}), device={}, fault={}, content={}",
                 site.id, site.name, deviceId, fault, content);
         return true;
     }
 
     /**
-     * 故障恢复：按站点+设备+内容精确匹配，关闭未关闭告警（status → #4#），
-     * 并联动关闭对应工单（status → #3#，已取消工单除外）。
+     * 故障恢复：按设备 + 故障后缀（"%-视频 {故障}！"）关闭未关闭告警（status → #4#），
+     * 不再依赖站点名前缀——设备换站/站点改名后告警 content 仍是旧站点名，按 device 匹配才能关掉。
+     * 并按实际关闭的告警 id 联动关闭对应工单（status → #3#，仅待处理）。
      *
      * @return 实际关闭的告警条数（人工已关闭的行不重复更新，返回0）
      */
@@ -201,14 +240,18 @@ public class VideoAlertService {
         if (deviceId == null) {
             return 0;
         }
-        String content = site.name + "-视频 " + fault.getLabel() + "！";
-        int rows = closeByContent(site.id, deviceId, content);
-        if (rows > 0) {
-            log.info("[视频告警] 恢复关警 {} 条: site={}({}), device={}, fault={}",
-                    rows, site.id, site.name, deviceId, fault);
+        String suffix = "-视频 " + fault.getLabel() + "！";
+        List<String> alertIds = findUnclosedAlertIds(deviceId, "%" + suffix);
+        if (alertIds.isEmpty()) {
+            return 0;
         }
-        // 告警恢复 → 同步自动关闭对应工单（与 hltgq-mq closeDeviceError 联动模式一致）
-        workOrderService.closeByContent(site.id, deviceId, content);
+        // 先关工单再关告警：任一步失败时告警仍为未关闭，下轮对账可重试收敛
+        workOrderService.closeByAlertIds(alertIds);
+        int rows = closeByIds(alertIds);
+        if (rows > 0) {
+            log.info("[视频告警] 恢复关警 {} 条: device={}({}), fault={}",
+                    rows, deviceId, devicecode, fault);
+        }
         return rows;
     }
 
@@ -217,22 +260,29 @@ public class VideoAlertService {
     /**
      * 新增智能事件告警（IVSS 事件接入复用入口）：content 由调用方拼装
      * （"{站点}-视频智能事件 {事件名}！"，与图像故障 "{站点}-视频 {故障名}！" 前缀隔离防撞），
-     * device 存设备表视频设备 ID，去重（site+device+content）与工单联动同故障告警完全一致。
+     * device 存设备表视频设备 ID，去重（site+device+content + 24h 同站同内容）与工单联动同故障告警完全一致。
      *
      * @param siteId   站点ID（事件 nodeCode 匹配到的视频站点）
      * @param deviceId 设备表视频设备ID
      * @param content  告警内容
      * @param level    告警级别（#1#~#4#，由事件 alarmGrade 映射）
-     * @return true-新增成功，false-已有未关闭同内容告警或入库失败
+     * @return true-新增成功，false-已有未关闭同内容告警、24h 内已有同站同内容告警或入库失败
      */
     public boolean reportEventAlert(String siteId, String deviceId, String content, String level) {
         if (siteId == null || deviceId == null || content == null || content.trim().isEmpty()) {
             return false;
         }
-        if (existsUnclosed(siteId, deviceId, content)) {
-            return false;
+        synchronized (lockFor(siteId, content)) {
+            if (existsUnclosed(siteId, deviceId, content)) {
+                return false;
+            }
+            if (existsRecentSameContent(siteId, content)) {
+                log.info("[视频告警] 24h 内已有同站同内容智能事件告警，抑制新增: site={}, content={}",
+                        siteId, content);
+                return false;
+            }
+            insertAlert(siteId, deviceId, content, level, WORK_ORDER_TYPE_SAFETY_RECTIFY, ALERT_TYPE_INTELLIGENT);
         }
-        insertAlert(siteId, deviceId, content, level, WORK_ORDER_TYPE_SAFETY_RECTIFY, ALERT_TYPE_INTELLIGENT);
         log.warn("[视频告警] 新增智能事件告警: site={}, device={}, content={}", siteId, deviceId, content);
         return true;
     }
@@ -333,7 +383,157 @@ public class VideoAlertService {
         }
     }
 
-    /** 精确 content 关闭（故障恢复用）：仅更新未关闭（status≠#4#）的告警，不覆盖人工已关闭记录 */
+    /**
+     * 同站点-内容且 24h 内已入库的告警是否存在（status 不限，对齐 hltgq-mq 一日去重）。
+     * <p>覆盖恢复关警后再次触发、服务重启防抖状态清零、抑制窗口结束补发等场景：
+     * 同一天内同站同内容只保留一条告警，避免告警/工单/平台播报循环放大；查询失败 fail-open 放行。
+     */
+    private boolean existsRecentSameContent(String siteId, String content) {
+        if (dedupWindowHours <= 0) {
+            return false;
+        }
+        try {
+            Timestamp cutoff = new Timestamp(System.currentTimeMillis() - dedupWindowHours * 3600_000L);
+            String sql = "SELECT 1 FROM " + ALERT_TABLE +
+                    " WHERE site = ? AND content = ? AND created_at >= ? LIMIT 1";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, siteId, content, cutoff);
+            return rows != null && !rows.isEmpty();
+        } catch (Exception e) {
+            log.warn("[视频告警] 24h 同内容去重检查失败, 放行: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /** 按站点+内容取分段锁（同一键的「查重→插入→建单」串行，不同键互不阻塞） */
+    private Object lockFor(String siteId, String content) {
+        return alertLocks[Math.floorMod((siteId + '\0' + content).hashCode(), alertLocks.length)];
+    }
+
+    /** 查设备下未关闭的故障告警 id（按故障后缀匹配，兼容换站/改名后的旧站点名前缀） */
+    private List<String> findUnclosedAlertIds(String deviceId, String contentLike) {
+        try {
+            String sql = "SELECT id FROM " + ALERT_TABLE +
+                    " WHERE device = ? AND content LIKE ? AND status IS DISTINCT FROM ?";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql,
+                    deviceId, contentLike, STATUS_CLOSED);
+            List<String> ids = new ArrayList<>();
+            if (rows != null) {
+                for (Map<String, Object> row : rows) {
+                    Object id = row.get("id");
+                    if (id != null && !String.valueOf(id).trim().isEmpty()) {
+                        ids.add(String.valueOf(id));
+                    }
+                }
+            }
+            return ids;
+        } catch (Exception e) {
+            log.warn("[视频告警] 查询未关闭告警失败, device={}: {}", deviceId, e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    /** 按告警 id 批量关闭（恢复/对账共用）：仅更新未关闭行，不覆盖人工已关闭记录 */
+    private int closeByIds(List<String> alertIds) {
+        if (alertIds == null || alertIds.isEmpty()) {
+            return 0;
+        }
+        try {
+            StringBuilder phs = new StringBuilder();
+            List<Object> args = new ArrayList<>();
+            args.add(STATUS_CLOSED);
+            args.add(new Timestamp(System.currentTimeMillis()));
+            for (String id : alertIds) {
+                if (phs.length() > 0) {
+                    phs.append(", ");
+                }
+                phs.append("?");
+                args.add(id);
+            }
+            args.add(STATUS_CLOSED);
+            String sql = "UPDATE " + ALERT_TABLE +
+                    " SET status = ?, updated_at = ?, updated_by = 'SYSTEM'" +
+                    " WHERE id IN (" + phs + ") AND status IS DISTINCT FROM ?";
+            return jdbcTemplate.update(sql, args.toArray());
+        } catch (Exception e) {
+            log.debug("[视频告警] 按ID关闭告警失败: {}", e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * 恢复对账（每轮巡检后调用）：不依赖防抖内存状态，按巡检表兜底关闭已恢复告警。
+     * <p>服务重启后 {@link AlertDebouncer} 计数清零，历史告警不会产生 RECOVERED 事件；
+     * 这里直接查未关闭视频故障告警对应设备最近 okRounds 轮巡检是否全 ok，
+     * 全 ok 即视为恢复：关闭告警并按告警 id 关闭对应工单（仅待处理）。
+     * 要求最新一轮落在回看时间窗内，长期无巡检数据的通道不参与对账，避免陈旧数据误关。
+     *
+     * @param okRounds 连续正常轮数阈值（video-alert.recover-threshold）
+     * @return 实际关闭的告警条数
+     */
+    public int reconcileRecovered(int okRounds) {
+        if (okRounds <= 0) {
+            return 0;
+        }
+        long lookbackMinutes = Math.max(RECONCILE_MIN_LOOKBACK_MINUTES, okRounds * 60L);
+        return reconcileRecovered(okRounds,
+                new Timestamp(System.currentTimeMillis() - lookbackMinutes * 60_000L));
+    }
+
+    /**
+     * 恢复对账（指定巡检轮次起点）：每轮巡检收尾调用。
+     * <p>取该通道最近 okRounds 行巡检结果（本轮留痕 round_time 即轮次起点），要求全部为 ok、
+     * 且最新一轮不早于本轮起点——本轮留痕未写入（数据库异常/通道被取消）时最新一轮是历史数据，
+     * 条件不成立，不会用陈旧巡检结果误关。
+     *
+     * @param okRounds   连续正常轮数阈值（video-alert.recover-threshold）
+     * @param roundStart 本轮巡检开始时间（巡检表 round_time 同源）
+     * @return 实际关闭的告警条数
+     */
+    public int reconcileRecovered(int okRounds, Timestamp roundStart) {
+        if (okRounds <= 0 || roundStart == null) {
+            return 0;
+        }
+        List<String> alertIds = new ArrayList<>();
+        try {
+            // 最近 okRounds 轮全 ok，且最新一轮（max round_time）不早于本轮起点
+            String latestRounds = "(SELECT p.result, p.round_time FROM " + PATROL_TABLE + " p" +
+                    " WHERE p.channel_code = d.code" +
+                    " ORDER BY p.round_time DESC LIMIT " + okRounds + ") x";
+            String sql = "SELECT a.id AS alert_id FROM " + ALERT_TABLE + " a" +
+                    " JOIN " + DEVICE_TABLE + " d ON d.id = a.device" +
+                    " WHERE a.status = ? AND a.content LIKE '%-视频 %'" +
+                    " AND d.code IS NOT NULL AND d.code <> ''" +
+                    " AND (SELECT count(*) FROM " + latestRounds + ") = " + okRounds +
+                    " AND (SELECT count(*) FILTER (WHERE x.result = 'ok') FROM " + latestRounds + ") = "
+                    + okRounds +
+                    " AND (SELECT max(x.round_time) FROM " + latestRounds + ") >= ?";
+            List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql,
+                    STATUS_UNCONFIRMED, roundStart);
+            if (rows != null) {
+                for (Map<String, Object> row : rows) {
+                    Object id = row.get("alert_id");
+                    if (id != null && !String.valueOf(id).trim().isEmpty()) {
+                        alertIds.add(String.valueOf(id));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[视频告警] 恢复对账查询失败: {}", e.getMessage());
+            return 0;
+        }
+        if (alertIds.isEmpty()) {
+            return 0;
+        }
+        // 先关工单再关告警：任一步失败时告警仍为未关闭，下轮对账可重试收敛
+        workOrderService.closeByAlertIds(alertIds);
+        int rows = closeByIds(alertIds);
+        if (rows > 0) {
+            log.info("[视频告警] 恢复对账关闭告警 {} 条（{}轮巡检全正常）", rows, okRounds);
+        }
+        return rows;
+    }
+
+    /** 精确 content 关闭（智能事件恢复用）：仅更新未关闭（status≠#4#）的告警，不覆盖人工已关闭记录 */
     private int closeByContent(String siteId, String deviceId, String content) {
         try {
             String sql = "UPDATE " + ALERT_TABLE +
