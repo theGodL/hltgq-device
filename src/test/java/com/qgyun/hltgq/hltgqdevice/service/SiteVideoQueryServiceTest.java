@@ -122,7 +122,7 @@ class SiteVideoQueryServiceTest {
                         CODE_A, "大门外", "集岭管理所", "虎形渡槽", true, 2));
         when(stationSyncService.findChannel(CODE_B)).thenReturn(null);
 
-        Map<String, Object> data = service.query(SITE_ID, null, null);
+        Map<String, Object> data = service.query(SITE_ID, null, null, null);
 
         assertEquals(SITE_ID, data.get("siteId"));
         assertEquals(SITE_NAME, data.get("siteName"));
@@ -155,7 +155,7 @@ class SiteVideoQueryServiceTest {
         stubSiteName();
         stubDevices(new ArrayList<>());
 
-        Map<String, Object> data = service.query(null, null, CODE_A);
+        Map<String, Object> data = service.query(null, null, CODE_A, null);
 
         assertEquals(SITE_ID, data.get("siteId"));
         assertEquals(0, data.get("total"));
@@ -171,7 +171,7 @@ class SiteVideoQueryServiceTest {
         stubSiteName();
         stubDevices(new ArrayList<>());
 
-        Map<String, Object> data = service.query(null, SITE_NAME, null);
+        Map<String, Object> data = service.query(null, SITE_NAME, null, null);
 
         assertEquals(SITE_ID, data.get("siteId"));
         assertEquals(SITE_NAME, data.get("siteName"));
@@ -189,7 +189,7 @@ class SiteVideoQueryServiceTest {
                 .thenThrow(new RuntimeException("patrol table missing"));
         when(stationSyncService.findChannel(CODE_A)).thenReturn(null);
 
-        Map<String, Object> data = service.query(SITE_ID, null, null);
+        Map<String, Object> data = service.query(SITE_ID, null, null, null);
 
         assertEquals(1, data.get("total"));
         assertNull(channelsOf(data).get(0).get("patrolResult"));
@@ -204,7 +204,7 @@ class SiteVideoQueryServiceTest {
                 org.mockito.ArgumentMatchers.<Object>any()))
                 .thenThrow(new RuntimeException("device table missing"));
 
-        Map<String, Object> data = service.query(SITE_ID, null, null);
+        Map<String, Object> data = service.query(SITE_ID, null, null, null);
 
         assertNotNull(data.get("channels"));
         assertEquals(0, data.get("total"));

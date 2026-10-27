@@ -92,6 +92,17 @@ body {
   position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.65);
   color: #FFF; font-size: 13px; text-align: center; padding: 6px 12px; display: none;
 }
+/* 全屏按钮：右下角（元素级全屏 videoArea，全屏后按钮仍在层内可见；图标 ⛶/✕ 双向切换） */
+.fs-btn {
+  position: absolute; right: 12px; bottom: 12px; width: 36px; height: 36px;
+  border-radius: 8px; border: none; background: rgba(0,0,0,0.45); color: #FFFFFF;
+  font-size: 16px; cursor: pointer; z-index: 3;
+  display: flex; align-items: center; justify-content: center;
+}
+.fs-btn:active { background: rgba(0,0,0,0.7); }
+/* 全屏态：video-area 撑满屏幕（flex 布局保持 video 居中 contain） */
+.video-area:fullscreen { width: 100%; height: 100%; background: #000; }
+.video-area:-webkit-full-screen { width: 100%; height: 100%; background: #000; }
 
 /* 云台控制条：横排按钮放底部（与回放播放页控制条风格一致） */
 .ptz-bar {
@@ -164,6 +175,7 @@ body {
   <button class="play-btn" id="playBtn" style="display:none">▶</button>
   <span class="record-dot" id="recordDot"></span>
   <div class="video-error" id="videoError"></div>
+  <button class="fs-btn" id="fsBtn" title="全屏">⛶</button>
 </div>
 
 <div class="ai-bar" id="aiBar"><span class="bulb">💡</span><span id="aiText">当前画面未检测到异常</span></div>
@@ -455,6 +467,67 @@ function bindPtzButton(btn) {
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
+// ==================== 全屏（按钮进入/退出，状态双向同步） ====================
+function currentFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+/** iOS 原生 video 全屏态（元素级全屏 API 在 iOS Safari 不可用，走 video 原生全屏） */
+function isNativeVideoFullscreen() {
+  const v = document.getElementById('video');
+  return !!(v && v.webkitDisplayingFullscreen);
+}
+/**
+ * 进入/退出全屏：标准 API → webkit → iOS video 原生全屏 兜底链；
+ * Promise 拒绝仅提示不抛错（部分 webview 禁用全屏 API）。
+ */
+function toggleFullscreen() {
+  const area = document.getElementById('videoArea');
+  const video = document.getElementById('video');
+  if (currentFullscreenElement()) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exit) {
+      try {
+        const p = exit.call(document);
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) { console.warn('[全屏] 退出失败：', e); }
+    }
+    return;
+  }
+  if (isNativeVideoFullscreen()) {
+    if (video.webkitExitFullscreen) { try { video.webkitExitFullscreen(); } catch (e) {} }
+    return;
+  }
+  try {
+    if (area.requestFullscreen) {
+      const p = area.requestFullscreen();
+      if (p && p.catch) p.catch((err) => {
+        console.warn('[全屏] 进入被拒绝：', err);
+        showToast('当前浏览器不支持页面全屏');
+      });
+    } else if (area.webkitRequestFullscreen) {
+      area.webkitRequestFullscreen();
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();   // iOS Safari：系统播放器全屏，用系统 UI 退出
+    } else {
+      showToast('当前浏览器不支持全屏');
+    }
+  } catch (e) {
+    console.warn('[全屏] 进入失败：', e);
+    showToast('当前浏览器不支持全屏');
+  }
+}
+/** 全屏状态变化：按钮图标同步（⛶ ↔ ✕）；iOS 原生全屏由 begin/end 事件触发 */
+function onFullscreenChange() {
+  const isFs = !!currentFullscreenElement() || isNativeVideoFullscreen();
+  const btn = document.getElementById('fsBtn');
+  if (btn) {
+    btn.textContent = isFs ? '✕' : '⛶';
+    btn.title = isFs ? '退出全屏' : '全屏';
+  }
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
 // ==================== AI 检测状态栏 ====================
 /**
  * 查询该通道未关闭告警（type=#3# 智能分析 / #2# 异常告警），
@@ -520,6 +593,13 @@ function init() {
     document.getElementById('playBtn').style.display = 'none';
     document.getElementById('recordDot').style.display = 'block';
   });
+  // 全屏按钮：阻止冒泡避免误触 videoArea 的点击起播；iOS 原生全屏事件同步按钮状态
+  document.getElementById('fsBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleFullscreen();
+  });
+  video.addEventListener('webkitbeginfullscreen', onFullscreenChange);
+  video.addEventListener('webkitendfullscreen', onFullscreenChange);
   // 云台方向按钮
   document.querySelectorAll('.ptz-btn').forEach(bindPtzButton);
   // 中心停止按钮：点击即停止

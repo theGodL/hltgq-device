@@ -164,9 +164,13 @@ public class StationStatusSyncService {
             log.info("[站点同步] ICC设备树遍历完成，共{}个视频通道，遍历失败={}",
                     channels.size(), traversalFailed.get());
 
-            // 遍历完整时整体刷新通道信息缓存（不完整保留旧快照，防部分通道"消失"）
+            // 通道信息缓存回写：完整遍历整体刷新；不完整遍历合并补充（只补不减，防部分通道“消失”）。
+            // ★ 失败轮也合并（否则预热门形同虚设：生产上遍历常带个别失败节点，缓存永不预热，
+            //   首个用户请求仍要实时全树遍历约7s）
             if (!traversalFailed.get()) {
                 refreshChannelCache(channels);
+            } else {
+                mergeChannelCache(channels);
             }
 
             // 2. 加载站点表快照：siteById（设备已挂站点判定）+ 全表名称（兜底站去重）+ 业务站名索引（匹配）
@@ -381,6 +385,8 @@ public class StationStatusSyncService {
         List<VideoChannel> channels = collectChannelsWithDisambiguation(traversalFailed);
         if (traversalFailed.get()) {
             log.warn("[视频告警] ICC设备树遍历存在失败节点，通道数据不完整，返回null");
+            // 即使本轮数据不完整，遍历到的通道仍合并回写缓存（只补不减），保持缓存持续预热
+            mergeChannelCache(channels);
             return null;
         }
         // 遍历完整时整体刷新通道信息缓存（/channel-info 查询用）
@@ -391,13 +397,27 @@ public class StationStatusSyncService {
     /**
      * 整体刷新通道信息缓存（设备树整轮遍历成功后调用；volatile 替换不可变 Map，读侧无锁）。
      * 同轮重复通道（多组织共享设备）先到先得，与站点同步 processedCodes 去重语义一致。
+     * synchronized：与 mergeChannelCache 互斥，防“合并回写基于旧快照构建的新 Map 反向覆盖整体刷新结果”。
      */
-    private void refreshChannelCache(List<VideoChannel> channels) {
+    private synchronized void refreshChannelCache(List<VideoChannel> channels) {
         Map<String, VideoChannel> snapshot = new HashMap<>();
         for (VideoChannel ch : channels) {
             snapshot.putIfAbsent(ch.devicecode, ch);
         }
         channelCache = Collections.unmodifiableMap(snapshot);
+    }
+
+    /**
+     * 合并回写通道信息缓存（实时遍历不完整时用）：只补不减——本次遍历到的通道覆盖同名旧条目，
+     * 未遍历到的旧通道保留，符合“不完整保留旧快照防通道消失”原则。
+     * synchronized 防两次未命中遍历并发时 last-write-wins 丢失彼此的补充结果（方法体极小，锁开销可忽略）。
+     */
+    private synchronized void mergeChannelCache(List<VideoChannel> channels) {
+        Map<String, VideoChannel> merged = new HashMap<>(channelCache);
+        for (VideoChannel ch : channels) {
+            merged.put(ch.devicecode, ch);
+        }
+        channelCache = Collections.unmodifiableMap(merged);
     }
 
     /**
@@ -418,8 +438,14 @@ public class StationStatusSyncService {
         log.info("[通道查询] 缓存未命中，实时遍历设备树：channelId={}", key);
         AtomicBoolean failed = new AtomicBoolean(false);
         List<VideoChannel> channels = collectChannelsWithDisambiguation(failed);
+        // ★ 遍历结果回写缓存（此前不回写：未命中→每次请求都全树遍历，站点视频列表逐设备查询时
+        //   同一站点 N 个通道等于 N 次全树递归，单次约 7s，N=2 即 15s）。
+        //   完整遍历整体刷新（与同步轮一致）；不完整遍历合并补充（只补不减，防“部分通道消失”）。
         if (failed.get()) {
             log.warn("[通道查询] 实时遍历存在失败节点，结果可能不完整：channelId={}", key);
+            mergeChannelCache(channels);
+        } else {
+            refreshChannelCache(channels);
         }
         for (VideoChannel ch : channels) {
             if (key.equals(ch.devicecode)) {
@@ -497,6 +523,34 @@ public class StationStatusSyncService {
     }
 
     /**
+     * 按通道编码查询视频设备当前在线状态（设备表 status 快照，{@code #1#}在线/{@code #2#}离线）。
+     * 供取流失败时区分提示：通道ID错误/未接入 与 设备离线 是两类问题，不应笼统提示"获取失败"。
+     * 单条索引查询实时查库（毫秒级），仅在取流失败路径调用，对正常播放链路无影响。
+     *
+     * @param devicecode 通道编码（= 设备表 code）
+     * @return null-设备表中无此通道；true-在线（status为空保守视为在线，避免误报未上线）；false-离线
+     */
+    public Boolean queryVideoDeviceOnline(String devicecode) {
+        if (devicecode == null || devicecode.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            List<String> statuses = jdbcTemplate.queryForList(
+                    "SELECT status FROM " + DEVICE_TABLE +
+                            " WHERE code = ? AND type LIKE '%" + VIDEO_TYPE + "%' LIMIT 1",
+                    String.class, devicecode.trim());
+            if (statuses == null || statuses.isEmpty()) {
+                return null;
+            }
+            String status = statuses.get(0);
+            return status == null || STATUS_ONLINE.equals(status);
+        } catch (Exception e) {
+            log.error("[通道查询] 视频设备在线状态查询失败: devicecode={}", devicecode, e);
+            return null;
+        }
+    }
+
+    /**
      * 递归遍历ICC设备树，收集视频通道（nodeType=ch）及其管理所归属
      * <p>ICC树层级（前端展示为"花凉亭灌区-管理所-硬盘录像机/位置节点-通道"，但tree API从根001
      * 返回的子列表首层即管理所，根"花凉亭灌区"不在返回中——monitor.html硬编码了根名）：
@@ -525,6 +579,9 @@ public class StationStatusSyncService {
         }
         DahuaDeviceService.DeviceTreeResult result = deviceService.getDeviceTreeWithStatus(parentId);
         if (!result.isSuccess()) {
+            // ★ 失败节点必须留痕：此前静默置 failed，无法定位是哪棵子树拖垮遍历
+            //（子树持续失败会导致该子树下通道永不进入缓存，findChannel 每次请求都实时遍历）
+            log.warn("[站点同步] 设备树节点查询失败，跳过子树: parentId={}, depth={}", parentId, depth);
             failed.set(true);
             return;
         }

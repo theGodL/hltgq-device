@@ -129,7 +129,7 @@ public class DahuaController {
     /**
      * 查询站点下的视频设备清单（站点视频监控面板左侧列表数据源）
      * <p>
-     * 前端调用：GET /api/dahua/site-channels?siteId=xxx（或 channelId / siteName 兜底）
+     * 前端调用：GET /api/dahua/site-channels?siteId=xxx（或 siteCode / channelId / siteName 兜底）
      * <p>
      * 返回该站点全部视频设备（code 去重）及 cameraType、在线状态、最新一轮巡检结果，
      * 纯只读，不写任何表。
@@ -137,21 +137,24 @@ public class DahuaController {
      * @param siteId    站点ID（优先）
      * @param siteName  站点名称（siteId 缺失时精确匹配）
      * @param channelId 通道ID（站点仍无法定位时按通道反查归属站点）
+     * @param siteCode  站点编号（站点表 iofhpi，如 9000000007；H5 轻量页按站点编号打开视频列表用）
      * @return {siteId, siteName, total, channels:[{channelId, name, location, online, cameraType, patrolResult, faultTypes}]}
      */
     @GetMapping("/site-channels")
     public ApiResponse<Map<String, Object>> getSiteChannels(
             @RequestParam(required = false) String siteId,
             @RequestParam(required = false) String siteName,
-            @RequestParam(required = false) String channelId) {
+            @RequestParam(required = false) String channelId,
+            @RequestParam(required = false) String siteCode) {
         boolean blankAll = (siteId == null || siteId.trim().isEmpty())
                 && (siteName == null || siteName.trim().isEmpty())
-                && (channelId == null || channelId.trim().isEmpty());
+                && (channelId == null || channelId.trim().isEmpty())
+                && (siteCode == null || siteCode.trim().isEmpty());
         if (blankAll) {
-            return ApiResponse.fail("缺少站点参数（siteId / siteName / channelId 至少一个）");
+            return ApiResponse.fail("缺少站点参数（siteId / siteCode / siteName / channelId 至少一个）");
         }
         try {
-            return ApiResponse.success(siteVideoQueryService.query(siteId, siteName, channelId));
+            return ApiResponse.success(siteVideoQueryService.query(siteId, siteName, channelId, siteCode));
         } catch (Exception e) {
             log.error("查询站点视频设备接口异常：", e);
             return ApiResponse.fail("查询站点视频设备失败：" + e.getMessage());
@@ -180,7 +183,16 @@ public class DahuaController {
 
             String url = videoService.getStreamUrl(channelId, streamType, protocol);
             if (url == null || url.trim().isEmpty()) {
-                return ApiResponse.fail("获取视频流地址失败");
+                // ★ 区分失败原因，避免一律"获取失败"误导用户（摄像头未必故障）：
+                //   设备表无此通道 → 通道ID错误/未接入；通道存在但离线 → 摄像头未上线；在线仍取不到流 → 取流异常
+                Boolean online = stationSyncService.queryVideoDeviceOnline(channelId);
+                if (online == null) {
+                    return ApiResponse.fail("通道不存在或未接入系统，请核对通道编号");
+                }
+                if (!online) {
+                    return ApiResponse.fail("摄像头未上线，请检查设备网络与电源");
+                }
+                return ApiResponse.fail("视频流获取失败，请稍后重试");
             }
 
             Map<String, String> result = new HashMap<>();

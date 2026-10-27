@@ -127,7 +127,7 @@ body {
 <div class="search-wrap">
   <div class="search-box">
     <span class="icon">🔍</span>
-    <input type="text" id="searchInput" placeholder="请输入站点名称查询">
+    <input type="text" id="searchInput" placeholder="请输入设备名称查询">
   </div>
 </div>
 
@@ -247,7 +247,7 @@ function renderCards(keyword) {
   const items = allChannels.filter(c => !kw || c.name.includes(kw));
   if (items.length === 0) {
     list.innerHTML = '<div class="empty-state">' +
-      (kw ? '未找到匹配「' + escapeHtml(kw) + '」的站点' : '暂无视频设备') + '</div>';
+      (kw ? '未找到匹配「' + escapeHtml(kw) + '」的设备' : '暂无视频设备') + '</div>';
     return;
   }
   let html = '';

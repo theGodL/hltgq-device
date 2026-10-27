@@ -121,6 +121,61 @@ body {
   background: rgba(0,0,0,0.75); color: #FFF; font-size: 14px; padding: 10px 18px;
   border-radius: 8px; z-index: 99; display: none; max-width: 80%;
 }
+
+/* ==================== 视图容器（列表视图/播放视图二选一显示） ==================== */
+.view-container { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+
+/* ==================== 站点摄像头列表（样式借鉴 mobile/monitor.html） ==================== */
+.card-list { flex: 1; overflow-y: auto; padding: 12px 16px 16px; -webkit-overflow-scrolling: touch; }
+.card {
+  background: #FFFFFF; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  display: flex; align-items: center; padding: 10px; margin-bottom: 12px; cursor: pointer;
+}
+.card:active { background: #FAFAFC; }
+.thumb {
+  width: 100px; height: 80px; border-radius: 8px; background: #E8E8E8; flex-shrink: 0;
+  position: relative; display: flex; align-items: center; justify-content: center;
+  font-size: 34px; color: #B0B0B0;
+}
+.thumb .status-dot {
+  position: absolute; right: 6px; top: 6px; width: 8px; height: 8px; border-radius: 50%;
+  border: 2px solid #FFFFFF;
+}
+.dot-online { background: #52C41A; }
+.dot-offline { background: #BFBFBF; }
+.card-info { flex: 1; margin-left: 12px; min-width: 0; }
+.card-title { font-size: 16px; font-weight: 600; color: #1F1F1F; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-title .warn-mark { color: #FF4D4F; }
+.card-loc { font-size: 14px; color: #999; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-loc .loc-icon { color: #FF4D4F; }
+.card-status { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+.card-status .tags { display: flex; align-items: center; gap: 6px; }
+.tag { font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+.tag-online { background: #F6FFED; color: #52C41A; }
+.tag-offline { background: #F5F5F5; color: #8C8C8C; }
+.tag-alert { background: #FFF1F0; color: #FF4D4F; }
+.card-status .aux { font-size: 12px; color: #999; }
+.card-arrow { color: #C0C4CC; font-size: 14px; flex-shrink: 0; margin-left: 8px; }
+.empty-state { text-align: center; color: #999; font-size: 14px; padding: 40px 0; }
+.loading-state { text-align: center; color: #999; font-size: 14px; padding: 40px 0; }
+
+/* ==================== 全屏（按钮进入/退出，元素级全屏 videoArea） ==================== */
+.fs-btn {
+  position: absolute; right: 12px; bottom: 12px; width: 36px; height: 36px;
+  border-radius: 8px; border: none; background: rgba(0,0,0,0.45); color: #FFFFFF;
+  font-size: 16px; cursor: pointer; z-index: 3;
+  display: flex; align-items: center; justify-content: center;
+}
+.fs-btn:active { background: rgba(0,0,0,0.7); }
+.video-area:fullscreen { width: 100%; height: 100%; background: #000; }
+.video-area:-webkit-full-screen { width: 100%; height: 100%; background: #000; }
+
+/* ==================== 云台灰显（管理员+固定枪机：PC 同款提示；非管理员整体隐藏） ==================== */
+.ptz-hint {
+  display: none; text-align: center; font-size: 13px; color: #FAAD14;
+  padding: 8px 16px 0; background: #FFFFFF; flex-shrink: 0;
+}
+.ptz-bar.disabled .ptz-btn, .ptz-bar.disabled .ptz-stop { opacity: 0.35; pointer-events: none; }
 </style>
 <script>
 /* 顶部安全区兜底（与 live.html 同款）：部分 webview/浏览器沉浸式全屏下页面延伸到状态栏后，
@@ -143,6 +198,8 @@ body {
 </script>
 </head>
 <body>
+<!-- ==================== 播放视图（channelId=完整通道ID 时；云台三态与 PC 一致，含全屏） ==================== -->
+<div class="view-container" id="playView" style="display:none">
 <div class="nav-bar">
   <button class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>返回</button>
   <span class="nav-title" id="navTitle">实时监控</span>
@@ -156,17 +213,31 @@ body {
   <button class="play-btn" id="playBtn" style="display:none">▶</button>
   <span class="record-dot" id="recordDot"></span>
   <div class="video-error" id="videoError"></div>
+  <button class="fs-btn" id="fsBtn" title="全屏">⛶</button>
 </div>
 
 <div class="ai-bar" id="aiBar"><span class="bulb">💡</span><span id="aiText">当前画面未检测到异常</span></div>
 
-<!-- 云台控制条：横排按钮（◀ ▲ ▼ ▶ + 停止）；没有控制权限的不展示——非管理员或设备不支持云台时整体隐藏 -->
+<!-- 云台控制条：三态与 PC 一致——非管理员整体隐藏；管理员+固定枪机灰显并提示；管理员+云台设备启用 -->
+<div class="ptz-hint" id="ptzHint"></div>
 <div class="ptz-bar" id="ptzBar" style="display:none">
   <button class="ptz-btn" data-dir="left">◀</button>
   <button class="ptz-btn" data-dir="up">▲</button>
   <button class="ptz-btn" data-dir="down">▼</button>
   <button class="ptz-btn" data-dir="right">▶</button>
   <button class="ptz-stop" id="ptzCenter">■</button>
+</div>
+</div>
+
+<!-- ==================== 站点摄像头列表视图（channelId=站点编号 时；样式借鉴 mobile/monitor.html） ==================== -->
+<div class="view-container" id="listView" style="display:none">
+  <div class="nav-bar">
+    <button class="back" onclick="history.length > 1 ? history.back() : location.href=appUrl('/mobile/monitor.html')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>返回</button>
+    <span class="nav-title" id="listTitle">视频列表</span>
+  </div>
+  <div class="card-list" id="cardList">
+    <div class="loading-state">⏳ 正在加载摄像头列表...</div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -337,17 +408,96 @@ function destroyPlayer() {
   video.load();
 }
 
+// ==================== 全屏（按钮进入/退出，状态双向同步；与 live.html 同一套） ====================
+function currentFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+/** iOS 原生 video 全屏态（元素级全屏 API 在 iOS Safari 不可用，走 video 原生全屏） */
+function isNativeVideoFullscreen() {
+  const v = document.getElementById('video');
+  return !!(v && v.webkitDisplayingFullscreen);
+}
+/**
+ * 进入/退出全屏：标准 API → webkit → iOS video 原生全屏 兜底链；
+ * Promise 拒绝仅提示不抛错（部分 webview 禁用全屏 API）。
+ */
+function toggleFullscreen() {
+  const area = document.getElementById('videoArea');
+  const video = document.getElementById('video');
+  if (currentFullscreenElement()) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exit) {
+      try {
+        const p = exit.call(document);
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) { console.warn('[全屏] 退出失败：', e); }
+    }
+    return;
+  }
+  if (isNativeVideoFullscreen()) {
+    if (video.webkitExitFullscreen) { try { video.webkitExitFullscreen(); } catch (e) {} }
+    return;
+  }
+  try {
+    if (area.requestFullscreen) {
+      const p = area.requestFullscreen();
+      if (p && p.catch) p.catch((err) => {
+        console.warn('[全屏] 进入被拒绝：', err);
+        showToast('当前浏览器不支持页面全屏');
+      });
+    } else if (area.webkitRequestFullscreen) {
+      area.webkitRequestFullscreen();
+    } else if (video.webkitEnterFullscreen) {
+      video.webkitEnterFullscreen();   // iOS Safari：系统播放器全屏，用系统 UI 退出
+    } else {
+      showToast('当前浏览器不支持全屏');
+    }
+  } catch (e) {
+    console.warn('[全屏] 进入失败：', e);
+    showToast('当前浏览器不支持全屏');
+  }
+}
+/** 全屏状态变化：按钮图标同步（⛶ ↔ ✕）；iOS 原生全屏由 begin/end 事件触发 */
+function onFullscreenChange() {
+  const isFs = !!currentFullscreenElement() || isNativeVideoFullscreen();
+  const btn = document.getElementById('fsBtn');
+  if (btn) {
+    btn.textContent = isFs ? '✕' : '⛶';
+    btn.title = isFs ? '退出全屏' : '全屏';
+  }
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
 // ==================== 云台控制（与 PC 端同一权限语义：仅系统管理员） ====================
 /**
- * 更新云台控制条状态：没有控制权限的不展示——
+ * 更新云台控制条状态：三态与 PC 端（monitor.html）完全一致——
  * ① 非系统管理员（无云台操作权限）→ 整体隐藏；
- * ② 设备不支持云台（固定枪机）→ 同样整体隐藏，不展示灰显条与提示；
- * 管理员 + 云台设备 → 启用。
+ * ② 管理员 + 固定枪机（cameraType<2）→ 灰显控制条并提示"不支持云台控制"（PC 同款文案）；
+ * ③ 管理员 + 云台设备 → 启用。
  * 初始 HTML 为隐藏态，权限/通道查询返回后才可能显示。
  */
 function updatePtzState() {
   const bar = document.getElementById('ptzBar');
-  bar.style.display = (userIsAdmin && hasPtz) ? '' : 'none';
+  const hint = document.getElementById('ptzHint');
+  if (!userIsAdmin) {
+    bar.style.display = 'none';
+    bar.classList.remove('disabled');
+    if (hint) hint.style.display = 'none';
+    return;
+  }
+  bar.style.display = '';
+  if (hasPtz) {
+    bar.classList.remove('disabled');
+    if (hint) hint.style.display = 'none';
+  } else {
+    // 管理员 + 枪机：灰显并提示（按钮 pointer-events:none，ptzStart 内也有 hasPtz 拦截兜底）
+    bar.classList.add('disabled');
+    if (hint) {
+      hint.textContent = '⚠ 当前为固定摄像头，不支持云台控制';
+      hint.style.display = 'block';
+    }
+  }
 }
 
 /**
@@ -530,7 +680,13 @@ async function loadChannelInfo() {
   }
 }
 
-function init() {
+// ==================== 模式判别与入口 ====================
+/**
+ * 播放模式初始化（channelId 为完整通道ID，如 1000355$1$0$6）：原单页播放逻辑，
+ * 云台三态与 PC 一致，含全屏进入/退出。
+ */
+function setupPlayMode() {
+  document.getElementById('playView').style.display = '';
   document.getElementById('navTitle').textContent = channelName;
   document.title = channelName;
   // 导航栏返回按钮为行内 onclick（任意时刻可点，缺参页也可返回），无需 JS 绑定
@@ -538,6 +694,11 @@ function init() {
     showVideoError('缺少 channelId 参数');
     return;
   }
+  // 全屏按钮（videoArea 点击会触发起播，按钮点击需阻断冒泡）
+  document.getElementById('fsBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleFullscreen();
+  });
   // 播放按钮（自动播放被浏览器拦截时兜底）
   document.getElementById('playBtn').addEventListener('click', () => {
     const video = document.getElementById('video');
@@ -559,6 +720,9 @@ function init() {
     document.getElementById('playBtn').style.display = 'none';
     document.getElementById('recordDot').style.display = 'block';
   });
+  // iOS 原生 video 全屏（元素级全屏 API 在 iOS Safari 不可用）：begin/end 事件同步按钮图标
+  video.addEventListener('webkitbeginfullscreen', onFullscreenChange);
+  video.addEventListener('webkitendfullscreen', onFullscreenChange);
   // 云台方向按钮
   document.querySelectorAll('.ptz-btn').forEach(bindPtzButton);
   // 中心停止按钮：点击即停止
@@ -598,6 +762,103 @@ function init() {
   loadAiStatus();
   // ★ 进入页面立即加载视频（静音自动播放；被浏览器拦截时显示播放按钮兜底）
   startPlay();
+}
+
+/**
+ * 列表模式初始化（channelId 为站点编号，如 9000000007）：展示站点下全部摄像头卡片，
+ * 点击卡片跳转播放模式（本页以完整通道ID 重新打开），与 monitor.html → live.html 同构。
+ */
+async function setupListMode(site) {
+  document.getElementById('listView').style.display = '';
+  const siteName = site.siteName || channelName || '视频列表';
+  document.getElementById('listTitle').textContent = siteName;
+  document.title = siteName;
+  // 告警汇总（通道 devicecode → 未关闭告警数）：失败不影响列表展示
+  let alertByChannel = {};
+  try {
+    const json = await apiGet(API_BASE + '/alert/active');
+    if (json.success === true && json.data) {
+      alertByChannel = json.data.byChannel || {};
+    }
+  } catch (err) {
+    console.warn('[Alert] 告警汇总获取失败：', err);
+  }
+  renderCards(site.channels || [], alertByChannel, siteName);
+}
+
+/** 渲染摄像头卡片（结构/样式与 mobile/monitor.html 设备卡片一致） */
+function renderCards(channels, alertByChannel, siteName) {
+  const list = document.getElementById('cardList');
+  if (!channels || channels.length === 0) {
+    list.innerHTML = '<div class="empty-state">该站点下暂无视频设备</div>';
+    return;
+  }
+  let html = '';
+  for (const c of channels) {
+    const alertCount = alertByChannel[c.channelId] || 0;
+    // ★ 告警不覆盖在线/离线主状态，作为主 Tag 旁的独立红色小 Tag 附加展示（与 monitor.html 一致）
+    const online = c.online === true;
+    const dotCls = online ? 'dot-online' : 'dot-offline';
+    const tagCls = online ? 'tag-online' : 'tag-offline';
+    const tagText = online ? '在线' : '离线';
+    let auxText = online ? '信号良好' : '设备离线';
+    let warnMark = '';
+    let alertTag = '';
+    if (alertCount > 0) {
+      alertTag = '<span class="tag tag-alert">告警 ' + alertCount + '</span>';
+      auxText = '存在未关闭告警';
+      warnMark = '<span class="warn-mark">△</span>';
+    }
+    const locText = c.location || siteName || '花凉亭灌区';
+    html += '<div class="card" data-id="' + escapeHtml(c.channelId) + '" ' +
+      'data-name="' + escapeHtml(c.name) + '" data-cam="' + (parseInt(c.cameraType) || 1) + '">' +
+      '<div class="thumb">📷<span class="status-dot ' + dotCls + '"></span></div>' +
+      '<div class="card-info">' +
+        '<div class="card-title">' + warnMark + escapeHtml(c.name) + '</div>' +
+        '<div class="card-loc"><span class="loc-icon">📍</span> ' + escapeHtml(locText) + '</div>' +
+        '<div class="card-status"><span class="tags">' +
+        '<span class="tag ' + tagCls + '">' + tagText + '</span>' + alertTag + '</span>' +
+        '<span class="aux">' + escapeHtml(auxText) + '</span></div>' +
+      '</div>' +
+      '<span class="card-arrow">&gt;</span>' +
+      '</div>';
+  }
+  list.innerHTML = html;
+  // 点击卡片 → 播放模式（同页跳转，history 自然支持返回列表）
+  list.querySelectorAll('.card').forEach(el => {
+    el.addEventListener('click', () => {
+      location.href = appUrl('/mobile/live-popup.html?channelId=') + encodeURIComponent(el.dataset.id) +
+        '&name=' + encodeURIComponent(el.dataset.name) +
+        '&cameraType=' + encodeURIComponent(el.dataset.cam);
+    });
+  });
+}
+
+/**
+ * 入口：按 channelId 形态判别模式（一个参数两种语义）——
+ * ① 含 '$' = 完整通道ID（如 1000355$1$0$6，ICC 通道编码必含 $）→ 播放模式，旧链接行为不变；
+ * ② 不含 '$' = 站点编号（站点表 iofhpi：既有纯数字如 9000000007，也有字母短码如 QSJSZ/SMH/NSS/QSDZ）
+ *    → 按站点编号查摄像头列表；站点定位失败时回退播放模式（兼容历史短编码链接）；
+ * ③ 空 → 播放模式（内部做缺参提示兜底）。
+ */
+async function init() {
+  if (channelId && channelId.indexOf('$') < 0) {
+    try {
+      // 站点名称作兜底：iofhpi 未命中时后端按 zzkaec 精确匹配定位站点
+      const query = '/site-channels?siteCode=' + encodeURIComponent(channelId) +
+        (params.get('name') ? '&siteName=' + encodeURIComponent(params.get('name')) : '');
+      const json = await apiGet(API_BASE + query);
+      if (json.success === true && json.data && json.data.siteId) {
+        await setupListMode(json.data);
+        return;
+      }
+      console.warn('[List] 站点编号未匹配到站点，按通道播放模式处理：' + channelId);
+    } catch (err) {
+      if (err.message === '未登录') return;   // 页面已在跳转登录，不再继续初始化
+      console.warn('[List] 站点摄像头查询失败，回退播放模式：', err);
+    }
+  }
+  setupPlayMode();
 }
 
 document.addEventListener('DOMContentLoaded', init);

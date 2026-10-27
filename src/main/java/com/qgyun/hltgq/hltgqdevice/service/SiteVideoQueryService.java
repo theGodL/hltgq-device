@@ -48,12 +48,13 @@ public class SiteVideoQueryService {
      * 查询站点下的视频设备清单。
      *
      * @param siteId    站点ID（优先）
-     * @param siteName  站点名称（siteId 缺失时按名称精确匹配）
+     * @param siteName  站点名称（siteId 缺失时精确匹配）
      * @param channelId 通道ID（站点仍无法定位时按通道反查归属站点）
+     * @param siteCode  站点编号（站点表 iofhpi，如 9000000007；H5 按站点编号打开视频列表用）
      * @return {siteId, siteName, total, channels:[{channelId, name, location, online, cameraType, patrolResult, faultTypes}]}
      */
-    public Map<String, Object> query(String siteId, String siteName, String channelId) {
-        String resolvedSiteId = resolveSiteId(siteId, siteName, channelId);
+    public Map<String, Object> query(String siteId, String siteName, String channelId, String siteCode) {
+        String resolvedSiteId = resolveSiteId(siteId, siteName, channelId, siteCode);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("siteId", resolvedSiteId);
         data.put("siteName", resolveSiteName(resolvedSiteId, siteName));
@@ -101,12 +102,25 @@ public class SiteVideoQueryService {
     // ======================== 站点定位 ========================
 
     /**
-     * 站点定位：siteId → channelId 反查 → siteName 精确匹配，均失败返回 null。
+     * 站点定位：siteId → 站点编号 → channelId 反查 → siteName 精确匹配，均失败返回 null。
      */
-    private String resolveSiteId(String siteId, String siteName, String channelId) {
+    private String resolveSiteId(String siteId, String siteName, String channelId, String siteCode) {
         String direct = str(siteId);
         if (direct != null) {
             return direct;
+        }
+        // 站点编号（站点表 iofhpi，如 9000000007）→ 站点主键：H5 按站点编号打开视频列表用
+        String code = str(siteCode);
+        if (code != null) {
+            try {
+                List<String> ids = jdbcTemplate.queryForList(
+                        "SELECT id FROM " + STATION_TABLE + " WHERE iofhpi = ? LIMIT 1", String.class, code);
+                if (ids != null && !ids.isEmpty() && str(ids.get(0)) != null) {
+                    return str(ids.get(0));
+                }
+            } catch (Exception e) {
+                log.warn("[站点视频] 站点编号反查ID失败: siteCode={}, err={}", code, e.getMessage());
+            }
         }
         String byChannel = str(channelId);
         if (byChannel != null) {
