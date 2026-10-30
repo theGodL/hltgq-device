@@ -49,6 +49,9 @@ public class VideoAlertScheduler {
     /** 单路检测超时余量（秒）：流探测+抽帧排队上限之外的等待缓冲 */
     private static final int PER_CHANNEL_TIMEOUT_SLACK_SECONDS = 10;
 
+    /** 轮巡总预算上限（分钟）：必须小于 cron 轮间隔（默认30分钟），否则本轮跨轮会被下一轮互斥跳过 */
+    private static final int PER_ROUND_BUDGET_MAX_MINUTES = 25;
+
     /** 轮级登录重试次数与间隔（防偶发网络抖动导致整轮跳过） */
     private static final int LOGIN_MAX_RETRY = 3;
     private static final long LOGIN_RETRY_INTERVAL_MS = 2000L;
@@ -92,6 +95,14 @@ public class VideoAlertScheduler {
     /** 单路检测时长上限（秒，含流探测+抽帧+分析），配置项 video-alert.stream-seconds */
     @Value("${video-alert.stream-seconds:15}")
     private int streamSeconds;
+
+    /** 流探测失败后的重试间隔（秒，0=不重试），仅用于单路超时预算（实际重试在 ChannelInspector） */
+    @Value("${video-alert.retry-delay-seconds:10}")
+    private int retryDelaySeconds;
+
+    /** ffmpeg 抽帧整体超时（秒），仅用于单路超时预算（实际超时在 FfmpegFrameGrabber） */
+    @Value("${video-alert.grab-timeout-seconds:15}")
+    private int grabTimeoutSeconds;
 
     @Resource
     private StationStatusSyncService stationSyncService;
@@ -416,6 +427,12 @@ public class VideoAlertScheduler {
                 futures.add(pool.submit(() -> {
                     try {
                         Set<VideoFaultType> faults = removeIgnored(channelInspector.inspect(ch), ignoreFaults);
+                        if (Thread.currentThread().isInterrupted()) {
+                            // 已被超时取消：不写故障、不加入 inspected（取消通道不参与防抖判定）
+                            snap.channelResults.put(ch.getDevicecode(), "检测取消");
+                            errorChannels.add(ch.getDevicecode());
+                            return;
+                        }
                         snap.channelResults.put(ch.getDevicecode(), summarize(ch, faults));
                         abnormalByChannel.put(ch.getDevicecode(), faults);
                         inspectedChannels.add(ch.getDevicecode());
@@ -429,11 +446,16 @@ public class VideoAlertScheduler {
                     }
                 }));
             }
-            // 等待全部完成：总预算 = 批数 × 单路硬超时（streamSeconds + 余量）。
+            // 等待全部完成：单路硬超时 = 两次流探测 + 重试等待 + 抽帧 + 余量
+            // （单次探测走 M3U8+TS 两个 HTTP 请求，各 3s 连接+5s 读超时，streamSeconds=15 已覆盖）。
+            // 总预算另设绝对上限（< cron 轮间隔），大面积故障时截断本轮剩余通道，防止本轮跨轮被互斥跳过。
             // 预算耗尽仍未完成的通道被取消且不参与防抖判定（计数保持），不会误关已有告警。
             int batches = (futures.size() + poolSize - 1) / poolSize;
-            long perChannelMillis = (streamSeconds + PER_CHANNEL_TIMEOUT_SLACK_SECONDS) * 1000L;
-            long deadline = System.currentTimeMillis() + perChannelMillis * Math.max(batches, 1);
+            long perChannelMillis = (streamSeconds * 2 + retryDelaySeconds + grabTimeoutSeconds
+                    + PER_CHANNEL_TIMEOUT_SLACK_SECONDS) * 1000L;
+            long budget = Math.min(perChannelMillis * Math.max(batches, 1),
+                    TimeUnit.MINUTES.toMillis(PER_ROUND_BUDGET_MAX_MINUTES));
+            long deadline = System.currentTimeMillis() + budget;
             for (Future<?> f : futures) {
                 long remain = deadline - System.currentTimeMillis();
                 if (remain <= 0) {
@@ -474,8 +496,17 @@ public class VideoAlertScheduler {
         // ============ 防抖判定 → 告警新增/恢复 ============
         List<AlertDebouncer.FaultEvent> events =
                 debouncer.acceptRound(abnormalByChannel, inspectedChannels, exemptFaults);
+        // 未投运通道过滤（业务口径 2026-10-30）：从未取流成功过的通道（巡检留痕无 ok）
+        // 即"设备本身没接入"，信号丢失按离线状态处理，不报严重不建单；
+        // 通道首次取流成功后自动进入正常判定，此后断流按真故障告警。
+        Set<String> neverOkChannels = findNeverOkSignalLossChannels(events);
         for (AlertDebouncer.FaultEvent ev : events) {
             if (ev.getType() == AlertDebouncer.FaultEvent.Type.NEW_ALERT) {
+                if (neverOkChannels.contains(ev.getChannelId())) {
+                    log.info("[视频告警] 通道从未取流成功（未投运/未接入），按离线状态处理不告警: {}",
+                            ev.getChannelId());
+                    continue;
+                }
                 if (alertService.reportFault(ev.getChannelId(), ev.getFault())) {
                     snap.newAlerts++;
                 }
@@ -526,6 +557,31 @@ public class VideoAlertScheduler {
         } catch (Exception e) {
             log.warn("[视频告警] 恢复对账异常: {}", e.getMessage());
             return 0;
+        }
+    }
+
+    /**
+     * 收集本轮"从未取流成功过"的信号丢失候选通道（批量查巡检留痕，查询失败按空集放行）：
+     * 仅对新建告警的 SIGNAL_LOSS 事件生效（取流异常候选设备树在线，属已接入设备，不豁免）。
+     * 包内可见供单测。
+     */
+    Set<String> findNeverOkSignalLossChannels(List<AlertDebouncer.FaultEvent> events) {
+        List<String> candidates = new ArrayList<>();
+        for (AlertDebouncer.FaultEvent ev : events) {
+            if (ev.getType() == AlertDebouncer.FaultEvent.Type.NEW_ALERT
+                    && ev.getFault() == VideoFaultType.SIGNAL_LOSS) {
+                candidates.add(ev.getChannelId());
+            }
+        }
+        if (candidates.isEmpty()) {
+            return Collections.emptySet();
+        }
+        try {
+            Set<String> neverOk = alertService.findNeverOkChannels(candidates);
+            return neverOk != null ? neverOk : Collections.emptySet();
+        } catch (Exception e) {
+            log.warn("[视频告警] 查询通道历史成功记录异常（放行告警）: {}", e.getMessage());
+            return Collections.emptySet();
         }
     }
 

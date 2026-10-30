@@ -111,6 +111,10 @@ public class FfmpegFrameGrabber {
             }
             log.debug("[视频告警] ffmpeg 抽帧结果: 期望{}张, 实得{}张", frames, images.size());
             return images;
+        } catch (InterruptedException e) {
+            // 轮巡总预算耗尽被取消：不伪装成空帧（否则被取消的通道会以取流异常进入防抖）
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("ffmpeg 抽帧被中断（本轮已取消）", e);
         } catch (Exception e) {
             log.warn("[视频告警] ffmpeg 抽帧失败: {}", e.getMessage());
             return Collections.emptyList();

@@ -6,13 +6,16 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -133,6 +136,43 @@ class VideoAlertSchedulerTest {
 
         assertEquals(1, scheduler.reconcileRecoveredAlerts(roundStart));
         verify(alertService).reconcileRecovered(2, roundStart);
+    }
+
+    /** never-ok 过滤：仅 NEW_ALERT+SIGNAL_LOSS 进候选，取流异常/恢复事件不查（已接入设备不豁免） */
+    @Test
+    void findNeverOkSignalLossChannelsOnlyQueriesNewSignalLoss() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        when(alertService.findNeverOkChannels(Collections.singletonList("ch1")))
+                .thenReturn(Collections.singleton("ch1"));
+        List<AlertDebouncer.FaultEvent> events = Arrays.asList(
+                new AlertDebouncer.FaultEvent("ch1", VideoFaultType.SIGNAL_LOSS,
+                        AlertDebouncer.FaultEvent.Type.NEW_ALERT),
+                new AlertDebouncer.FaultEvent("ch2", VideoFaultType.STREAM_ERROR,
+                        AlertDebouncer.FaultEvent.Type.NEW_ALERT),
+                new AlertDebouncer.FaultEvent("ch3", VideoFaultType.SIGNAL_LOSS,
+                        AlertDebouncer.FaultEvent.Type.RECOVERED));
+
+        Set<String> neverOk = scheduler.findNeverOkSignalLossChannels(events);
+
+        assertEquals(Collections.singleton("ch1"), neverOk);
+        // 只有信号丢失的新建告警进候选（流探测失败才可能是未接入设备；恢复事件必须照常关警）
+        verify(alertService).findNeverOkChannels(Collections.singletonList("ch1"));
+    }
+
+    /** never-ok 查询异常：返回空集放行（照常告警，宁可多报不漏报） */
+    @Test
+    void findNeverOkSignalLossChannelsFailOpenOnError() {
+        VideoAlertScheduler scheduler = new VideoAlertScheduler();
+        VideoAlertService alertService = mock(VideoAlertService.class);
+        ReflectionTestUtils.setField(scheduler, "alertService", alertService);
+        when(alertService.findNeverOkChannels(anyList())).thenThrow(new RuntimeException("db down"));
+        List<AlertDebouncer.FaultEvent> events = Collections.singletonList(
+                new AlertDebouncer.FaultEvent("ch1", VideoFaultType.SIGNAL_LOSS,
+                        AlertDebouncer.FaultEvent.Type.NEW_ALERT));
+
+        assertTrue(scheduler.findNeverOkSignalLossChannels(events).isEmpty(), "查询失败应放行告警");
     }
 
     private static long at(int hour, int minute) {

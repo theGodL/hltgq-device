@@ -217,7 +217,10 @@ public class VideoAlertService {
                         site.id, site.name, content);
                 return false;
             }
-            insertAlert(site.id, deviceId, content, levelOf(fault), WORK_ORDER_TYPE_FAULT_REPAIR, ALERT_TYPE_ABNORMAL);
+            // ★ 工单口径（2026-10-29 业务定级）：只有 A 层流故障（视频看不了需人处理）建单；
+            //   画质类画面仍能看，不生成工单（无人处理，挂单只积累噪音），级别亦为 #1# 一般
+            String workOrderType = fault.isNeedWorkOrder() ? WORK_ORDER_TYPE_FAULT_REPAIR : null;
+            insertAlert(site.id, deviceId, content, levelOf(fault), workOrderType, ALERT_TYPE_ABNORMAL);
         }
         log.warn("[视频告警] 新增告警: site={}({}), device={}, fault={}, content={}",
                 site.id, site.name, deviceId, fault, content);
@@ -253,6 +256,46 @@ public class VideoAlertService {
                     rows, deviceId, devicecode, fault);
         }
         return rows;
+    }
+
+    // ======================== 未投运通道判定 ========================
+
+    /**
+     * 从给定通道中筛出"从未取流成功过"的通道（巡检留痕无 ok 记录）：
+     * 业务口径 2026-10-30——设备本身没接入/未投运就是离线，谈不上"视频看不了"的告警，
+     * 信号丢失按离线状态处理（不报严重不建单）；通道首次取流成功后自动进入正常判定。
+     * 查询失败 fail-open 返回空集（照常告警，宁可多报不漏报）。
+     *
+     * @param devicecodes 候选通道设备编码（本轮信号丢失候选）
+     * @return 从未成功过的通道集合（可能为空）
+     */
+    public Set<String> findNeverOkChannels(List<String> devicecodes) {
+        Set<String> neverOk = new HashSet<>();
+        if (devicecodes == null || devicecodes.isEmpty()) {
+            return neverOk;
+        }
+        try {
+            StringBuilder phs = new StringBuilder();
+            for (int i = 0; i < devicecodes.size(); i++) {
+                if (i > 0) {
+                    phs.append(", ");
+                }
+                phs.append("?");
+            }
+            String sql = "SELECT DISTINCT channel_code FROM " + PATROL_TABLE +
+                    " WHERE channel_code IN (" + phs + ") AND result = 'ok'";
+            List<String> hasOk = jdbcTemplate.queryForList(sql, String.class, devicecodes.toArray());
+            Set<String> hasOkSet = new HashSet<>(hasOk);
+            for (String code : devicecodes) {
+                if (!hasOkSet.contains(code)) {
+                    neverOk.add(code);
+                }
+            }
+            return neverOk;
+        } catch (Exception e) {
+            log.warn("[视频告警] 查询通道历史成功记录失败(按有记录处理，照常告警): {}", e.getMessage());
+            return Collections.emptySet();
+        }
     }
 
     // ======================== 智能事件告警（IVSS 事件接入复用） ========================
@@ -313,7 +356,8 @@ public class VideoAlertService {
      * 插入成功后自动联动生成工单（与 hltgq-mq insertAlert 联动模式一致）。
      *
      * @param deviceId      设备表视频设备ID（device 字段）
-     * @param workOrderType 联动工单类型（qjulvf）：故障=#hxqm#设备故障抢修，智能事件=#pfqj#安全隐患整改
+     * @param workOrderType 联动工单类型（qjulvf）：故障=#hxqm#设备故障抢修，智能事件=#pfqj#安全隐患整改；
+     *                      null=不生成工单（画质类告警：视频仍能看，无人处理）
      * @param alertType     告警类型：故障=#2#异常告警，智能事件=#3#智能分析
      */
     private void insertAlert(String siteId, String deviceId, String content, String level, String workOrderType,
@@ -358,7 +402,10 @@ public class VideoAlertService {
             String sql = String.format("INSERT INTO %s (%s) VALUES (%s)", ALERT_TABLE, cols, phs);
             jdbcTemplate.update(sql, vals.toArray());
             // 告警新增成功 → 自动生成工单（alert 存告警ID精确关联；device 存设备表视频设备ID；qjulvf 存工单类型）
-            workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveTitle(content), content, workOrderType);
+            // workOrderType=null 表示该故障类型不建单（画质类：视频仍能看，无人处理）
+            if (workOrderType != null) {
+                workOrderService.createIfAbsent(alertId, siteId, deviceId, deriveTitle(content), content, workOrderType);
+            }
         } catch (Exception e) {
             log.error("[视频告警] 告警入库失败, site={}, content={}: {}", siteId, content, e.getMessage());
         }

@@ -149,6 +149,24 @@ class VideoAlertServiceTest {
                 eq("#hxqm#"));
     }
 
+    /** 画质类告警（视频仍能看）：级别 #1# 一般、不生成工单（2026-10-29 业务定级） */
+    @Test
+    void qualityFaultLowLevelNoWorkOrder() {
+        when(jdbcTemplate.queryForObject(anyString(), eq(Integer.class), any(), any(), any(), any()))
+                .thenReturn(0);
+
+        assertTrue(service.reportFault(DEVICECODE, VideoFaultType.BLUR));
+
+        assertEquals(1, updateInvocations.size());
+        Object[] args = (Object[]) ((Invocation) updateInvocations.get(0)).getRawArguments()[1];
+        List<Object> vals = new ArrayList<>(Arrays.asList(args));
+        // content="{站点}-视频 图像模糊！"，level=#1#（一般）
+        assertTrue(vals.contains(SITE_NAME + "-视频 图像模糊！"));
+        assertTrue(vals.contains("#1#"));
+        // 画质类画面仍可正常观看，不生成工单（无人处理，挂单只积累噪音）
+        verify(workOrderService, never()).createIfAbsent(any(), any(), any(), any(), any(), any());
+    }
+
     /** 智能事件告警：type=#3# 智能分析、工单 qjulvf=#pfqj# 安全隐患整改（与故障告警 #2#/#hxqm# 区分） */
     @Test
     void reportEventAlertInsertsWithIntelligentType() {
@@ -489,5 +507,26 @@ class VideoAlertServiceTest {
         assertTrue(sql.contains("JOIN"), "站点解析应 JOIN 站点表：" + sql);
         assertTrue(sql.contains("t_auto_hltgq_water_device"), "站点解析应走设备表：" + sql);
         assertTrue(sql.contains("type LIKE '%#5#%'"), "必须限定视频设备类型：" + sql);
+    }
+
+    /** 未投运通道判定：巡检留痕无 ok 记录的通道才返回（有 ok 记录 = 曾取流成功，不豁免） */
+    @Test
+    void findNeverOkChannelsReturnsOnlyNeverSucceeded() {
+        // ch-a 有 ok 记录（曾取流成功），ch-b 从未成功 → 只返回 ch-b
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), any(), any()))
+                .thenReturn(Collections.singletonList("ch-a"));
+
+        Set<String> neverOk = service.findNeverOkChannels(Arrays.asList("ch-a", "ch-b"));
+
+        assertEquals(Collections.singleton("ch-b"), neverOk);
+    }
+
+    /** 查询失败 fail-open：返回空集按有记录处理（宁可多报不漏报，不静默丢警） */
+    @Test
+    void findNeverOkChannelsFailOpenOnQueryError() {
+        when(jdbcTemplate.queryForList(anyString(), eq(String.class), any(), any()))
+                .thenThrow(new RuntimeException("db down"));
+
+        assertTrue(service.findNeverOkChannels(Arrays.asList("ch-a", "ch-b")).isEmpty());
     }
 }
